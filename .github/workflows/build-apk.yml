@@ -94,7 +94,7 @@ jobs:
             || { echo "Expected 2 flclash apk, got fewer"; exit 1; }
 
       - name: Upload apk artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: flclash-apk-aarch64-cortex-a53
           path: artifacts/*.apk
