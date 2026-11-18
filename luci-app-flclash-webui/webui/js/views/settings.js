@@ -25,6 +25,14 @@
           '<div class="settings-row"><div class="row-copy"><div class="row-title">IPv6</div><div class="row-desc">解析并代理 IPv6 流量</div></div>' +
             '<button class="switch" role="switch" data-cfg="ipv6" type="button"><span class="thumb"></span></button></div>' +
         '</div></div>' +
+      '<div class="settings-group"><div class="settings-title">透明代理(局域网接管)</div>' +
+        '<div class="settings-card">' +
+          '<div class="settings-row"><div class="row-copy"><div class="row-title">接管局域网流量</div>' +
+            '<div class="row-desc" data-role="proxy-desc">TCP/UDP/DNS 经内核分流;路由器管理面不受影响</div></div>' +
+            '<button class="switch" role="switch" data-cfg="proxyLan" type="button"><span class="thumb"></span></button></div>' +
+          '<div class="settings-row"><div class="row-copy"><div class="row-title">当前状态</div><div class="row-desc" data-role="proxy-state">—</div></div>' +
+            '<span class="chip" data-role="proxy-chip">—</span></div>' +
+        '</div></div>' +
       '<div class="settings-group"><div class="settings-title">DNS(进阶)</div>' +
         '<div class="settings-card">' +
           '<div class="settings-row"><div class="row-copy"><div class="row-title">启用 DNS 模块</div><div class="row-desc">关闭后由系统 DNS 解析</div></div>' +
@@ -76,7 +84,8 @@
       dnsDefaults: ui.$('[data-cfg="dnsDefaults"]', root),
       dnsFakeRange: ui.$('[data-cfg="dnsFakeRange"]', root),
       dnsFilter: ui.$('[data-cfg="dnsFilter"]', root),
-      theme: ui.$('[data-cfg="theme"]', root)
+      theme: ui.$('[data-cfg="theme"]', root),
+      proxyLan: ui.$('[data-cfg="proxyLan"]', root)
     };
 
     function fill() {
@@ -115,6 +124,24 @@
 
     ['allowLan', 'ipv6', 'tun', 'dnsEnable'].forEach(function (key) {
       controls[key].addEventListener('click', function () { controls[key].classList.toggle('is-on'); });
+    });
+
+    controls.proxyLan.addEventListener('click', function () {
+      const sw = controls.proxyLan;
+      if (sw.dataset.busy === '1') return;
+      sw.dataset.busy = '1';
+      const on = sw.classList.contains('is-on');
+      const action = on ? 'stop' : 'start';
+      sw.classList.toggle('is-on', !on);
+      ctx.api.proxyToggle(action)
+        .then(function () {
+          ui.toast(action === 'start' ? '局域网接管已开启' : '局域网接管已关闭', 'ok');
+        })
+        .catch(function (error) {
+          sw.classList.toggle('is-on', on);
+          ui.toast((action === 'start' ? '开启失败: ' : '关闭失败: ') + error.message, 'error');
+        })
+        .then(function () { sw.dataset.busy = ''; });
     });
     controls.theme.classList.toggle('is-on', document.documentElement.getAttribute('data-theme') === 'dark');
     controls.theme.addEventListener('click', function () {

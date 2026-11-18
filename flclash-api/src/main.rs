@@ -147,6 +147,8 @@ async fn main() {
                 .delete(api::profiles_delete),
         )
         .route("/service/{action}", post(api::service_action))
+        .route("/proxy", get(api::proxy_status))
+        .route("/proxy/{action}", post(api::proxy_toggle))
         .route_layer(middleware::from_fn_with_state(st.clone(), auth));
 
     let app: Router<()> = Router::new()

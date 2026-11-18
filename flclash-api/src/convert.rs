@@ -643,10 +643,12 @@ fn node_lines_from(body: &str) -> (Vec<Vec<Kv>>, usize) {
 
 // -------------------------------------------------------------- yaml assembly
 
-pub const HEADER_ORDER: [&str; 8] = [
+pub const HEADER_ORDER: [&str; 10] = [
     "mixed-port",
     "socks-port",
     "port",
+    "redir-port",
+    "tproxy-port",
     "external-controller",
     "mode",
     "log-level",
@@ -654,10 +656,12 @@ pub const HEADER_ORDER: [&str; 8] = [
     "ipv6",
 ];
 
-const TOP_LEVEL_PORT_KEYS: [&str; 9] = [
+const TOP_LEVEL_PORT_KEYS: [&str; 11] = [
     "mixed-port",
     "socks-port",
     "port",
+    "redir-port",
+    "tproxy-port",
     "external-controller",
     "mode",
     "log-level",
@@ -672,6 +676,8 @@ pub fn header_map(config_path: &Path) -> Vec<(&'static str, String)> {
         ("mixed-port", "7892".into()),
         ("socks-port", "7891".into()),
         ("port", "7892".into()),
+        ("redir-port", "7893".into()),
+        ("tproxy-port", "7894".into()),
         ("external-controller", "127.0.0.1:9097".into()),
         ("mode", "rule".into()),
         ("log-level", "info".into()),

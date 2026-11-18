@@ -137,9 +137,8 @@ pub async fn save_config(
     if let Some(v) = parse_bool(patch, "ipv6") {
         runtime.insert("ipv6".into(), Value::Bool(v));
     }
-    if let Some(v) = parse_bool(patch, "tun") {
-        runtime.insert("tun".into(), serde_json::json!({"enable": v}));
-    }
+    // tun is NOT runtime-patched: taking over the router needs the full
+    // auto-route/auto-redirect block, which only a config reload applies.
     if !runtime.is_empty() {
         // Failure is deliberately non-fatal: a stopped core must not turn
         // "save settings" into an error (connection refused must not leak).
@@ -155,9 +154,8 @@ pub async fn save_config(
         .await;
     }
     let result = persist_config(&st.config_path(), patch);
-    // A dns patch changes resolver behaviour at startup, not just at runtime:
-    // apply it through a config reload when the core is up.
-    if result.is_ok() && patch.get("dns").is_some() {
+    // dns and tun patches only take effect from the startup config file.
+    if result.is_ok() && (patch.get("dns").is_some() || patch.get("tun").is_some()) {
         crate::profiles::reload_core(st).await;
     }
     result
@@ -213,11 +211,49 @@ fn render_dns_block(patch: &Value) -> Option<String> {
     Some(out)
 }
 
+
+/// Renders the tun: block. When enabled it follows the desktop client's
+/// takeover shape (auto-route + auto-redirect + dns-hijack), so enabling the
+/// switch puts the whole router and its LAN clients behind the core without
+/// any external firewall rules.
+fn render_tun_block(patch: &Value) -> Option<String> {
+    let tun = patch.get("tun")?;
+    let enable = match tun {
+        Value::Bool(v) => *v,
+        Value::Object(map) => map.get("enable").and_then(|v| v.as_bool()).unwrap_or(false),
+        _ => return None,
+    };
+    let mut out = String::from("tun:\n");
+    out.push_str(&format!("  enable: {}\n", yaml_bool(enable)));
+    if !enable {
+        return Some(out);
+    }
+    let stack = match tun {
+        Value::Object(map) => map
+            .get("stack")
+            .and_then(|v| v.as_str())
+            .unwrap_or("mixed")
+            .to_string(),
+        _ => "mixed".to_string(),
+    };
+    out.push_str("  stack: ");
+    out.push_str(&stack);
+    out.push('\n');
+    out.push_str("  auto-route: true\n");
+    out.push_str("  auto-redirect: true\n");
+    out.push_str("  auto-detect-interface: true\n");
+    out.push_str("  dns-hijack:\n");
+    out.push_str("    - any:53\n");
+    out.push_str("  mtu: 1500\n");
+    Some(out)
+}
+
 /// Mirrors a settings patch into config.yaml. Top-level scalar keys are
 /// line-edited in place; tun and dns are block-edited.
 pub fn persist_config(path: &Path, patch: &Value) -> Result<(), String> {
     let data = std::fs::read_to_string(path).map_err(|e| format!("read config: {}", e))?;
     let dns_block = render_dns_block(patch);
+    let tun_block = render_tun_block(patch);
 
     let mut scalars: Vec<(&str, String)> = Vec::new();
     if let Some(v) = parse_str(patch, "mode") {
@@ -239,6 +275,16 @@ pub fn persist_config(path: &Path, patch: &Value) -> Result<(), String> {
     if let Some(v) = parse_i64(patch, "httpPort") {
         if v > 0 {
             scalars.push(("port", v.to_string()));
+        }
+    }
+    if let Some(v) = parse_i64(patch, "redirPort") {
+        if v > 0 {
+            scalars.push(("redir-port", v.to_string()));
+        }
+    }
+    if let Some(v) = parse_i64(patch, "tproxyPort") {
+        if v > 0 {
+            scalars.push(("tproxy-port", v.to_string()));
         }
     }
     if let Some(v) = parse_bool(patch, "allowLan") {
@@ -283,7 +329,25 @@ pub fn persist_config(path: &Path, patch: &Value) -> Result<(), String> {
                 in_dns = false;
             }
         }
-        if tun.is_some() {
+        if tun_block.is_some() {
+            if at_root && key == "tun" {
+                in_tun = true;
+                tun_done = true;
+                if let Some(block) = &tun_block {
+                    for bline in block.lines() {
+                        out.push(bline.to_string());
+                    }
+                }
+                continue;
+            }
+            if in_tun {
+                if line.starts_with(' ') || line.starts_with('\t') || trimmed.is_empty() {
+                    continue; // skip old tun block lines
+                }
+                in_tun = false;
+            }
+        }
+        if at_root {
             if at_root && key == "tun" {
                 in_tun = true;
                 tun_done = true;
@@ -311,7 +375,7 @@ pub fn persist_config(path: &Path, patch: &Value) -> Result<(), String> {
         }
         out.push(line.to_string());
     }
-    let order = ["mixed-port", "socks-port", "port", "mode", "log-level", "allow-lan", "ipv6"];
+    let order = ["mixed-port", "socks-port", "port", "redir-port", "tproxy-port", "mode", "log-level", "allow-lan", "ipv6"];
     for key in order {
         if let Some((_, value)) = scalars.iter().find(|(k, _)| *k == key) {
             if !appended.contains(key) {
@@ -369,8 +433,12 @@ mod tests {
         assert!(text.contains("mixed-port: 7893"));
         assert!(text.contains("mode: global"));
         assert!(text.contains("allow-lan: true"));
+        // Enabling tun rewrites the whole block into the takeover shape.
         assert!(text.contains("enable: true"));
-        assert!(text.contains("stack: gvisor")); // untouched sibling in tun block
+        assert!(text.contains("stack: mixed"));
+        assert!(text.contains("auto-route: true"));
+        assert!(text.contains("auto-redirect: true"));
+        assert!(text.contains("dns-hijack:"));
         assert!(text.contains("proxies:"));
         std::fs::remove_dir_all(&dir).ok();
     }

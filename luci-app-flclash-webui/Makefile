@@ -42,6 +42,10 @@ define Package/luci-app-flclash-webui/install
 
 	$(INSTALL_DIR) $(1)/usr/libexec/flclash
 	$(INSTALL_BIN) ./files/usr/libexec/flclash/core-update.sh $(1)/usr/libexec/flclash/core-update.sh
+	$(INSTALL_BIN) ./files/usr/libexec/flclash/proxy-rules.sh $(1)/usr/libexec/flclash/proxy-rules.sh
+
+	$(INSTALL_DIR) $(1)/etc/init.d
+	$(INSTALL_BIN) ./files/etc/init.d/flclash-proxy $(1)/etc/init.d/flclash-proxy
 
 	$(INSTALL_DIR) $(1)/etc/uci-defaults
 	$(INSTALL_BIN) ./files/etc/uci-defaults/99-flclash-webui $(1)/etc/uci-defaults/

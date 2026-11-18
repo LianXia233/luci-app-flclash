@@ -732,6 +732,70 @@ pub async fn service_action(
     }
 }
 
+/// LAN transparent-proxy takeover, ShellClash-style: nft REDIRECT/TPROXY plus
+/// DNS hijack handled by /usr/libexec/flclash/proxy-rules.sh. Never touches
+/// the router's own outbound path, so the management plane stays alive.
+pub async fn proxy_status(State(st): State<Arc<AppState>>) -> Response {
+    let enabled = std::fs::read_to_string("/tmp/flclash-proxy.state")
+        .map(|s| s.trim() == "on")
+        .unwrap_or(false);
+    let rules = std::process::Command::new("nft")
+        .args(["list", "table", "inet", "flclash"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    let lan_if = std::fs::read_to_string("/proc/net/route")
+        .ok()
+        .and_then(|data| {
+            data.lines()
+                .skip(1)
+                .find(|l| {
+                    let f: Vec<&str> = l.split('\t').collect();
+                    f.len() > 3 && f[1] == "00000000" && f[3] != "FFFFFFFF"
+                })
+                .map(|l| l.split('\t').next().unwrap_or("").to_string())
+        })
+        .unwrap_or_else(|| "br-lan".into());
+    ok_json(json!({
+        "enabled": enabled,
+        "rulesActive": rules,
+        "lanInterface": lan_if,
+        "dnsPort": 1053,
+        "redirPort": 7893,
+        "tproxyPort": 7894,
+    }))
+}
+
+pub async fn proxy_toggle(
+    State(st): State<Arc<AppState>>,
+    Path(action): Path<String>,
+) -> Response {
+    if !matches!(action.as_str(), "start" | "stop") {
+        return fail_json(StatusCode::BAD_REQUEST, "action must be start or stop");
+    }
+    let script = "/usr/libexec/flclash/proxy-rules.sh";
+    let output = tokio::process::Command::new(script)
+        .arg(&action)
+        .output()
+        .await;
+    match output {
+        Ok(out) if out.status.success() => {
+            let _ = tokio::fs::write(
+                "/tmp/flclash-proxy.state",
+                if action == "start" { "on" } else { "off" },
+            )
+            .await;
+            ok_json(json!({"ok": true, "action": action}))
+        }
+        Ok(out) => bad_gateway(&format!(
+            "{}: {}",
+            action,
+            String::from_utf8_lossy(&out.stderr).trim()
+        )),
+        Err(err) => bad_gateway(&format!("proxy-rules.sh: {}", err)),
+    }
+}
+
 // ------------------------------------------------------------- static assets
 
 pub async fn static_index() -> Redirect {

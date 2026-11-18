@@ -81,6 +81,10 @@ window.FlClashAPI = (function () {
     version: function () { return live('version', '/version'); },
     rules: function () { return live('rules', '/rules'); },
     providers: function () { return live('providers', '/providers/proxies'); },
+    proxyStatus: function () { return live('proxyStatus', '/proxy'); },
+    proxyToggle: function (action) {
+      return live('proxyToggle', { path: '/proxy/' + encodeURIComponent(action), method: 'POST' });
+    },
     dnsResolve: function (name, type) {
       return request('/dns/resolve?name=' + encodeURIComponent(name) + '&type=' + encodeURIComponent(type || 'A'));
     },
