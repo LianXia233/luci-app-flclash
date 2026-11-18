@@ -92,6 +92,7 @@ func main() {
 	go b.sampleTraffic()
 	go b.sampleLogs()
 	go b.sampleTotals()
+	go b.applyConfiguredPorts()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/flclash/api/", b.handleAPI)
@@ -844,6 +845,43 @@ func (b *Bridge) service(action string) error {
 		return fmt.Errorf("%s: %s", err, strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+/* --------------------------------------------------------------- ports */
+
+/*
+ * The bundled core ignores mixed-port/socks-port from its YAML on startup and
+ * only binds them when the controller is patched. Apply them once the REST
+ * API is reachable so a fresh boot accepts proxy connections.
+ */
+func (b *Bridge) applyConfiguredPorts() {
+	deadline := time.Now().Add(2 * time.Minute)
+	for time.Now().Before(deadline) {
+		raw, err := os.ReadFile(b.configPath())
+		if err == nil {
+			patch := map[string]interface{}{}
+			for _, line := range strings.Split(string(raw), "\n") {
+				line = strings.TrimSpace(line)
+				if strings.HasPrefix(line, "mixed-port:") {
+					if v, e := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(line, "mixed-port:"))); e == nil && v > 0 {
+						patch["mixed-port"] = v
+					}
+				}
+				if strings.HasPrefix(line, "socks-port:") {
+					if v, e := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(line, "socks-port:"))); e == nil && v > 0 {
+						patch["socks-port"] = v
+					}
+				}
+			}
+			if len(patch) > 0 {
+				if _, _, err := b.api("PATCH", "/configs", patch); err == nil {
+					log.Printf("applied configured ports: %v", patch)
+					return
+				}
+			}
+		}
+		time.Sleep(2 * time.Second)
+	}
 }
 
 /* ------------------------------------------------------------------ routing */

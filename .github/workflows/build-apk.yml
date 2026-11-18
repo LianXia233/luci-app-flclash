@@ -13,7 +13,7 @@ env:
   GO_VERSION: '1.27.3'
   TARGET_SUBTARGET: mediatek/filogic
   SDK_DIR: sdk
-  RELEASE_TAG: apk-aarch64-cortex-a53-v3
+  RELEASE_TAG: apk-aarch64-cortex-a53-v4
 
 jobs:
   build:

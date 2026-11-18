@@ -6,11 +6,6 @@
       "type": "view",
       "path": "flclash/launch"
     },
-    "depends": {
-      "acl": [
-        "luci-app-flclash-webui"
-      ]
-    },
     "firstchild_ineligible": true
   }
 }
