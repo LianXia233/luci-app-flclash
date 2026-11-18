@@ -99,8 +99,9 @@ const methods = {
 	},
 
 	service_toggle: {
+		/* On this rpcd-ucode build declared args arrive under req.args. */
 		call: function (request) {
-			const action = (request != null) ? request.action : null;
+			const action = (request?.args?.action != null) ? request.args.action : null;
 			if (action != 'start' && action != 'stop' && action != 'restart')
 				return { code: 1, error: '未知操作' };
 
@@ -109,7 +110,8 @@ const methods = {
 			system('sleep 1');
 			const state = core_state();
 			return { code: rc, running: state.running, action: action };
-		}
+		},
+		args: { action: 'start | stop | restart' }
 	},
 
 	core_log: {
