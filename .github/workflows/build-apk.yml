@@ -13,7 +13,7 @@ env:
   GO_VERSION: '1.27.3'
   TARGET_SUBTARGET: mediatek/filogic
   SDK_DIR: sdk
-  RELEASE_TAG: apk-aarch64-cortex-a53-v2
+  RELEASE_TAG: apk-aarch64-cortex-a53-v3
 
 jobs:
   build:
@@ -54,6 +54,18 @@ jobs:
               -o "$GITHUB_WORKSPACE/flclash-core/files/usr/bin/mihomo-arm64" .
           file "$GITHUB_WORKSPACE/flclash-core/files/usr/bin/mihomo-arm64"
 
+      # The bridge is stdlib-only; vet catches the usual wiring mistakes before
+      # the cross build, and the binary is statically linked like the core.
+      - name: Build FlClash API bridge (linux/arm64)
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/flclash-api/files/usr/bin"
+          cd "$GITHUB_WORKSPACE/flclash-api"
+          go vet ./...
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
+            go build -trimpath -ldflags "-s -w" \
+              -o files/usr/bin/flclash-api .
+          file files/usr/bin/flclash-api
+
       - name: Download OpenWrt SNAPSHOT SDK (mediatek/filogic)
         run: |
           BASE="https://downloads.openwrt.org/snapshots/targets/${TARGET_SUBTARGET}"
@@ -69,8 +81,10 @@ jobs:
       - name: Stage packages into SDK
         run: |
           mkdir -p "$SDK_DIR/package/flclash-core" \
+                   "$SDK_DIR/package/flclash-api" \
                    "$SDK_DIR/package/luci-app-flclash-webui"
           cp -a "$GITHUB_WORKSPACE/flclash-core/." "$SDK_DIR/package/flclash-core/"
+          cp -a "$GITHUB_WORKSPACE/flclash-api/." "$SDK_DIR/package/flclash-api/"
           cp -a "$GITHUB_WORKSPACE/luci-app-flclash-webui/." "$SDK_DIR/package/luci-app-flclash-webui/"
 
       - name: Build apk packages
@@ -78,20 +92,26 @@ jobs:
           cd "$SDK_DIR"
           make defconfig
           make -j"$(nproc)" package/flclash-core/compile
+          make -j"$(nproc)" package/flclash-api/compile
           make -j"$(nproc)" package/luci-app-flclash-webui/compile
           echo "=== built flclash apk ==="
-          find bin -type f \( -name 'flclash-core-*.apk' -o -name 'luci-app-flclash-webui-*.apk' \) -print
+          find bin -type f \( \
+            -name 'flclash-core-*.apk' -o \
+            -name 'flclash-api-*.apk' -o \
+            -name 'luci-app-flclash-webui-*.apk' \) -print
 
       - name: Collect artifacts
         run: |
           mkdir -p "$GITHUB_WORKSPACE/artifacts"
-          # 只收集本项目的两个包，避免上传整个 bin 的 kmod 触发 GitHub 速率限制
+          # 只收集本项目的三个包，避免上传整个 bin 的 kmod 触发 GitHub 速率限制
           find "$SDK_DIR/bin" -type f \
-            \( -name 'flclash-core-*.apk' -o -name 'luci-app-flclash-webui-*.apk' \) \
+            \( -name 'flclash-core-*.apk' -o \
+               -name 'flclash-api-*.apk' -o \
+               -name 'luci-app-flclash-webui-*.apk' \) \
             -exec cp -v {} "$GITHUB_WORKSPACE/artifacts/" \;
           ls -lh "$GITHUB_WORKSPACE/artifacts"
-          test "$(find "$GITHUB_WORKSPACE/artifacts" -name '*.apk' | wc -l)" -ge 2 \
-            || { echo "Expected 2 flclash apk, got fewer"; exit 1; }
+          test "$(find "$GITHUB_WORKSPACE/artifacts" -name '*.apk' | wc -l)" -ge 3 \
+            || { echo "Expected 3 flclash apk, got fewer"; exit 1; }
 
       - name: Upload apk artifact
         uses: actions/upload-artifact@v6
@@ -106,12 +126,13 @@ jobs:
           tag_name: ${{ env.RELEASE_TAG }}
           name: FlClash OpenWrt apk - aarch64_cortex-a53
           body: |
-            FlClash WebUI + static mihomo core for OpenWrt master / SNAPSHOT (aarch64_cortex-a53).
+            FlClash WebUI + static mihomo core + API bridge for OpenWrt master / SNAPSHOT (aarch64_cortex-a53).
 
             Built from source in GitHub Actions: Go ${{ env.GO_VERSION }} static core (CGO_ENABLED=0, with_gvisor) + OpenWrt SNAPSHOT SDK (${{ env.TARGET_SUBTARGET }}).
 
             Packages:
             - flclash-core: static mihomo core, installed as /usr/bin/mihomo
+            - flclash-api: stdlib-only bridge, exposes /flclash/api on port 9098
             - luci-app-flclash-webui: LuCI launcher + HTML5 WebUI
           files: artifacts/*.apk
           generate_release_notes: false

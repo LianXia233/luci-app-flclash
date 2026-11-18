@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-flclash-webui
 PKG_VERSION:=1.1.0
-PKG_RELEASE:=1
+PKG_RELEASE:=2
 
 PKG_MAINTAINER:=FlClash WebUI
 PKG_LICENSE:=GPL-3.0-only
@@ -14,7 +14,7 @@ define Package/luci-app-flclash-webui
   CATEGORY:=LuCI
   SUBMENU:=3. Applications
   TITLE:=FlClash WebUI launcher
-  DEPENDS:=+flclash-core +luci-base +uhttpd +rpcd
+  DEPENDS:=+flclash-core +flclash-api +luci-base +rpcd +rpcd-mod-ucode
   PKGARCH:=all
 endef
 

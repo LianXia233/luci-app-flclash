@@ -15,19 +15,19 @@ return view.extend({
 		return uci.load('flclash').catch(function () { /* defaults below */ });
 	},
 
-	readOption: function (name, fallback) {
-		var value = uci.get('flclash', 'main', name);
+	readOption: function (section, name, fallback) {
+		var value = uci.get('flclash', section, name);
 		return (value === null || value === undefined || value === '') ? fallback : value;
 	},
 
 	targetUrl: function () {
-		var path = String(this.readOption('webui_path', '/flclash/'));
+		var path = String(this.readOption('webui', 'webui_path', '/flclash/'));
 		if (path.charAt(0) !== '/')
 			path = '/' + path;
 		if (path.charAt(path.length - 1) !== '/')
 			path += '/';
 
-		var port = parseInt(this.readOption('webui_port', '80'), 10) || 80;
+		var port = parseInt(this.readOption('webui', 'webui_port', '9098'), 10) || 9098;
 		if (port === 80 || port === 443)
 			return path;
 
@@ -36,16 +36,28 @@ return view.extend({
 		return scheme + '://' + host + ':' + port + path;
 	},
 
+	/*
+	 * The core package installs /etc/init.d/flclash-core. A companion API
+	 * bridge, when present, is started first so the WebUI finds a live
+	 * backend as soon as the redirect lands.
+	 */
 	startService: function () {
-		if (this.readOption('enabled', '1') === '0')
+		if (this.readOption('main', 'enabled', '1') === '0')
 			return Promise.reject(new Error('服务已在配置中禁用'));
 
-		return fs.exec('/etc/init.d/flclash', ['start']).then(function (result) {
-			/* procd reports the command's own status; a running instance exits 0. */
-			if (result && typeof result.code === 'number' && result.code !== 0)
-				throw new Error((result.stderr || result.stdout || '').trim() || ('启动失败，退出码 ' + result.code));
-			return result;
-		});
+		/* The API bridge is optional: ignore failures so a missing or broken
+		 * bridge never blocks the core from starting. */
+		var api = fs.exec('/etc/init.d/flclash-api', ['start']).catch(function () { });
+
+		var core = function () {
+			return fs.exec('/etc/init.d/flclash-core', ['start']).then(function (result) {
+				if (result && typeof result.code === 'number' && result.code !== 0)
+					throw new Error((result.stderr || result.stdout || '').trim() ||
+						('启动内核失败，退出码 ' + result.code));
+			});
+		};
+
+		return api.then(core);
 	},
 
 	render: function () {

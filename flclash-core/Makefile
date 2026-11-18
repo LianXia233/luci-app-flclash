@@ -2,29 +2,27 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=flclash-core
 PKG_VERSION:=1.19.33
-PKG_RELEASE:=1
+PKG_RELEASE:=2
 
 PKG_MAINTAINER:=FlClash WebUI
 PKG_LICENSE:=GPL-3.0-only
 
-# Prebuilt static Go core. CGO_ENABLED=0 + with_gvisor, built with Go 1.27.3.
-# Binary assets are architecture-specific; select the matching prebuilt file.
+# Prebuilt static Go core (CGO_ENABLED=0, with_gvisor).
+# Binary assets are architecture-specific; never fall back to a foreign arch.
 ifeq ($(ARCH),aarch64)
   CORE_BIN:=mihomo-arm64
-  PKGARCH:=aarch64_cortex-a53
 else ifeq ($(ARCH),arm)
   CORE_BIN:=mihomo-armv7
-  PKGARCH:=arm_cortex-a7_neon-vfpv4
 else ifeq ($(ARCH),x86_64)
   CORE_BIN:=mihomo-amd64
-  PKGARCH:=x86_64
 else ifeq ($(ARCH),mipsel)
   CORE_BIN:=mihomo-mipsle
-  PKGARCH:=mipsel_24kc
 else
-  CORE_BIN:=mihomo-arm64
-  PKGARCH:=all
+  $(error flclash-core: unsupported ARCH '$(ARCH)'; build a matching core with scripts/build-core.sh)
 endif
+
+# Package architecture follows the target, not a hard-coded board name.
+PKGARCH:=$(if $(ARCH_PACKAGES),$(ARCH_PACKAGES),$(ARCH))
 
 include $(INCLUDE_DIR)/package.mk
 

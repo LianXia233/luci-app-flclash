@@ -1,12 +1,19 @@
 {
   "luci-app-flclash-webui": {
-    "description": "Grant read-only access to live system proxy information",
+    "description": "Start/stop the FlClash core and read live system proxy information",
     "read": {
       "ubus": {
         "flclash": ["system_proxy"]
       },
-      "uci": ["flclash", "homeproxy"]
+      "uci": ["flclash"]
     },
-    "write": {}
+    "write": {
+      "file": {
+        "exec": {
+          "/etc/init.d/flclash-core": ["start", "stop", "restart"],
+          "/etc/init.d/flclash-api": ["start", "stop", "restart"]
+        }
+      }
+    }
   }
 }

@@ -24,7 +24,7 @@ for f in "$DIR"/mihomo-*; do
   file "$f"
 
   check "ELF executable" sh -c "file '$f' | grep -q 'ELF'"
-  check "statically linked" sh -c "file '$f' | grep -q 'statically linked' || file '$f' | grep -qv 'dynamically linked'"
+  check "statically linked" sh -c "! file '$f' | grep -q 'dynamically linked'"
   check "stripped (no symbols)" sh -c "file '$f' | grep -q 'stripped'"
 
   case "$(basename "$f")" in

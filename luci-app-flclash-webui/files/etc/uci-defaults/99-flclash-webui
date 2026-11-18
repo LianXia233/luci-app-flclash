@@ -3,18 +3,31 @@
 # /etc/config/flclash is installed by the flclash-core package.
 # This script only fills missing keys and never writes credentials.
 
-uci -q get flclash.main >/dev/null || uci add flclash main
-uci -q get flclash.main.enabled || uci set flclash.main.enabled='1'
-uci -q get flclash.main.config_file || uci set flclash.main.config_file='/etc/flclash/config.yaml'
-uci -q get flclash.main.external_controller || uci set flclash.main.external_controller='127.0.0.1:9097'
-uci -q get flclash.main.mixed_port || uci set flclash.main.mixed_port='7892'
-uci -q get flclash.main.mode || uci set flclash.main.mode='rule'
-uci -q get flclash.main.log_level || uci set flclash.main.log_level='info'
+[ -f /etc/config/flclash ] || touch /etc/config/flclash
 
-uci -q get flclash.webui >/dev/null || uci add flclash webui
-uci -q get flclash.webui.enabled || uci set flclash.webui.enabled='1'
-uci -q get flclash.webui.webui_path || uci set flclash.webui.webui_path='/flclash/'
-uci -q get flclash.webui.webui_port || uci set flclash.webui.webui_port='80'
+uci -q get flclash.main >/dev/null || uci set flclash.main=flclash
+uci -q get flclash.main.enabled >/dev/null || uci set flclash.main.enabled='1'
+uci -q get flclash.main.config_file >/dev/null || uci set flclash.main.config_file='/etc/flclash/config.yaml'
+uci -q get flclash.main.external_controller >/dev/null || uci set flclash.main.external_controller='127.0.0.1:9097'
+uci -q get flclash.main.mixed_port >/dev/null || uci set flclash.main.mixed_port='7892'
+uci -q get flclash.main.mode >/dev/null || uci set flclash.main.mode='rule'
+uci -q get flclash.main.log_level >/dev/null || uci set flclash.main.log_level='info'
+
+uci -q get flclash.api >/dev/null || uci set flclash.api=flclash
+uci -q get flclash.api.enabled >/dev/null || uci set flclash.api.enabled='1'
+uci -q get flclash.api.listen >/dev/null || uci set flclash.api.listen='0.0.0.0:9098'
+uci -q get flclash.api.ui_dir >/dev/null || uci set flclash.api.ui_dir='/www/flclash'
+uci -q get flclash.api.data_dir >/dev/null || uci set flclash.api.data_dir='/etc/flclash'
+
+uci -q get flclash.webui >/dev/null || uci set flclash.webui=flclash
+uci -q get flclash.webui.enabled >/dev/null || uci set flclash.webui.enabled='1'
+uci -q get flclash.webui.webui_path >/dev/null || uci set flclash.webui.webui_path='/flclash/'
+uci -q get flclash.webui.webui_port >/dev/null || uci set flclash.webui.webui_port='9098'
 
 uci commit flclash
+
+# procd services are enabled on first install; idempotent on upgrades.
+[ -x /etc/init.d/flclash-core ] && /etc/init.d/flclash-core enable >/dev/null 2>&1
+[ -x /etc/init.d/flclash-api ] && /etc/init.d/flclash-api enable >/dev/null 2>&1
+
 exit 0
