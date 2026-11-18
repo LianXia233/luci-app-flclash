@@ -39,9 +39,9 @@ jobs:
         run: |
           mkdir -p "$GITHUB_WORKSPACE/flclash-api/files/usr/bin"
           cd flclash-api
-          cargo test --locked
+          cargo test
           RUSTFLAGS="-C link-self-contained=yes -C linker=rust-lld" \
-            cargo build --release --locked --target aarch64-unknown-linux-musl
+            cargo build --release --target aarch64-unknown-linux-musl
           file target/aarch64-unknown-linux-musl/release/flclash-api
           cp target/aarch64-unknown-linux-musl/release/flclash-api files/usr/bin/flclash-api
 
