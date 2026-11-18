@@ -1,0 +1,23 @@
+[package]
+name = "flclash-api"
+version = "1.2.0"
+edition = "2021"
+description = "FlClash WebUI backend bridge (Tokio) for OpenWrt: exposes /flclash/api on top of the local mihomo controller and serves the static WebUI from the same origin."
+
+[[bin]]
+name = "flclash-api"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "process", "sync", "fs"] }
+axum = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

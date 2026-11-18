@@ -1,29 +1,25 @@
 <!doctype html>
-<html lang="zh-CN" data-theme="light">
+<html lang="zh-CN" data-theme="dark">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <meta name="theme-color" content="#f2f2f7">
+  <meta name="theme-color" content="#0b0b0d">
   <meta name="flclash-api-base" content="/flclash/api">
   <title>FlClash</title>
+  <link rel="preload" href="fonts/material-symbols.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="icon" href="img/icon.png" type="image/png">
   <link rel="stylesheet" href="css/app.css">
   <link rel="stylesheet" href="css/views.css">
 </head>
 <body>
   <div class="app-shell">
-    <aside class="sidebar" id="sidebar">
-      <div class="brand">
-        <span class="brand-mark" aria-hidden="true">
-          <svg viewBox="0 0 24 24"><path d="M4 7.5 12 3l8 4.5v9L12 21l-8-4.5v-9Z"/><path d="m8.4 13.8 2.4 2.3 4.8-5.1"/></svg>
-        </span>
-        <span class="brand-text">FlClash</span>
-      </div>
-      <nav class="side-nav" id="side-nav" aria-label="主导航"></nav>
-      <div class="side-foot">
-        <div class="side-status" id="side-status">
-          <span class="dot"></span><span id="side-status-text">正在连接</span>
-        </div>
-        <div class="side-version" id="side-version">WebUI</div>
+    <aside class="rail" id="rail">
+      <div class="brand" aria-hidden="true"><img src="img/icon.png" alt="" width="30" height="30"></div>
+      <button class="rail-btn rail-top" id="rail-collapse" type="button" aria-label="收起导航" data-icon="sidebar"></button>
+      <nav class="rail-nav" id="rail-nav" aria-label="主导航"></nav>
+      <div class="rail-foot">
+        <button class="rail-btn" id="rail-theme" type="button" aria-label="切换主题" data-icon="theme"></button>
+        <button class="rail-btn" id="rail-status" type="button" aria-label="核心状态" data-icon="status"></button>
       </div>
     </aside>
 
@@ -31,15 +27,16 @@
       <header class="app-header">
         <div class="header-copy">
           <h1 id="page-title">仪表盘</h1>
+          <div class="header-mini" id="header-mini" aria-hidden="true">
+            <span class="mini-row"><i data-icon="arrowUp" data-icon-size="12"></i><b id="mini-up">0 B/s</b></span>
+            <span class="mini-row"><i data-icon="arrowDown" data-icon-size="12"></i><b id="mini-down">0 B/s</b></span>
+          </div>
           <p class="header-sub" id="page-sub"></p>
         </div>
         <div class="header-actions">
-          <div class="header-traffic" id="header-traffic" aria-hidden="true">
-            <span class="traffic-up"><i></i><b>0 B/s</b></span>
-            <span class="traffic-down"><i></i><b>0 B/s</b></span>
-          </div>
+          <div class="header-traffic" id="header-traffic" aria-hidden="true"></div>
+          <button class="icon-button layout-edit" id="layout-edit" type="button" aria-label="编辑仪表盘" title="编辑仪表盘" data-icon="edit"></button>
           <button class="round-action is-ok" id="core-status" type="button" aria-label="核心状态" title="核心状态"></button>
-          <button class="round-action" id="theme-toggle" type="button" aria-label="切换主题" title="切换主题"></button>
         </div>
       </header>
       <section class="view-root" id="view-root" aria-live="polite"></section>
@@ -53,7 +50,7 @@
     <header class="sheet-head">
       <div class="sheet-handle" aria-hidden="true"></div>
       <h2 class="sheet-title" id="sheet-title"></h2>
-      <button class="icon-button" id="sheet-close" type="button" aria-label="关闭"></button>
+      <button class="icon-button" id="sheet-close" type="button" aria-label="关闭" data-icon="close"></button>
     </header>
     <div class="sheet-body" id="sheet-body"></div>
   </section>
@@ -66,6 +63,14 @@
   <script src="js/ui.js"></script>
   <script src="js/mock.js"></script>
   <script src="js/api.js"></script>
+  <script src="js/views/proxies.js"></script>
+  <script src="js/views/profiles.js"></script>
+  <script src="js/views/requests.js"></script>
+  <script src="js/views/logs.js"></script>
+  <script src="js/views/rules.js"></script>
+  <script src="js/views/dns.js"></script>
+  <script src="js/views/tools.js"></script>
+  <script src="js/views/settings.js"></script>
   <script src="js/views.js"></script>
   <script src="js/app.js"></script>
 </body>

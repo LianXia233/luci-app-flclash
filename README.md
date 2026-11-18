@@ -1,127 +1,87 @@
 # luci-app-flclash
 
-FlClash WebUI + mihomo 静态内核 + 同源 API 桥接，面向 OpenWrt 主线（master）与
-SNAPSHOT 快照版，目标架构 `aarch64_cortex-a53`。
+FlClash WebUI + mihomo 静态内核 + **Rust/Tokio** 同源 API 桥接,面向 OpenWrt
+主线(master)与 SNAPSHOT 快照版,目标架构 `aarch64_cortex-a53`。
+
+功能对齐上游 FlClash(chen08209):订阅导入与自动转换、配置管理(更新 /
+编辑 / 自动更新 / 流量与到期)、代理组与节点测速、连接、日志、规则、DNS
+进阶(fake-ip / redir-host,DoH / DoT / bootstrap)、仪表盘(IP 资料、地区、
+质量)、内核停止后 WebUI 全功能可用、LuCI 内启停开关与内核更新。
 
 ## 架构
 
 ```
-浏览器 ──► LuCI「服务 → FlClash」 ──► /etc/init.d/flclash-api  (先起桥接)
-                                   ├─► /etc/init.d/flclash-core (再起内核)
-                                   └─► 跳转 http://<router>:9098/flclash/
+浏览器 ──► LuCI「服务 → FlClash」(服务开关 / 内核更新 / 日志) ──► /etc/init.d/flclash-api
+                                   ├─► /etc/init.d/flclash-core (mihomo)
+                                   └─► http://<router>:9098/flclash/
 
-浏览器 ──► 9098 /flclash/        静态 WebUI（bridge 同源提供）
-        └─ 9098 /flclash/api/*   Go 桥接 ──► 127.0.0.1:9097 (mihomo controller)
+浏览器 ──► 9098 /flclash/        静态 WebUI(bridge 同源提供)
+        └─ 9098 /flclash/api/*   Rust/Tokio 桥接 ──► 127.0.0.1:9097 (mihomo controller)
 ```
 
-- **LuCI 只做两件事**：启动服务、跳转 WebUI。
-- **WebUI**：HTML5 + CSS + JS，功能与 FlClash 对齐；不直接接触内核。
-- **flclash-api**：stdlib-only 静态 Go 程序，补齐 FlClash 语义并转发 mihomo 原生接口。
-- **flclash-core**：静态 mihomo 内核（`CGO_ENABLED=0`、`with_gvisor`），由 procd 托管。
+- **LuCI**:单页(`admin/services/flclash`,服务 / 日志双标签),启停服务、
+  更新内核、一键进 WebUI。通过 rpcd ucode 对象 `flclash` 读写,视图内使用
+  直连 fetch 调 `admin/ubus`(见 AGENTS.md 的 rpc.js 约束)。
+- **WebUI**:HTML5 + CSS + JS(每视图一个文件),Material Symbols 图标字体,
+  PC 导航栏 / 手机底部导航,响应式配置抽屉(PC 右侧 / 手机底部,禁遮罩关闭
+  + 未保存保护)。
+- **flclash-api**:Rust/Tokio(axum)静态 musl 二进制。订阅格式识别与转换
+  (Clash YAML / base64 节点列表 / ss ssr vmess vless trojan hysteria2 tuic
+  分享链接),配置持久化,DNS 覆写,自动更新,出口 IP 资料 / 质量,内核停止
+  时全接口优雅降级。
+- **flclash-core**:静态 mihomo 内核(`CGO_ENABLED=0`、`with_gvisor`),procd
+  托管;LuCI 可在线更新到上游最新版。
 
 ## 包与端口
 
 | 包 | 作用 | 安装内容 |
 | --- | --- | --- |
 | `flclash-core` | 内核 | `/usr/bin/mihomo`、`/etc/init.d/flclash-core`、`/etc/config/flclash` |
-| `flclash-api` | API 桥接 | `/usr/bin/flclash-api`、`/etc/init.d/flclash-api` |
-| `luci-app-flclash-webui` | 入口 + 静态页 | menu.d、ACL、launch.js、`/www/flclash/` |
+| `flclash-api` | API 桥接(Rust) | `/usr/bin/flclash-api`、`/etc/init.d/flclash-api` |
+| `luci-app-flclash-webui` | LuCI 入口 + WebUI | menu、ACL、launch 视图、rpcd 对象、core-update.sh、`/www/flclash/` |
 
-默认监听：
+默认监听:mihomo controller `127.0.0.1:9097`(仅回环);桥接/WebUI
+`0.0.0.0:9098`(LAN);可选 `api.secret` 请求头校验。
 
-- mihomo controller：`127.0.0.1:9097`（仅回环，不对外）
-- 桥接/WebUI：`0.0.0.0:9098`（局域网访问；可选 `api.secret`）
-- LuCI 菜单跳转目标：`http://<host>:9098/flclash/`
-
-## 桥接层实现（`flclash-api/main.go`）
-
-仅使用 Go 标准库，单文件：
-
-- 静态资源：`/flclash/` 由 `http.FileServer` 提供，`/` 302 到 `/flclash/`；
-- 认证：设置 `api.secret` 后，API 需 `X-FlClash-Secret` 或 `Authorization: Bearer`；
-- 启动后自动把 `mixed-port` / `socks-port` `PATCH` 到控制器：随包内核会忽略 YAML 里的端口，
-  不补这一步重启后不会监听代理端口；
-- LuCI 菜单不声明 `depends.acl`，避免 root 会话没有 ACL 组时入口被隐藏；
-  启动脚本的执行权限仍由 `rpcd` ACL 控制；
-- 后台采样：`/traffic`（速率与历史）、`/logs`（最近 500 条）、`/connections`
-  （累计流量），供 `/status` 使用；
-- 语义映射：
+## 桥接层(`flclash-api/`,Rust 单 crate 多模块)
 
 | FlClash API | 实现 |
 | --- | --- |
-| `GET /status` | `/version` + `/configs` + `/connections` + 采样缓存 + `/proc` 内存/运行时长 |
-| `GET /proxies` | `/proxies` map → `{groups, nodes}` |
-| `POST /proxies/select` | `PUT /proxies/{group}` |
-| `POST /proxies/delay` | `GET /proxies/{name}/delay` |
-| `GET /connections` | 字段映射（chains/rule/upload/download/start） |
-| `DELETE /connections/{id}` | `DELETE /connections/{id}` |
-| `GET /config` / `PUT /config` | `/configs` 读取 / `PATCH /configs` |
-| `GET /logs` | 采样缓存数组 |
-| `GET /profiles` | `/etc/flclash/index.json` + `profiles/*.yaml` |
-| `POST /profiles/import` | 下载订阅并落盘 |
-| `POST /profiles/{id}/apply` | 复制为 `config.yaml` 并 `PUT /configs {path}` |
-| `DELETE /profiles/{id}` | 删除索引与文件 |
-| `POST /service/{action}` | 调用 `/etc/init.d/flclash-core` |
-| `GET /system/proxy` | 只读汇总（端口/模式/IPv6/运行状态） |
+| `GET /status` | 控制器 + config.yaml 文件回退(内核停止仍完整)+ 出口 IP 资料/质量 |
+| `GET /proxies` | `{groups, nodes}`;内核停止返回空集(200) |
+| `POST /proxies/select` `POST /proxies/delay` `POST /proxies/group-delay` | 组/节点测速与切换 |
+| `GET /connections` `DELETE /connections/{id}` | 连接列表与关闭 |
+| `GET /config` `PUT /config` | 标量 + `dns` 块;持久化到 config.yaml(重启保留),内核停止仍可保存 |
+| `GET /rules` `GET /providers/proxies` `GET /dns/resolve` | 控制器透传 |
+| `GET /logs` | 采样缓存(ring buffer) |
+| `GET /profiles` `POST /profiles/import` `POST /profiles/{id}/update` | 订阅管理:下载→转换→元数据(节点/组/规则/流量/到期) |
+| `POST /profiles/{id}/apply` | 转换→原子写 config.yaml→重载或启动内核 |
+| `PATCH /profiles/{id}` | 名称 / URL / 自动更新间隔 |
+| `POST /service/{action}` | 内核 init 脚本 |
+| 静态 | `/flclash/` 同源提供 WebUI(含 Material Symbols 字体) |
 
-未实现/降级：`GET /dns/queries` 返回空数组（mihomo 不提供查询历史）；
-`POST /dns/flush` 尽力调用 `/cache/fakeip/flush`。
+内核停止时的降级契约:读接口 200 + 文件回显;依赖内核的写操作返回明确
+503「内核未运行」,不泄漏 dial 错误;`apply` 会自行拉起内核。
 
-## UCI
+## CI
 
-`/etc/config/flclash`：
+`.github/workflows/build-apk.yml`:cargo test → rust-lld 静态交叉编译
+aarch64-musl → 编译静态 mihomo → OpenWrt SNAPSHOT SDK 打包三个 apk →
+Release(tag `apk-aarch64-cortex-a53-v5`)。
 
-```uci
-config flclash 'main'
-    option enabled '1'
-    option config_file '/etc/flclash/config.yaml'
-    option external_controller '127.0.0.1:9097'
-    option mixed_port '7892'
-    option mode 'rule'
-    option log_level 'info'
-
-config flclash 'api'
-    option enabled '1'
-    option listen '0.0.0.0:9098'
-    option ui_dir '/www/flclash'
-    option data_dir '/etc/flclash'
-    option secret ''          # 非空时 API 需要请求头校验
-
-config flclash 'webui'
-    option enabled '1'
-    option webui_path '/flclash/'
-    option webui_port '9098'
-```
-
-> `api.secret` 同时作为桥接的客户端凭据与转发给 mihomo 的 `Authorization`；
-> 若内核侧单独配置了 `secret`，请保持一致，或保持两者为空并依赖 LAN 访问控制。
-
-## 构建
-
-### CI（推荐）
-
-`.github/workflows/build-apk.yml` 会：
-
-1. 拉取 FlClash / Clash.Meta 并编译 `mihomo-arm64`；
-2. 在 `flclash-api/` 执行 `go vet ./...` 与静态交叉编译；
-3. 下载 OpenWrt SNAPSHOT SDK（`mediatek/filogic`）；
-4. 编译三个包并收集 `.apk`（数量少于 3 直接失败）；
-5. 上传 artifact 并发布 Release。
-
-### 本地
+## 本地构建桥接
 
 ```bash
-./scripts/build-core.sh
-./scripts/verify-core.sh ./flclash-core/files/usr/bin
-
 cd flclash-api
-CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "-s -w" \
-  -o files/usr/bin/flclash-api .
+cargo test
+RUSTFLAGS="-C link-self-contained=yes -C linker=rust-lld" \
+  cargo build --release --target aarch64-unknown-linux-musl
+# 产物: target/aarch64-unknown-linux-musl/release/flclash-api (~1.1 MB 静态)
 ```
 
 ## 兼容性
 
-- OpenWrt master / SNAPSHOT（apk）；24.10（opkg）同样适用，包定义未使用 apk 专有语法。
-- 内核与桥接均为静态 ELF，无 glibc/musl 运行时依赖。
-- 包架构由 OpenWrt 构建系统自动推导，不硬编码板型；不支持的架构在打包阶段直接报错，不会误装 arm64 二进制。
-- `flclash-core` 首启自动生成最小 `config.yaml`，不再因缺配置进入 respawn 循环。
+- OpenWrt master / SNAPSHOT(apk);24.10(opkg)同样适用。
+- 内核与桥接均为静态 ELF,无 glibc/musl 运行时依赖。
+- `flclash-core` 首启自动生成最小 `config.yaml`;订阅导入路径保证写入的
+  配置永远是内核可加载的 YAML(历史上的 base64 直写崩溃已根治)。

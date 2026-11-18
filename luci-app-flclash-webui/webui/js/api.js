@@ -1,3 +1,4 @@
+/* FlClash WebUI — API client. One method per backend contract endpoint. */
 window.FlClashAPI = (function () {
   'use strict';
 
@@ -75,22 +76,20 @@ window.FlClashAPI = (function () {
     profiles: function () { return live('profiles', '/profiles'); },
     proxies: function () { return live('proxies', '/proxies'); },
     connections: function () { return live('connections', '/connections'); },
-    dnsQueries: function () { return live('dnsQueries', '/dns/queries'); },
     logs: function () { return live('logs', '/logs'); },
     config: function () { return live('config', '/config'); },
     version: function () { return live('version', '/version'); },
+    rules: function () { return live('rules', '/rules'); },
+    providers: function () { return live('providers', '/providers/proxies'); },
+    dnsResolve: function (name, type) {
+      return request('/dns/resolve?name=' + encodeURIComponent(name) + '&type=' + encodeURIComponent(type || 'A'));
+    },
 
-    /**
-     * Read-only live system proxy information.
-     * Never sends credentials and never writes device state.
-     * Preference: Go bridge (/system/proxy) -> rpcd ubus -> mock.
-     */
     systemProxy: function () {
       if (cfg.mock && mock && typeof mock.systemProxy === 'function') {
         return mock.systemProxy();
       }
       return request('/system/proxy').catch(function () {
-        // rpcd ubus read-only call; auth token is supplied by the host page.
         return request(cfg.ubusBase + '?auth=' + encodeURIComponent(cfg.secret || ''), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -105,6 +104,12 @@ window.FlClashAPI = (function () {
     importProfile: function (profileUrl) {
       return live('importProfile', { path: '/profiles/import', method: 'POST' }, { url: profileUrl });
     },
+    updateProfile: function (id) {
+      return live('updateProfile', { path: '/profiles/' + encodeURIComponent(id) + '/update', method: 'POST' });
+    },
+    editProfile: function (id, patch) {
+      return live('editProfile', { path: '/profiles/' + encodeURIComponent(id), method: 'PATCH' }, patch);
+    },
     applyProfile: function (id) {
       return live('applyProfile', { path: '/profiles/' + encodeURIComponent(id) + '/apply', method: 'POST' });
     },
@@ -116,6 +121,9 @@ window.FlClashAPI = (function () {
     },
     testDelay: function (name) {
       return live('testDelay', { path: '/proxies/delay', method: 'POST' }, { name: name });
+    },
+    testGroupDelay: function (group) {
+      return live('testGroupDelay', { path: '/proxies/group-delay', method: 'POST' }, { group: group });
     },
     closeConnection: function (id) {
       return live('closeConnection', { path: '/connections/' + encodeURIComponent(id), method: 'DELETE' });

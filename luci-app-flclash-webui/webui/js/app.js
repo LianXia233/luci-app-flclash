@@ -1,4 +1,7 @@
-/* FlClash WebUI — shell, router and dashboard. */
+/* FlClash WebUI — shell, router and dashboard (aligned with the desktop
+ * client: status card with flower FAB, speed cards with peak/total/chart,
+ * outbound-mode segments, takeover tiles, profile/service/memory cards,
+ * live connections table and proxy groups). */
 (function () {
   'use strict';
 
@@ -6,15 +9,15 @@
   const cfg = window.FlClashConfig;
   const ui = window.FlClashUI;
   const views = window.FlClashViews;
-  const icon = ui.icon;
+  const icon = window.FlClashIcons.svg;
+  const flower = window.FlClashIcons.flower;
 
   const viewRoot = document.getElementById('view-root');
   const pageTitle = document.getElementById('page-title');
   const pageSub = document.getElementById('page-sub');
   const headerTraffic = document.getElementById('header-traffic');
-  const sideStatus = document.getElementById('side-status');
-  const sideStatusText = document.getElementById('side-status-text');
-  const sideVersion = document.getElementById('side-version');
+  const miniUp = document.getElementById('mini-up');
+  const miniDown = document.getElementById('mini-down');
 
   const state = {
     status: null,
@@ -22,10 +25,9 @@
     profiles: null,
     connections: null,
     logs: null,
-    dns: null,
+    rules: null,
     config: null,
     history: { up: [], down: [] },
-    loaded: false,
     offline: false
   };
 
@@ -33,19 +35,13 @@
     { id: 'dashboard', label: '仪表盘', glyph: 'dashboard' },
     { id: 'proxies', label: '代理', glyph: 'proxies' },
     { id: 'profiles', label: '配置', glyph: 'profiles' },
-    { id: 'requests', label: '请求', glyph: 'requests' },
+    { id: 'requests', label: '连接', glyph: 'requests' },
     { id: 'tools', label: '工具', glyph: 'tools' }
   ];
 
   const META = {
-    dashboard: '仪表盘',
-    proxies: '代理',
-    profiles: '配置',
-    requests: '请求',
-    tools: '工具',
-    dns: 'DNS',
-    logs: '日志',
-    settings: '设置'
+    dashboard: '仪表盘', proxies: '代理', profiles: '配置', requests: '连接',
+    tools: '工具', dns: 'DNS 测试', logs: '日志', rules: '规则', settings: '设置'
   };
 
   let current = 'dashboard';
@@ -57,16 +53,18 @@
   function isMobile() { return window.innerWidth < 860; }
 
   function buildNav() {
-    const side = document.getElementById('side-nav');
+    const side = document.getElementById('rail-nav');
     const bottom = document.getElementById('bottom-nav');
     side.innerHTML = NAV.map(function (item) {
-      return '<button class="side-item" data-view="' + item.id + '" type="button">' +
-        '<span data-icon="' + item.glyph + '"></span><span>' + item.label + '</span></button>';
+      return '<button class="rail-item" data-view="' + item.id + '" type="button" title="' + item.label + '">' +
+        '<span class="rail-glyph" data-icon="' + item.glyph + '"></span><span class="rail-label">' + item.label + '</span></button>';
     }).join('');
-    bottom.innerHTML = NAV.map(function (item) {
+    bottom.innerHTML = NAV.filter(function (item) { return item.id !== 'tools'; }).map(function (item) {
       return '<button class="bottom-item" data-view="' + item.id + '" type="button">' +
-        '<span data-icon="' + item.glyph + '"></span><span>' + item.label + '</span></button>';
-    }).join('');
+        '<span class="bottom-inner"><span data-icon="' + item.glyph + '"></span><span>' + item.label + '</span></span></button>';
+    }).join('') +
+      '<button class="bottom-item" data-view="tools" type="button">' +
+      '<span class="bottom-inner"><span data-icon="tools"></span><span>工具</span></span></button>';
     window.FlClashIcons.mount(side);
     window.FlClashIcons.mount(bottom);
     ui.$$('[data-view]').forEach(function (button) {
@@ -79,15 +77,10 @@
   }
 
   function paintNav(name) {
-    const root = ['dns', 'logs', 'settings'].indexOf(name) >= 0 ? 'tools' : name;
-    ui.$$('.side-item,.bottom-item').forEach(function (button) {
+    const root = ['dns', 'logs', 'rules', 'settings'].indexOf(name) >= 0 ? 'tools' : name;
+    ui.$$('.rail-item,.bottom-item').forEach(function (button) {
       button.classList.toggle('is-active', button.getAttribute('data-view') === root);
     });
-  }
-
-  function setHeader(title, subtitle) {
-    pageTitle.textContent = title;
-    pageSub.textContent = subtitle || '';
   }
 
   function applyTheme(theme) {
@@ -95,10 +88,10 @@
     cfg.theme = next;
     document.documentElement.setAttribute('data-theme', next);
     const meta = document.querySelector('meta[name="theme-color"]');
-    if (meta) meta.setAttribute('content', next === 'dark' ? '#000000' : '#f2f2f7');
+    if (meta) meta.setAttribute('content', next === 'dark' ? '#0b0b0d' : '#eef0f3');
     try { window.localStorage.setItem('flclash.theme', next); } catch (error) { /* ignore */ }
-    const toggle = document.getElementById('theme-toggle');
-    toggle.innerHTML = icon('theme');
+    const toggle = document.getElementById('rail-theme');
+    if (toggle) toggle.innerHTML = icon('theme');
   }
 
   function setTheme(theme) {
@@ -106,38 +99,44 @@
     if (current === 'settings') renderView('settings', true);
   }
 
-  function subtitleFor(status) {
-    if (!status) return '正在连接内核…';
-    if (!status.running) return '内核未运行';
-    return '运行中 · ' + ui.duration(status.uptime) + ' · ' + modeLabel(status.mode) + '模式';
-  }
-
   function modeLabel(mode) {
     return mode === 'global' ? '全局' : mode === 'direct' ? '直连' : '规则';
+  }
+
+  function subtitleFor(status) {
+    if (!status) return '正在连接后端…';
+    if (!status.running) return '内核已停止 · 功能保持可用';
+    return '运行中 · ' + ui.duration(status.uptime) + ' · ' + modeLabel(status.mode) + '模式';
   }
 
   function updateChrome(status) {
     state.status = status;
     state.offline = false;
-    sideStatus.className = 'side-status is-ok';
-    sideStatusText.textContent = status.running ? '内核运行中' : '内核已停止';
-    if (!status.running) sideStatus.className = 'side-status is-off';
-    sideVersion.textContent = 'v' + (status.version || '—') + ' · ' + (status.coreVersion || '');
-    if (current === 'dashboard' || current === 'settings') setHeader(META[current], subtitleFor(status));
+    const sideStatus = document.getElementById('rail-status');
+    if (sideStatus) {
+      sideStatus.classList.toggle('is-off', !status.running);
+      sideStatus.innerHTML = icon(status.running ? 'status' : 'stop');
+      sideStatus.setAttribute('title', status.running ? '内核运行中' : '内核已停止');
+    }
+    const version = document.querySelector('.rail-version');
+    if (version) version.textContent = 'v' + (status.version || '—');
+    if (current === 'dashboard') setHeader(META.dashboard, subtitleFor(status));
     const button = document.getElementById('core-status');
     button.className = 'round-action ' + (status.running ? 'is-ok' : 'is-warn');
     button.innerHTML = icon(status.running ? 'check' : 'refresh');
-    button.setAttribute('aria-label', status.running ? '内核运行中' : '内核未运行');
+    button.setAttribute('aria-label', status.running ? '内核运行中' : '内核已停止');
+    button.setAttribute('title', status.running ? '内核运行中' : '内核已停止');
+    const traffic = status.traffic || {};
     headerTraffic.innerHTML =
-      '<span class="traffic-up"><i></i><b>' + ui.rate(status.traffic ? status.traffic.upRate : 0) + '</b></span>' +
-      '<span class="traffic-down"><i></i><b>' + ui.rate(status.traffic ? status.traffic.downRate : 0) + '</b></span>';
+      '<span class="traffic-up">' + icon('arrowUp', 14) + '<b>' + ui.rate(traffic.upRate || 0) + '</b></span>' +
+      '<span class="traffic-down">' + icon('arrowDown', 14) + '<b>' + ui.rate(traffic.downRate || 0) + '</b></span>';
+    if (miniUp) miniUp.textContent = ui.rate(traffic.upRate || 0);
+    if (miniDown) miniDown.textContent = ui.rate(traffic.downRate || 0);
   }
 
   function markOffline(error) {
     if (state.offline) return;
     state.offline = true;
-    sideStatus.className = 'side-status is-off';
-    sideStatusText.textContent = '未连接后端';
     ui.toast('后端不可达: ' + (error && error.message ? error.message : '网络错误'), 'error');
   }
 
@@ -148,13 +147,8 @@
       const traffic = status.traffic || {};
       const history = traffic.history;
       if (history && history.up && history.down) {
-        state.history.up = history.up.slice(-40);
-        state.history.down = history.down.slice(-40);
-      } else {
-        state.history.up.push(traffic.upRate || traffic.up || 0);
-        state.history.down.push(traffic.downRate || traffic.down || 0);
-        if (state.history.up.length > 40) state.history.up.shift();
-        if (state.history.down.length > 40) state.history.down.shift();
+        state.history.up = history.up.slice(-60);
+        state.history.down = history.down.slice(-60);
       }
       if (current === 'dashboard' && dashboardNode) updateDashboard(status);
       if (current === 'settings') {
@@ -170,49 +164,48 @@
 
   /* -------------------------------------------------------------- dashboard */
 
-  function modeSegments(status) {
-    const modes = [
-      ['rule', '规则', 'split'],
-      ['global', '全局', 'proxies'],
-      ['direct', '直连', 'target']
-    ];
-    return '<div class="segmented" data-role="mode">' + modes.map(function (item) {
-      return '<button class="segment' + (status.mode === item[0] ? ' is-active' : '') + '" data-mode="' + item[0] + '" type="button">' +
-        icon(item[2]) + '<span>' + item[1] + '</span></button>';
-    }).join('') + '</div>';
-  }
-
   function statusCard(status) {
     const running = !!status.running;
     const quality = status.quality || {};
+    const knownIp = status.outboundIp && status.outboundIp !== '—';
+    const info = status.ipInfo || {};
+    const locationText = [info.country || '', info.city || ''].filter(Boolean).join(' · ');
     return '<section class="card status-card span-2' + (running ? ' is-running' : '') + '" data-role="status">' +
       '<div class="status-inner">' +
         '<div class="status-main">' +
           '<div class="status-head">' +
-            '<span class="glyph">' + icon('status') + '</span>' +
+            '<span class="glyph" data-icon="status"></span>' +
             '<span class="card-title">状态</span>' +
             '<span class="chip ' + (running ? 'is-ok' : '') + '" data-role="state-chip">' +
-              (running ? '<i class="chip-dot"></i>运行中' : '未运行') + '</span>' +
+              (running ? '<i class="chip-dot"></i>运行中' : '<i class="chip-dot"></i>已停止') + '</span>' +
           '</div>' +
           '<div class="status-ip-row">' +
-            '<div class="country-badge" data-role="country">' + ui.esc(status.countryCode || '--') + '</div>' +
+            '<div class="country-badge">' +
+              flower(52, 'flower-mask') +
+              '<span class="country-code" data-role="country">' + ui.esc((status.countryCode || '--').toUpperCase()) + '</span>' +
+            '</div>' +
             '<div class="ip-stack">' +
-              '<button class="ip-text" data-role="ip" type="button" title="复制出口 IP" style="text-align:left">' + ui.esc(status.outboundIp || '—') + '</button>' +
+              '<button class="ip-text" data-role="ip" type="button" title="复制出口 IP">' +
+                (knownIp ? ui.esc(status.outboundIp) : '<span class="sk-line" style="width:220px"></span>') + '</button>' +
               '<div class="ip-chips">' +
-                '<span class="chip">' + ui.esc(quality.type || '未知') + '</span>' +
-                '<span class="chip ' + (quality.level === '质量优' ? 'is-ok' : '') + '">' + ui.esc(quality.level || '质量未知') + '</span>' +
+                '<span class="chip">' + ui.esc(quality.type || '直连') + '</span>' +
+                '<span class="chip ' + (quality.level === '干净' || quality.level === '质量优' ? 'is-ok' : 'is-warn') + '" data-role="quality">' +
+                  ui.esc(quality.level || '检测中') + '</span>' +
+                (locationText ? '<span class="chip chip-plain" data-role="location">' + ui.esc(locationText) + '</span>' : '<span class="chip chip-plain" data-role="location" style="display:none"></span>') +
               '</div>' +
             '</div>' +
           '</div>' +
           '<div class="status-cells">' +
             '<div class="status-cell"><div class="status-cell-label">运行时长</div>' +
-              '<div class="status-cell-value" data-role="uptime">' + ui.duration(status.uptime) + '</div></div>' +
-            '<div class="status-cell"><div class="status-cell-label">组织</div>' +
-              '<div class="status-cell-value" data-role="org">' + ui.esc(status.organization || '—') + '</div></div>' +
+              '<div class="status-cell-value" data-role="uptime">' + (running ? ui.duration(status.uptime) : '—') + '</div></div>' +
+            '<div class="status-cell"><div class="status-cell-label">IP 资料</div>' +
+              '<div class="status-cell-value is-muted" data-role="org" title="' + ui.esc([info.isp || info.org || '', info.asn || ''].filter(Boolean).join(' · ')) + '">' +
+                ui.esc(info.isp || info.org || status.organization || '—') + '</div></div>' +
           '</div>' +
         '</div>' +
         '<button class="start-toggle' + (running ? ' is-running' : '') + '" data-act="toggle" type="button" ' +
-          'aria-label="' + (running ? '停止内核' : '启动内核') + '">' + icon(running ? 'pause' : 'play') + '</button>' +
+          'aria-label="' + (running ? '停止内核' : '启动内核') + '" title="' + (running ? '停止内核' : '启动内核') + '">' +
+          flower(88, 'flower-bg') + '<span class="start-glyph">' + icon(running ? 'pause' : 'play', 30) + '</span></button>' +
       '</div>' +
     '</section>';
   }
@@ -224,16 +217,13 @@
     const peak = up ? traffic.peakUp : traffic.peakDown;
     const total = up ? traffic.totalUp : traffic.totalDown;
     return '<section class="card speed-card" data-role="speed-' + direction + '">' +
-      '<div class="speed-inner">' +
-        '<div class="speed-head">' +
-          '<span class="glyph">' + icon(up ? 'arrowUp' : 'arrowDown') + '</span>' +
-          '<span class="label">' + (up ? '上传' : '下载') + '</span>' +
-          '<span class="peak" data-role="peak">峰值 ' + ui.rate(peak || 0) + '</span>' +
-        '</div>' +
-        '<div class="speed-figure"><span class="speed-value" data-role="value">' + value.value + '</span>' +
-          '<span class="speed-unit" data-role="unit">' + value.unit + '/s</span></div>' +
-        '<div class="speed-total" data-role="total">累计 ' + ui.bytes(total || 0) + '</div>' +
+      '<div class="speed-head">' +
+        '<span class="speed-label">' + icon(up ? 'arrowUp' : 'arrowDown', 16) + '<span>' + (up ? '上传' : '下载') + '</span></span>' +
+        '<span class="peak" data-role="peak">峰值 ' + ui.rate(peak || 0) + '</span>' +
       '</div>' +
+      '<div class="speed-figure"><span class="speed-value" data-role="value">' + value.value + '</span>' +
+        '<span class="speed-unit" data-role="unit">' + value.unit + '/s</span></div>' +
+      '<div class="speed-total" data-role="total">累计 ' + ui.bytes(total || 0) + '</div>' +
       '<div class="speed-chart ' + (up ? 'is-up' : 'is-down') + '" data-role="chart"></div>' +
     '</section>';
   }
@@ -242,26 +232,31 @@
     const traffic = status.traffic || {};
     function tile(up) {
       const value = ui.splitBytes(up ? traffic.upRate : traffic.downRate);
-      return '<div class="node-card" style="background:var(--tone);cursor:default">' +
-        '<div class="node-meta" style="gap:4px"><span class="glyph">' + icon(up ? 'arrowUp' : 'arrowDown') + '</span>' +
-          '<b style="color:var(--muted);font-size:12px">' + (up ? '上传' : '下载') + '</b></div>' +
-        '<div class="row" style="align-items:baseline;gap:4px"><span class="speed-value" style="font-size:26px" data-role="m-' + (up ? 'up' : 'down') + '">' + value.value + '</span>' +
-          '<span class="speed-unit" style="font-size:12px">' + value.unit + '/s</span></div>' +
-        '<div class="speed-total" style="margin:0">累计 ' + ui.bytes(up ? traffic.totalUp : traffic.totalDown) + '</div>' +
-        '<div class="speed-chart ' + (up ? 'is-up' : 'is-down') + '" style="position:relative;left:0;right:0;bottom:0;height:52px;margin:2px -14px -10px" data-role="m-chart-' + (up ? 'up' : 'down') + '"></div>' +
+      return '<div class="speed-tile">' +
+        '<span class="speed-label">' + icon(up ? 'arrowUp' : 'arrowDown', 16) + '<span>' + (up ? '上传' : '下载') + '</span></span>' +
+        '<div class="speed-figure"><span class="speed-value" data-role="m-' + (up ? 'up' : 'down') + '">' + value.value + '</span>' +
+          '<span class="speed-unit">' + value.unit + '/s</span></div>' +
+        '<div class="speed-total">累计 ' + ui.bytes(up ? traffic.totalUp : traffic.totalDown) + '</div>' +
+        '<div class="speed-chart ' + (up ? 'is-up' : 'is-down') + '" data-role="m-chart-' + (up ? 'up' : 'down') + '"></div>' +
       '</div>';
     }
-    return '<section class="card">' +
-      '<div class="card-head"><span class="glyph">' + icon('speed') + '</span><span class="card-title">网络速度</span></div>' +
-      '<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">' + tile(true) + tile(false) + '</div>' +
-    '</section>';
+    return '<section class="card"><div class="card-head"><span class="glyph" data-icon="speed"></span>' +
+      '<span class="card-title">网络速度</span></div>' +
+      '<div class="speed-tiles">' + tile(true) + tile(false) + '</div></section>';
   }
 
   function modeBar(status) {
+    const modes = [
+      ['rule', '规则', 'split'],
+      ['global', '全局', 'proxies'],
+      ['direct', '直连', 'target']
+    ];
     return '<section class="card mode-bar span-2" data-role="mode-bar">' +
-      '<span class="glyph">' + icon('split') + '</span>' +
-      '<span class="mode-label">出站模式</span>' +
-      modeSegments(status) +
+      '<span class="mode-title">' + icon('split', 18) + '<span>出站模式</span></span>' +
+      '<div class="segmented" data-role="mode">' + modes.map(function (item) {
+        return '<button class="segment' + (status.mode === item[0] ? ' is-active' : '') + '" data-mode="' + item[0] + '" type="button">' +
+          '<span class="seg-icon" data-icon="' + item[2] + '"></span><span>' + item[1] + '</span></button>';
+      }).join('') + '</div>' +
     '</section>';
   }
 
@@ -269,9 +264,9 @@
     const system = kind === 'systemProxy';
     const on = system ? !!status.systemProxy : !!status.tun;
     return '<section class="card takeover-tile" data-role="takeover-' + kind + '">' +
-      '<span class="tile-icon' + (on ? ' is-on' : '') + '" data-role="icon">' + icon(system ? 'shuffle' : 'vpn') + '</span>' +
+      '<span class="tile-icon' + (on ? ' is-on' : '') + '" data-role="icon" data-icon="' + (system ? 'shuffle' : 'shield') + '"></span>' +
       '<span class="tile-copy"><span class="tile-title">' + (system ? '系统代理' : '虚拟网卡') + '</span>' +
-        '<span class="tile-sub">' + (system ? '端口 ' + (status.mixedPort || '—') : (on ? '已接管全局流量' : '未启用')) + '</span></span>' +
+        '<span class="tile-sub" data-role="sub">' + (system ? '端口 ' + (status.mixedPort || '—') : (on ? '已接管全局流量' : '未启用')) + '</span></span>' +
       ui.switchHtml(kind, on, system ? '系统代理' : '虚拟网卡') +
     '</section>';
   }
@@ -281,11 +276,11 @@
     return '<section class="card intranet-card" data-role="intranet">' +
       ui.head('内网 IP', {
         glyph: 'devices',
-        end: '<button class="icon-button" data-act="copy-ip" type="button" aria-label="复制内网 IP">' + icon('copy') + '</button>'
+        end: '<button class="icon-button" data-act="copy-ip" type="button" aria-label="复制内网 IP">' + icon('copy', 16) + '</button>'
       }) +
       '<div class="ip-figure" data-role="lan-ip">' + ui.esc(status.localIp || '—') + '</div>' +
       '<div class="sub-switch">' +
-        '<span class="tile-icon' + (on ? ' is-on' : '') + '">' + icon('activity') + '</span>' +
+        '<span class="tile-icon' + (on ? ' is-on' : '') + '" data-icon="wifi"></span>' +
         '<span class="tile-copy"><span class="tile-title">局域网代理</span>' +
           '<span class="tile-sub">' + (on ? '端口 ' + (status.mixedPort || '—') : '已关闭') + '</span></span>' +
         ui.switchHtml('allowLan', on, '局域网代理') +
@@ -306,7 +301,7 @@
       '<div class="profile-meta"><span>更新于 ' + ui.esc(profile.updatedAt || '—') + '</span>' +
         (profile.expireDays ? '<span>剩余 ' + ui.esc(profile.expireDays) + ' 天</span>' : '') + '</div>' +
       '<div class="profile-usage">' +
-        '<div class="usage-row"><strong>' + Math.round(share * 100) + '% 已用</strong>' +
+        '<div class="usage-row"><strong>' + (share * 100).toFixed(1).replace(/\.0$/, '') + '% 已用</strong>' +
           '<span>' + ui.esc(profile.used || '0 B') + ' / ' + ui.esc(profile.total || '0 B') + '</span></div>' +
         '<svg class="wave" viewBox="0 0 300 12" preserveAspectRatio="none">' + ui.wave(share, 300, 12) + '</svg>' +
       '</div>' +
@@ -315,14 +310,15 @@
 
   function serviceCard(status) {
     const services = status.services || [];
-    return '<section class="card is-tappable" data-role="service" data-go="requests">' +
+    return '<section class="card is-tappable" data-role="service" data-go="proxies">' +
       ui.head('服务状态', { glyph: 'verified', chevron: true }) +
-      '<div class="service-list" data-role="service-list">' + services.map(function (item) {
-        return '<div class="service-row"><span class="service-icon">' + icon('proxies') + '</span>' +
+      '<div class="service-list" data-role="service-list">' + (services.length ? services.map(function (item) {
+        return '<div class="service-row">' + ui.letterTile(item.label) +
           '<span class="tile-copy"><span class="tile-title">' + ui.esc(item.label) + '</span></span>' +
           '<span class="service-value' + (item.ok ? '' : ' is-bad') + '">' +
           (item.delay ? ui.esc(item.delay) + ' ms' : '超时') + '</span></div>';
-      }).join('') + '</div>' +
+      }).join('') : '<div class="service-row"><span class="tile-copy"><span class="tile-title">内核 ' +
+        (status.running ? '运行中' : '已停止') + '</span></span></div>') + '</div>' +
     '</section>';
   }
 
@@ -332,7 +328,7 @@
     const appShare = total ? (memory.app / total) * 100 : 50;
     return '<section class="card is-tappable" data-role="memory">' +
       ui.head('内存信息', { glyph: 'memory', chevron: true }) +
-      '<div class="memory-value" data-role="memory-total">' + ui.bytes(total) + '</div>' +
+      '<div class="memory-value"><span data-role="memory-total">' + ui.bytes(total) + '</span><span class="memory-unit">RSS</span></div>' +
       '<div class="memory-bar"><span class="memory-seg app" data-role="mem-app" style="width:' + appShare + '%"></span>' +
         '<span class="memory-seg core" data-role="mem-core" style="width:' + (100 - appShare) + '%"></span></div>' +
       '<div class="memory-legend">' +
@@ -342,46 +338,88 @@
     '</section>';
   }
 
-  function connectionStatsCard(status) {
-    const stats = status.stats || {};
-    const groups = status.proxyGroups || {};
-    return '<section class="card" data-role="summaries">' +
-      '<div class="stat-pairs">' +
-        '<button class="stat-pill" data-go="requests" type="button"><span class="stat-count" data-role="conn-count">' + ui.count(stats.connections || 0) + '</span>' +
-          '<span class="stat-label">实时连接</span></button>' +
-        '<button class="stat-pill" data-go="proxies" type="button"><span class="stat-count" data-role="group-count">' + ui.count(groups.count || 0) + '</span>' +
-          '<span class="stat-label">策略组</span></button>' +
-      '</div>' +
-    '</section>';
-  }
-
   function connectionsCard(status) {
     const stats = status.stats || {};
-    return '<section class="card is-flush" data-role="connections">' +
-      '<div class="card-head" style="padding-right:22px"><span class="glyph">' + icon('requests') + '</span>' +
-        '<span class="card-title">连接</span>' +
-        '<span class="card-end"><span class="chip is-primary">' + ui.count(stats.connections || 0) + ' 实时</span>' +
-          '<span class="chevron">' + icon('chevron') + '</span></span></div>' +
+    return '<section class="card is-flush is-tappable" data-role="connections" data-go="requests">' +
+      '<div class="stat-pairs">' +
+        '<span class="stat-pill is-primary"><span class="stat-count" data-role="conn-count">' + ui.count(stats.connections || 0) + '</span>' +
+          '<span class="stat-label">实时连接</span></span>' +
+      '</div>' +
       '<div class="table-wrap" data-role="connections-table">' + ui.empty('暂无连接', 'requests') + '</div>' +
     '</section>';
   }
 
   function groupsCard(status) {
     const info = status.proxyGroups || { groups: [] };
-    return '<section class="card" data-role="groups">' +
+    return '<section class="card is-tappable" data-role="groups" data-go="proxies">' +
       ui.head('策略组', {
         glyph: 'layers',
         chevron: true,
         end: '<span class="chip">' + (info.count || 0) + '</span>' +
           (info.timeout ? '<span class="chip is-warn">' + info.timeout + ' 超时</span>' : '')
       }) +
-      '<div class="group-list" data-role="group-list">' + (info.groups || []).map(function (group) {
-        return '<div class="group-row"><span class="group-icon">' + icon('proxies') + '</span>' +
+      '<div class="group-list" data-role="group-list">' + (info.groups || []).slice(0, 6).map(function (group) {
+        return '<div class="group-row">' + ui.letterTile(group.name) +
           '<span class="group-copy"><span class="group-name">' + ui.esc(group.name) + '</span>' +
             '<span class="group-now">' + ui.esc(group.now || '—') + '</span></span>' +
           '<span class="chip">' + ui.esc(group.count || 0) + '</span></div>';
       }).join('') + '</div>' +
     '</section>';
+  }
+
+  function dashLayout() {
+    try { return JSON.parse(window.localStorage.getItem('flclash.dashcards')) || {}; }
+    catch (error) { return {}; }
+  }
+
+  function applyDashLayout(node) {
+    const layout = dashLayout();
+    const map = {
+      speed: '[data-role="speed-up"],[data-role="speed-down"],.dash-row.is-control, .card:has(>.speed-tiles)',
+      mode: '[data-role="mode-bar"]',
+      takeover: '[data-role="takeover-systemProxy"],[data-role="takeover-tun"]',
+      intranet: '[data-role="intranet"]',
+      profile: '[data-role="profile"]',
+      service: '[data-role="service"]',
+      memory: '[data-role="memory"]',
+      tables: '[data-role="connections"],[data-role="groups"]'
+    };
+    Object.keys(map).forEach(function (key) {
+      if (layout[key] === false) {
+        ui.$$(map[key], node).forEach(function (item) { item.classList.add('is-hidden'); });
+      }
+    });
+  }
+
+  function bindLayoutEditor(node) {
+    const button = document.getElementById('layout-edit');
+    if (!button) return;
+    button.addEventListener('click', function () {
+      const layout = dashLayout();
+      const items = [
+        ['speed', '网络速度'], ['mode', '出站模式'], ['takeover', '系统代理 / 虚拟网卡'],
+        ['intranet', '内网 IP'], ['profile', '配置'], ['service', '服务状态'],
+        ['memory', '内存信息'], ['tables', '连接与策略组']
+      ];
+      ui.openSheet('编辑仪表盘', '<div class="settings-card">' + items.map(function (item) {
+        const on = layout[item[0]] !== false;
+        return '<div class="settings-row"><div class="row-copy"><div class="row-title">' + item[1] + '</div></div>' +
+          ui.switchHtml('dash-' + item[0], on, item[1]) + '</div>';
+      }).join('') + '</div><p class="sheet-note">关闭的卡片将从仪表盘中隐藏,设置保存在本设备。</p>', function (body) {
+        ui.$$('[data-switch]', body).forEach(function (sw) {
+          sw.addEventListener('click', function () {
+            const key = sw.getAttribute('data-switch').replace('dash-', '');
+            const on = sw.classList.contains('is-on');
+            sw.classList.toggle('is-on', !on);
+            const next = dashLayout();
+            next[key] = !on;
+            try { window.localStorage.setItem('flclash.dashcards', JSON.stringify(next)); } catch (error) { /* ignore */ }
+            ui.$$('[data-role]', node).forEach(function () { /* noop */ });
+            applyDashLayout(node);
+          });
+        });
+      });
+    });
   }
 
   function renderDashboardShell(status) {
@@ -397,9 +435,7 @@
         takeoverTile('tun', status),
         intranetCard(status),
         profileCard(status),
-        serviceCard(status),
         memoryCard(status),
-        connectionStatsCard(status),
         groupsCard(status)
       ].join('');
     } else {
@@ -434,7 +470,13 @@
         const patch = {};
         patch[key] = on;
         api.saveConfig(patch)
-          .then(function () { return refreshStatus(); })
+          .then(function () {
+            if (key === 'tun') {
+              const sub = ui.$('[data-role="takeover-tun"] [data-role="sub"]', node);
+              if (sub) sub.textContent = on ? '已接管全局流量' : '未启用';
+            }
+            return refreshStatus();
+          })
           .catch(function (error) {
             button.classList.toggle('is-on', !on);
             ui.toast('设置失败: ' + error.message, 'error');
@@ -455,39 +497,13 @@
     }
 
     const ipButton = ui.$('[data-role="ip"]', node);
-    if (ipButton) {
-      ipButton.addEventListener('click', function () {
-        const text = ipButton.textContent.trim();
-        copy(text);
-      });
-    }
+    if (ipButton) ipButton.addEventListener('click', function () { copy(ipButton.textContent.trim()); });
     const copyButton = ui.$('[data-act="copy-ip"]', node);
-    if (copyButton) {
-      copyButton.addEventListener('click', function () {
-        copy((state.status && state.status.localIp) || '');
-      });
-    }
-
-    const memory = ui.$('[data-role="memory"]', node);
-    if (memory) {
-      ui.pressable(memory, function () {
-        const data = (state.status && state.status.memory) || { app: 0, core: 0 };
-        ui.openSheet('内存信息',
-          '<div class="kv"><span class="k">应用</span><span class="v">' + ui.bytes(data.app || 0) + '</span></div>' +
-          '<div class="kv"><span class="k">内核</span><span class="v">' + ui.bytes(data.core || 0) + '</span></div>' +
-          '<div class="kv"><span class="k">合计</span><span class="v">' + ui.bytes((data.app || 0) + (data.core || 0)) + '</span></div>' +
-          '<p class="sheet-note">内存数据由后端上报；WebUI 仅展示，不参与采样。</p>');
-      });
-    }
+    if (copyButton) copyButton.addEventListener('click', function () { copy((state.status && state.status.localIp) || ''); });
 
     ui.$$('[data-go]', node).forEach(function (item) {
       ui.pressable(item, function () { navigate(item.getAttribute('data-go')); });
     });
-
-    const connections = ui.$('[data-role="connections"]', node);
-    if (connections) {
-      ui.pressable(connections, function () { navigate('requests'); });
-    }
   }
 
   function copy(text) {
@@ -518,29 +534,42 @@
 
     const card = ui.$('[data-role="status"]', node);
     if (card) card.classList.toggle('is-running', running);
-
     const chip = ui.$('[data-role="state-chip"]', node);
     if (chip) {
       chip.className = 'chip ' + (running ? 'is-ok' : '');
-      chip.innerHTML = running ? '<i class="chip-dot"></i>运行中' : '未运行';
+      chip.innerHTML = '<i class="chip-dot"></i>' + (running ? '运行中' : '已停止');
     }
-
     const country = ui.$('[data-role="country"]', node);
-    if (country) country.textContent = status.countryCode || '--';
-
+    if (country) country.textContent = (status.countryCode || '--').toUpperCase();
     const ip = ui.$('[data-role="ip"]', node);
-    if (ip && ip.textContent !== (status.outboundIp || '—')) ip.textContent = status.outboundIp || '—';
-
+    if (ip && status.outboundIp && ip.textContent !== status.outboundIp) {
+      ip.textContent = status.outboundIp;
+    }
     const uptime = ui.$('[data-role="uptime"]', node);
-    if (uptime) uptime.textContent = ui.duration(status.uptime);
-
+    if (uptime) uptime.textContent = running ? ui.duration(status.uptime) : '—';
     const org = ui.$('[data-role="org"]', node);
-    if (org) org.textContent = status.organization || '—';
+    const info = status.ipInfo || {};
+    if (org) {
+      org.textContent = info.isp || info.org || status.organization || '—';
+      org.setAttribute('title', [info.isp || info.org || '', info.asn || ''].filter(Boolean).join(' · '));
+    }
+    const qualityChip = ui.$('[data-role="quality"]', node);
+    const qualityNow = status.quality || {};
+    if (qualityChip) {
+      qualityChip.textContent = qualityNow.level || '—';
+      qualityChip.className = 'chip ' + (qualityNow.level === '干净' || qualityNow.level === '质量优' ? 'is-ok' : 'is-warn');
+    }
+    const locationChip = ui.$('[data-role="location"]', node);
+    if (locationChip) {
+      const loc = [info.country || '', info.city || ''].filter(Boolean).join(' · ');
+      locationChip.textContent = loc;
+      locationChip.style.display = loc ? '' : 'none';
+    }
 
     const toggle = ui.$('[data-act="toggle"]', node);
     if (toggle) {
       toggle.classList.toggle('is-running', running);
-      toggle.innerHTML = icon(running ? 'pause' : 'play');
+      toggle.innerHTML = flower(88, 'flower-bg') + '<span class="start-glyph">' + icon(running ? 'pause' : 'play', 30) + '</span>';
       toggle.setAttribute('aria-label', running ? '停止内核' : '启动内核');
     }
 
@@ -561,17 +590,14 @@
       const chart = ui.$('[data-role="speed-' + dir + '"] [data-role="chart"]', node);
       if (chart) ui.renderChart(chart, dir === 'up' ? state.history.up : state.history.down, { minScale: 8192 });
       const mobileValue = ui.$('[data-role="m-' + dir + '"]', node);
-      if (mobileValue) mobileValue.textContent = value.value;
+      if (mobileValue) ui.countUp(mobileValue, Number(value.value), function (v) { return v.toFixed(1); });
       const mobileChart = ui.$('[data-role="m-chart-' + dir + '"]', node);
-      if (mobileChart) ui.renderChart(mobileChart, dir === 'up' ? state.history.up : state.history.down, { height: 52, minScale: 8192 });
+      if (mobileChart) ui.renderChart(mobileChart, dir === 'up' ? state.history.up : state.history.down, { height: 46, minScale: 8192 });
     });
 
-    const modeBarNode = ui.$('[data-role="mode"]', node);
-    if (modeBarNode) {
-      ui.$$('[data-mode]', modeBarNode).forEach(function (button) {
-        button.classList.toggle('is-active', button.getAttribute('data-mode') === status.mode);
-      });
-    }
+    ui.$$('[data-mode]', node).forEach(function (button) {
+      button.classList.toggle('is-active', button.getAttribute('data-mode') === status.mode);
+    });
 
     ['systemProxy', 'tun'].forEach(function (kind) {
       const tile = ui.$('[data-role="takeover-' + kind + '"]', node);
@@ -581,8 +607,9 @@
       if (sw) { sw.classList.toggle('is-on', on); sw.setAttribute('aria-checked', String(on)); }
       const iconNode = ui.$('[data-role="icon"]', tile);
       if (iconNode) iconNode.classList.toggle('is-on', on);
-      const sub = ui.$('.tile-sub', tile);
+      const sub = ui.$('[data-role="sub"]', tile);
       if (sub && kind === 'tun') sub.textContent = on ? '已接管全局流量' : '未启用';
+      if (sub && kind === 'systemProxy') sub.textContent = '端口 ' + (status.mixedPort || '—');
     });
 
     const lan = ui.$('[data-role="lan-ip"]', node);
@@ -596,297 +623,186 @@
       if (wave) wave.innerHTML = ui.wave(Number(status.profile.usedShare) || 0, 300, 12);
     }
 
+    const connCount = ui.$('[data-role="conn-count"]', node);
+    if (connCount) connCount.textContent = ui.count(status.stats ? status.stats.connections : 0);
+
+    const table = ui.$('[data-role="connections-table"]', node);
+    if (table) {
+      api.connections().then(function (list) {
+        if (!list || !list.length) return;
+        table.innerHTML = connectionsTable(list.slice(0, 8));
+      }).catch(function () {});
+    }
+
+    /* Service / memory / profile cards must track live status too, not just
+     * the values captured at first render. */
     const serviceList = ui.$('[data-role="service-list"]', node);
-    if (serviceList && status.services) {
-      serviceList.innerHTML = status.services.map(function (item) {
-        return '<div class="service-row"><span class="service-icon">' + icon('proxies') + '</span>' +
+    if (serviceList) {
+      const services = status.services || [];
+      serviceList.innerHTML = services.length ? services.map(function (item) {
+        return '<div class="service-row">' + ui.letterTile(item.label) +
           '<span class="tile-copy"><span class="tile-title">' + ui.esc(item.label) + '</span></span>' +
           '<span class="service-value' + (item.ok ? '' : ' is-bad') + '">' +
           (item.delay ? ui.esc(item.delay) + ' ms' : '超时') + '</span></div>';
-      }).join('');
+      }).join('') : '<div class="service-row">' + ui.letterTile(running ? 'M' : 'X') +
+        '<span class="tile-copy"><span class="tile-title">' + (running ? '内核运行中' : '内核已停止') + '</span></span>' +
+        '<span class="service-value' + (running ? '' : ' is-bad') + '">' + (running ? '正常' : '离线') + '</span></div>';
     }
 
+    const memoryTotal = ui.$('[data-role="memory-total"]', node);
     const memory = status.memory || { app: 0, core: 0 };
-    const total = (memory.app || 0) + (memory.core || 0);
-    const totalNode = ui.$('[data-role="memory-total"]', node);
-    if (totalNode) totalNode.textContent = ui.bytes(total);
-    const appBar = ui.$('[data-role="mem-app"]', node);
-    const coreBar = ui.$('[data-role="mem-core"]', node);
-    if (appBar) appBar.style.width = (total ? (memory.app / total) * 100 : 50) + '%';
-    if (coreBar) coreBar.style.width = (total ? (memory.core / total) * 100 : 50) + '%';
-
-    const connCount = ui.$('[data-role="conn-count"]', node);
-    if (connCount) connCount.textContent = ui.count((status.stats || {}).connections || 0);
-    const groupCount = ui.$('[data-role="group-count"]', node);
-    if (groupCount) groupCount.textContent = ui.count((status.proxyGroups || {}).count || 0);
-
-    const groupList = ui.$('[data-role="group-list"]', node);
-    if (groupList && status.proxyGroups) {
-      groupList.innerHTML = (status.proxyGroups.groups || []).map(function (group) {
-        return '<div class="group-row"><span class="group-icon">' + icon('proxies') + '</span>' +
-          '<span class="group-copy"><span class="group-name">' + ui.esc(group.name) + '</span>' +
-          '<span class="group-now">' + ui.esc(group.now || '—') + '</span></span>' +
-          '<span class="chip">' + ui.esc(group.count || 0) + '</span></div>';
-      }).join('');
+    if (memoryTotal) memoryTotal.textContent = ui.bytes((memory.app || 0) + (memory.core || 0));
+    const memApp = ui.$('[data-role="mem-app"]', node);
+    const memCore = ui.$('[data-role="mem-core"]', node);
+    const memSum = (memory.app || 0) + (memory.core || 0);
+    if (memApp && memCore && memSum) {
+      const appShare = (memory.app / memSum) * 100;
+      memApp.style.width = appShare + '%';
+      memCore.style.width = (100 - appShare) + '%';
     }
 
-    updateConnectionsTable(status);
+    const profileChip = ui.$('[data-role="profile"] .card-end .chip', node);
+    if (profileChip && status.profile) profileChip.textContent = (status.profile.proxies || 0) + ' 节点';
+    const profileMeta = ui.$('[data-role="profile"] .profile-meta', node);
+    if (profileMeta && status.profile) {
+      profileMeta.innerHTML = '<span>更新于 ' + ui.esc(status.profile.updatedAt || '—') + '</span>' +
+        (status.profile.expireDays ? '<span>剩余 ' + ui.esc(status.profile.expireDays) + ' 天</span>' : '');
+    }
+    const usageRow = ui.$('[data-role="profile"] .usage-row', node);
+    if (usageRow && status.profile && status.profile.total !== undefined) {
+      const share = Number(status.profile.usedShare) || 0;
+      usageRow.innerHTML = '<strong>' + (share * 100).toFixed(1).replace(/\.0$/, '') + '% 已用</strong>' +
+        '<span>' + ui.esc(status.profile.used || '0 B') + ' / ' + ui.esc(status.profile.total || '0 B') + '</span>';
+    }
+
+    const groupsCardNode = ui.$('[data-role="groups"]', node);
+    if (groupsCardNode && status.proxyGroups) {
+      const info = status.proxyGroups;
+      const countChipNode = ui.$('.card-end .chip', groupsCardNode);
+      if (countChipNode) countChipNode.textContent = String(info.count || 0);
+      const warnChip = ui.$('.card-end .chip.is-warn', groupsCardNode);
+      if (info.timeout && !warnChip) {
+        ui.$('.card-end', groupsCardNode).insertAdjacentHTML('afterbegin',
+          '<span class="chip is-warn">' + info.timeout + ' 超时</span>');
+      }
+      const gl = ui.$('[data-role="group-list"]', groupsCardNode);
+      if (gl) {
+        gl.innerHTML = (info.groups || []).slice(0, 6).map(function (group) {
+          return '<div class="group-row">' + ui.letterTile(group.name) +
+            '<span class="group-copy"><span class="group-name">' + ui.esc(group.name) + '</span>' +
+              '<span class="group-now">' + ui.esc(group.now || '—') + '</span></span>' +
+            '<span class="chip">' + ui.esc(group.count || 0) + '</span></div>';
+        }).join('');
+      }
+    }
   }
 
-  function updateConnectionsTable(status) {
-    const wrap = ui.$('[data-role="connections-table"]', dashboardNode);
-    if (!wrap) return;
-    const list = state.connections;
-    if (!list || !list.length) {
-      wrap.innerHTML = ui.empty('暂无连接', 'requests');
-      return;
-    }
-    wrap.innerHTML = '<table class="data"><thead><tr><th>主机</th><th>链路</th><th>上传</th><th>下载</th></tr></thead><tbody>' +
-      list.slice(0, 8).map(function (item) {
-        return '<tr><td>' + ui.esc(item.host) + '</td><td class="is-muted">' + ui.esc(item.chain || '-') + '</td>' +
-          '<td class="num">' + ui.bytes(item.up) + '</td><td class="num">' + ui.bytes(item.down) + '</td></tr>';
+  function connectionsTable(list) {
+    return '<table class="data"><thead><tr>' +
+      '<th>目标</th><th>协议</th><th>出口</th><th class="num">下载</th><th class="num">上传</th><th>时长</th>' +
+      '</tr></thead><tbody>' + list.map(function (item) {
+        return '<tr>' +
+          '<td title="' + ui.esc(item.host) + '">' + ui.esc(item.host) + ':' + ui.esc(item.port) + '</td>' +
+          '<td class="is-muted">' + ui.esc((item.network || 'tcp').toUpperCase()) + '</td>' +
+          '<td>' + ui.esc(item.chain || '-') + '</td>' +
+          '<td class="num">' + ui.bytes(item.down) + '</td>' +
+          '<td class="num">' + ui.bytes(item.up) + '</td>' +
+          '<td class="is-muted">' + ui.duration(item.duration) + '</td>' +
+          '</tr>';
       }).join('') + '</tbody></table>';
   }
 
   async function renderDashboard() {
     const token = ++mountToken;
-    dashboardNode = null;
-    let status = state.status;
-    try {
-      status = await api.status();
-      updateChrome(status);
-      if (token !== mountToken) return;
-      if (!state.connections) {
-        api.connections().then(function (list) { state.connections = list; if (token === mountToken) updateConnectionsTable(status); }).catch(function () {});
-      }
-    } catch (error) {
-      markOffline(error);
-      if (token !== mountToken) return;
-    }
-    if (!status) {
-      viewRoot.innerHTML = '<div class="view">' + ui.empty('无法获取内核状态', 'info') + '</div>';
-      return;
-    }
-    dashboardNode = renderDashboardShell(status);
+    dashboardNode = renderDashboardShell(state.status || { running: false, proxyGroups: {} });
     viewRoot.innerHTML = '';
     viewRoot.appendChild(dashboardNode);
+    applyDashLayout(dashboardNode);
+    window.FlClashIcons.mount(dashboardNode);
     bindDashboard(dashboardNode);
-    updateDashboard(status);
-
+    bindLayoutEditor(dashboardNode);
     ui.every('status', function () { refreshStatus().catch(function () {}); }, cfg.pollInterval);
-    ui.every('connections', function () {
+    ui.every('dash-connections', function () {
       api.connections().then(function (list) {
+        if (token !== mountToken || !dashboardNode) return;
         state.connections = list;
-        updateConnectionsTable(state.status);
-        const chip = ui.$('[data-role="summaries"] [data-role="conn-count"]');
-        if (chip) chip.textContent = ui.count(list.length);
+        const table = ui.$('[data-role="connections-table"]', dashboardNode);
+        if (table && list && list.length) table.innerHTML = connectionsTable(list.slice(0, 8));
       }).catch(function () {});
     }, 3000);
   }
 
   /* ----------------------------------------------------------------- router */
 
-  const ctx = {
-    api: api,
-    state: state,
-    navigate: function (name) { window.location.hash = '#/' + name; },
-    refreshStatus: refreshStatus,
-    reloadProfiles: async function () {
-      state.profiles = await api.profiles();
-      if (ctx.onProfiles) ctx.onProfiles();
-      if (current === 'dashboard' && dashboardNode) updateDashboard(state.status || {});
-    },
-    reloadProxies: async function () {
-      state.proxies = await api.proxies();
-      if (ctx.onProxies) ctx.onProxies();
-    },
-    reloadConnections: async function () {
-      state.connections = await api.connections();
-      if (ctx.onConnections) ctx.onConnections();
-    },
-    setTheme: setTheme
-  };
-
-  const renderers = {
-    dashboard: renderDashboard,
-    proxies: async function () {
-      try {
-        state.proxies = await api.proxies();
-      } catch (error) { markOffline(error); }
-      if (!state.proxies) { viewRoot.innerHTML = '<div class="view">' + ui.empty('无法获取节点', 'proxies') + '</div>'; return; }
-      const node = views.proxies(ctx);
-      viewRoot.innerHTML = '';
-      viewRoot.appendChild(node);
-      ui.every('proxies', function () {
-        api.proxies().then(function (data) {
-          state.proxies = data;
-          if (ctx.onProxies) ctx.onProxies();
-        }).catch(function () {});
-      }, 6000);
-    },
-    profiles: async function () {
-      try {
-        state.profiles = await api.profiles();
-      } catch (error) { markOffline(error); }
-      const node = views.profiles(ctx);
-      viewRoot.innerHTML = '';
-      viewRoot.appendChild(node);
-      ui.every('profiles', function () {
-        api.profiles().then(function (data) { state.profiles = data; if (ctx.onProfiles) ctx.onProfiles(); }).catch(function () {});
-      }, 15000);
-    },
-    requests: async function () {
-      if (!state.connections) {
-        try { state.connections = await api.connections(); } catch (error) { markOffline(error); }
-      }
-      const node = views.requests(ctx);
-      viewRoot.innerHTML = '';
-      viewRoot.appendChild(node);
-      ui.every('connections', function () {
-        api.connections().then(function (list) {
-          state.connections = list;
-          if (ctx.onConnections) ctx.onConnections();
-        }).catch(function () {});
-      }, 3000);
-    },
-    logs: async function () {
-      try { state.logs = await api.logs(); } catch (error) { markOffline(error); }
-      const node = views.logs(ctx);
-      viewRoot.innerHTML = '';
-      viewRoot.appendChild(node);
-      ui.every('logs', function () {
-        api.logs().then(function (data) { state.logs = data; if (ctx.onLogs) ctx.onLogs(); }).catch(function () {});
-      }, 2500);
-    },
-    dns: async function () {
-      try { state.dns = await api.dnsQueries(); } catch (error) { markOffline(error); }
-      const node = views.dns(ctx);
-      viewRoot.innerHTML = '';
-      viewRoot.appendChild(node);
-      ui.every('dns', function () {
-        api.dnsQueries().then(function (data) { state.dns = data; if (ctx.onDns) ctx.onDns(); }).catch(function () {});
-      }, 5000);
-    },
-    tools: async function () {
-      const node = views.tools(ctx);
-      viewRoot.innerHTML = '';
-      viewRoot.appendChild(node);
-    },
-    settings: async function () {
-      try { state.config = await api.config(); } catch (error) { /* settings tolerates missing config */ }
-      const node = views.settings(ctx);
-      viewRoot.innerHTML = '';
-      viewRoot.appendChild(node);
-    }
-  };
-
-  const SUBTITLE = {
-    proxies: '选择策略组与节点',
-    profiles: '订阅与配置文件',
-    requests: '实时连接与流量',
-    logs: '内核运行日志',
-    dns: '解析记录与缓存',
-    tools: '诊断与维护',
-    settings: '网络、内核与外观'
-  };
-
-  async function renderView(name, force) {
-    if (!renderers[name]) name = 'dashboard';
-    if (!force && current === name && name !== 'dashboard') return;
-    current = name;
-    ui.stopAll();
-    paintNav(name);
-    ctx.onProfiles = null;
-    ctx.onProxies = null;
-    ctx.onConnections = null;
-    ctx.onLogs = null;
-    ctx.onDns = null;
-    setHeader(META[name] || '仪表盘', name === 'dashboard' ? subtitleFor(state.status) : (SUBTITLE[name] || ''));
-    viewRoot.innerHTML = '<div class="view">' + skeleton() + '</div>';
-    try {
-      await renderers[name]();
-    } catch (error) {
-      viewRoot.innerHTML = '<div class="view">' + ui.empty('页面加载失败: ' + (error.message || error), 'info') + '</div>';
-    }
+  function setHeader(title, subtitle) {
+    pageTitle.textContent = title;
+    pageSub.textContent = subtitle || '';
+    document.querySelector('.app-header').classList.toggle('has-sub', !!subtitle);
   }
 
   function skeleton() {
-    return '<div class="dashboard">' +
-      '<div class="skeleton" style="height:208px;border-radius:32px"></div>' +
-      '<div class="skeleton" style="height:176px;border-radius:32px"></div>' +
-      '<div class="skeleton" style="height:176px;border-radius:32px"></div>' +
-      '</div>';
+    viewRoot.innerHTML = '<div class="view page">' + ui.skeletonRows(6) + '</div>';
+  }
+
+  async function renderView(name, force) {
+    if (name === 'dashboard') { await renderDashboard(); return; }
+    ui.stopAll();
+    if (!force) skeleton();
+    const builder = views[name];
+    const token = ++mountToken;
+    const ctx = {
+      api: api,
+      state: state,
+      navigate: function (next) { window.location.hash = '#/' + next; },
+      refreshStatus: refreshStatus,
+      reloadProfiles: async function () {
+        state.profiles = await api.profiles().catch(function () { return state.profiles; });
+        if (token === mountToken && ctx.onProfiles) ctx.onProfiles();
+      },
+      reloadProxies: async function () {
+        state.proxies = await api.proxies().catch(function () { return state.proxies; });
+        if (token === mountToken && ctx.onProxies) ctx.onProxies();
+      },
+      reloadConnections: async function () {
+        state.connections = await api.connections().catch(function () { return state.connections; });
+        if (token === mountToken && ctx.onConnections) ctx.onConnections();
+      },
+      setTheme: setTheme,
+      copy: copy
+    };
+    const node = builder(ctx);
+    viewRoot.innerHTML = '';
+    viewRoot.appendChild(node);
+    window.FlClashIcons.mount(node);
   }
 
   function navigate(name) {
-    if (!renderers[name]) name = 'dashboard';
-    if (window.location.hash !== '#/' + name) {
-      window.location.hash = '#/' + name;
-      return;
-    }
-    renderView(name, true);
-  }
-
-  /* ------------------------------------------------------------------- init */
-
-  function bindChrome() {
-    document.getElementById('theme-toggle').addEventListener('click', function () {
-      setTheme(document.documentElement.getAttribute('data-theme') === 'dark' ? 'light' : 'dark');
-    });
-
-    document.getElementById('core-status').addEventListener('click', function () {
-      const button = this;
-      button.classList.add('is-busy');
-      api.service('restart')
-        .then(function () { ui.toast('内核已重启', 'ok'); return refreshStatus(); })
-        .catch(function (error) { ui.toast('重启失败: ' + error.message, 'error'); })
-        .then(function () { button.classList.remove('is-busy'); });
-    });
-
-    document.getElementById('sheet-close').addEventListener('click', ui.closeSheet);
-    document.getElementById('sheet-backdrop').addEventListener('click', ui.closeSheet);
-    document.addEventListener('keydown', function (event) {
-      if (event.key === 'Escape') ui.closeSheet();
-    });
-
-    let lastMobile = isMobile();
-    window.addEventListener('resize', ui.debounce(function () {
-      const mobile = isMobile();
-      if (mobile !== lastMobile) {
-        lastMobile = mobile;
-        if (current === 'dashboard') renderDashboard();
-      }
-    }, 200));
-
-    window.addEventListener('hashchange', function () {
-      const name = window.location.hash.replace(/^#\/?/, '') || 'dashboard';
-      if (name !== current || name === 'dashboard') renderView(name, true);
-    });
-  }
-
-  async function init() {
-    buildNav();
-    applyTheme();
-    bindChrome();
-    const initial = window.location.hash.replace(/^#\/?/, '') || 'dashboard';
-    try {
-      const status = await api.status();
-      updateChrome(status);
-    } catch (error) {
-      markOffline(error);
-    }
-    await renderView(initial === current ? 'dashboard' : initial, true);
+    if (!META[name]) name = 'dashboard';
+    if (current === name && name !== 'dashboard') return;
     const splash = document.getElementById('boot-splash');
-    if (splash) {
-      splash.classList.add('is-hidden');
-      window.setTimeout(function () { splash.remove(); }, 400);
-    }
-    ui.every('status', function () { refreshStatus().catch(function () {}); }, cfg.pollInterval);
+    if (splash) { splash.classList.add('is-done'); window.setTimeout(function () { splash.remove(); }, 500); }
+    current = name;
+    paintNav(name);
+    ui.stopAll();
+    setHeader(META[name], '');
+    viewRoot.classList.remove('view-in');
+    renderView(name).then(function () {
+      window.requestAnimationFrame(function () { viewRoot.classList.add('view-in'); });
+    }).catch(function (error) {
+      viewRoot.innerHTML = '<div class="view page">' + ui.empty(error.message, 'info') + '</div>';
+    });
   }
 
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', init);
-  } else {
-    init();
-  }
+  window.addEventListener('hashchange', function () {
+    navigate((window.location.hash || '#/dashboard').replace('#/', ''));
+  });
+  window.addEventListener('resize', ui.debounce(function () {
+    if (current === 'dashboard') { renderDashboard(); }
+  }, 250));
+
+  buildNav();
+  applyTheme();
+  window.FlClashIcons.mount(document);
+  navigate((window.location.hash || '#/dashboard').replace('#/', ''));
+  refreshStatus().catch(function () {});
 })();

@@ -1,17 +1,20 @@
 {
   "luci-app-flclash-webui": {
-    "description": "Start/stop the FlClash core and read live system proxy information",
+    "description": "Control the FlClash core/service and read live system proxy information",
     "read": {
       "ubus": {
-        "flclash": ["system_proxy"]
+        "flclash": ["system_proxy", "service_state", "core_log", "core_update_status"]
       },
       "uci": ["flclash"]
     },
     "write": {
+      "ubus": {
+        "flclash": ["service_toggle", "core_update"]
+      },
       "file": {
         "exec": {
-          "/etc/init.d/flclash-core": ["start", "stop", "restart"],
-          "/etc/init.d/flclash-api": ["start", "stop", "restart"]
+          "/etc/init.d/flclash-core": ["start", "stop", "restart", "status"],
+          "/etc/init.d/flclash-api": ["start", "stop", "restart", "status"]
         }
       }
     }

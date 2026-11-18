@@ -1,0 +1,165 @@
+//! flclash-api (Rust/Tokio): the WebUI backend for luci-app-flclash.
+//!
+//! Drop-in replacement for the Go bridge: same binary name, same CLI flags
+//! (-listen / -controller / -ui / -data / -init), same /flclash/api contract,
+//! same /flclash/ static origin — so init.d, ACL, LuCI and the WebUI stay
+//! byte-for-byte unchanged.
+//!
+//! Layout (one concern per module):
+//!   state.rs    — shared state, /proc helpers, formatting
+//!   ctrl.rs     — loopback controller client + curl-backed fetch/stream
+//!   convert.rs  — subscription format detection and node parsing
+//!   config.rs   — config.yaml view + settings persistence
+//!   profiles.rs — profile store, import/update/apply, service control
+//!   loops.rs    — background samplers and maintenance loops
+//!   api.rs      — HTTP handlers
+
+mod api;
+mod config;
+mod convert;
+mod ctrl;
+mod loops;
+mod profiles;
+mod state;
+
+use std::sync::Arc;
+
+use axum::extract::{Request, State};
+use axum::http::StatusCode;
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{delete, get, post};
+use axum::{Json, Router};
+use serde_json::json;
+use state::AppState;
+
+/// Accepts both `-flag value` and `-flag=value` (and `--flag`), matching the
+/// flag style the Go bridge accepted from /etc/init.d/flclash-api.
+fn flag_value(args: &[String], name: &str, default: &str) -> String {
+    for (i, arg) in args.iter().enumerate() {
+        if arg == name {
+            return args.get(i + 1).cloned().unwrap_or_else(|| default.to_string());
+        }
+        for prefix in [format!("{}=", name), format!("-{}", name)] {
+            if let Some(rest) = arg.strip_prefix(&prefix) {
+                return rest.to_string();
+            }
+        }
+    }
+    default.to_string()
+}
+
+async fn auth(
+    State(st): State<Arc<AppState>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if let Some(secret) = &st.secret {
+        let got = req
+            .headers()
+            .get("x-flclash-secret")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
+            .or_else(|| {
+                req.headers()
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.trim_start_matches("Bearer ").trim().to_string())
+            });
+        if got.as_deref() != Some(secret.as_str()) {
+            return (StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"})))
+                .into_response();
+        }
+    }
+    next.run(req).await
+}
+
+async fn not_found() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({"error": "not found"})),
+    )
+        .into_response()
+}
+
+#[tokio::main]
+async fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let listen = flag_value(&args, "-listen", "0.0.0.0:9098");
+    let controller = flag_value(&args, "-controller", "127.0.0.1:9097")
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .to_string();
+    let ui_dir = flag_value(&args, "-ui", "/www/flclash");
+    let data_dir = flag_value(&args, "-data", "/etc/flclash");
+    let init_script = flag_value(&args, "-init", "/etc/init.d/flclash-core");
+    let secret = std::env::var("FLCLASH_API_SECRET")
+        .ok()
+        .filter(|s| !s.is_empty());
+
+    let st = Arc::new(AppState {
+        controller,
+        ui_dir,
+        data_dir,
+        init_script,
+        secret,
+        hist: std::sync::Mutex::default(),
+    });
+
+    eprintln!(
+        "flclash-api listening on {}, controller {}, ui {}",
+        listen, st.controller, st.ui_dir
+    );
+
+    tokio::spawn(loops::sample_traffic(st.clone()));
+    tokio::spawn(loops::sample_logs(st.clone()));
+    tokio::spawn(loops::sample_totals(st.clone()));
+    tokio::spawn(loops::apply_ports(st.clone()));
+    tokio::spawn(loops::auto_update(st.clone()));
+    tokio::spawn(loops::refresh_outbound(st.clone()));
+
+    let protected = Router::new()
+        .route("/status", get(api::status))
+        .route("/version", get(api::version))
+        .route("/memory", get(api::memory))
+        .route("/rules", get(api::rules))
+        .route("/providers/proxies", get(api::providers))
+        .route("/dns/resolve", get(api::dns_resolve))
+        .route("/dns/queries", get(api::dns_queries))
+        .route("/dns/flush", post(api::dns_flush))
+        .route("/config", get(api::config_get).put(api::config_put).patch(api::config_put))
+        .route("/proxies", get(api::proxies))
+        .route("/proxies/select", post(api::proxies_select))
+        .route("/proxies/delay", post(api::proxies_delay))
+        .route("/proxies/group-delay", post(api::proxies_group_delay))
+        .route("/connections", get(api::connections))
+        .route("/connections/{id}", delete(api::connection_close))
+        .route("/logs", get(api::logs))
+        .route("/system/proxy", get(api::system_proxy))
+        .route("/profiles", get(api::profiles_get))
+        .route("/profiles/import", post(api::profiles_import))
+        .route("/profiles/{id}/apply", post(api::profiles_apply))
+        .route("/profiles/{id}/update", post(api::profiles_update))
+        .route(
+            "/profiles/{id}",
+            axum::routing::patch(api::profiles_edit)
+                .put(api::profiles_edit)
+                .delete(api::profiles_delete),
+        )
+        .route("/service/{action}", post(api::service_action))
+        .route_layer(middleware::from_fn_with_state(st.clone(), auth));
+
+    let app: Router<()> = Router::new()
+        .nest("/flclash/api", protected)
+        .route("/", get(api::static_index))
+        .route("/flclash", get(api::static_index))
+        .route("/flclash/", get(api::static_root))
+        .route("/flclash/{*path}", get(api::static_file))
+        .layer(axum::extract::DefaultBodyLimit::max(crate::state::MAX_BODY))
+        .with_state(st.clone());
+
+    let server = tokio::net::TcpListener::bind(&listen)
+        .await
+        .expect("failed to bind listen address");
+    axum::serve(server, app).await.expect("server error");
+}

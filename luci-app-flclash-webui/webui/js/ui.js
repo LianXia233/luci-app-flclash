@@ -1,341 +1,353 @@
-/* Shared UI primitives: formatting, toasts, sheets, charts, polling. */
+/* FlClash WebUI — shared UI primitives: dom helpers, toasts, sheets,
+ * switches, charts, counters, press ripple. View files stay lean by
+ * consuming these. */
 window.FlClashUI = (function () {
   'use strict';
 
-  const KB = 1024;
-  const MB = KB * 1024;
-  const GB = MB * 1024;
-  const TB = GB * 1024;
+  function $(selector, root) {
+    return (root || document).querySelector(selector);
+  }
 
-  function $(sel, root) { return (root || document).querySelector(sel); }
-  function $$(sel, root) { return Array.prototype.slice.call((root || document).querySelectorAll(sel)); }
+  function $$(selector, root) {
+    return Array.prototype.slice.call((root || document).querySelectorAll(selector));
+  }
 
-  function esc(value) {
-    return String(value == null ? '' : value)
+  function esc(text) {
+    return String(text == null ? '' : text)
       .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
       .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
   }
 
-  function icon(name, cls) { return window.FlClashIcons.svg(name, cls); }
-
-  function glyph(name, cls) {
-    return '<span class="glyph' + (cls ? ' ' + cls : '') + '">' + icon(name) + '</span>';
-  }
-
-  function splitBytes(bytes) {
-    const value = Math.max(0, Number(bytes) || 0);
-    if (value < KB) return { value: String(Math.round(value)), unit: 'B' };
-    if (value < MB) return { value: (value / KB).toFixed(1), unit: 'KB' };
-    if (value < GB) return { value: (value / MB).toFixed(1), unit: 'MB' };
-    if (value < TB) return { value: (value / GB).toFixed(2), unit: 'GB' };
-    return { value: (value / TB).toFixed(2), unit: 'TB' };
-  }
+  /* ------------------------------------------------------------ formatting */
 
   function bytes(value) {
-    const part = splitBytes(value);
-    return part.value + ' ' + part.unit;
+    const v = Number(value) || 0;
+    if (v < 1024) return Math.round(v) + ' B';
+    const units = ['KB', 'MB', 'GB', 'TB', 'PB'];
+    let n = v, i = -1;
+    do { n /= 1024; i++; } while (n >= 1024 && i < units.length - 1);
+    return (n >= 100 ? n.toFixed(0) : n.toFixed(1)) + ' ' + units[i];
+  }
+
+  function splitBytes(value) {
+    const v = Number(value) || 0;
+    if (v < 1024) return { value: String(Math.round(v)), unit: 'B' };
+    const units = ['KB', 'MB', 'GB', 'TB', 'PB'];
+    let n = v, i = -1;
+    do { n /= 1024; i++; } while (n >= 1024 && i < units.length - 1);
+    return { value: n >= 100 ? n.toFixed(0) : n.toFixed(1), unit: units[i] };
   }
 
   function rate(value) {
-    const part = splitBytes(value);
-    return part.value + ' ' + part.unit + '/s';
+    const split = splitBytes(value);
+    return split.value + ' ' + split.unit + '/s';
   }
 
   function count(value) {
-    const n = Number(value) || 0;
-    if (n < 100000) return n.toLocaleString('en-US');
-    if (n < 1000000) return (n / 1000).toFixed(1).replace(/\.0$/, '') + 'K';
-    return (n / 1000000).toFixed(1).replace(/\.0$/, '') + 'M';
+    const v = Number(value) || 0;
+    if (v >= 10000) return (v / 10000).toFixed(1).replace(/\.0$/, '') + 'w';
+    if (v >= 1000) return (v / 1000).toFixed(1).replace(/\.0$/, '') + 'k';
+    return String(v);
   }
 
   function duration(seconds) {
-    const total = Math.max(0, Math.floor(Number(seconds) || 0));
-    const d = Math.floor(total / 86400);
-    const h = Math.floor((total % 86400) / 3600);
-    const m = Math.floor((total % 3600) / 60);
-    const s = total % 60;
-    const pad = (v) => String(v).padStart(2, '0');
-    if (d > 0) return d + '天 ' + pad(h) + ':' + pad(m) + ':' + pad(s);
-    return pad(h) + ':' + pad(m) + ':' + pad(s);
+    const s = Math.max(0, Math.floor(Number(seconds) || 0));
+    const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+    const pad = function (x) { return String(x).padStart(2, '0'); };
+    if (h > 24) {
+      const days = Math.floor(h / 24);
+      return days + ' 天 ' + pad(h % 24) + ':' + pad(m) + ':' + pad(sec);
+    }
+    return pad(h) + ':' + pad(m) + ':' + pad(sec);
   }
 
-  function clock(value) {
-    const date = value instanceof Date ? value : new Date(value || Date.now());
-    if (isNaN(date.getTime())) return String(value || '');
-    return date.toLocaleTimeString('zh-CN', { hour12: false });
-  }
-
-  function dayTime(value) {
-    const date = value instanceof Date ? value : new Date(value);
-    if (isNaN(date.getTime())) return String(value || '');
-    return (date.getMonth() + 1) + '/' + date.getDate() + ' ' + clock(date);
+  function clock(ts) {
+    const d = new Date((Number(ts) || 0) * 1000);
+    const pad = function (x) { return String(x).padStart(2, '0'); };
+    return pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
   }
 
   function delayTone(delay) {
-    const n = Number(delay) || 0;
-    if (!n) return 'bad';
-    if (n < 200) return 'ok';
-    if (n < 500) return 'warn';
+    const v = Number(delay) || 0;
+    if (!v) return 'bad';
+    if (v < 200) return 'ok';
+    if (v < 500) return 'warn';
     return 'bad';
   }
 
-  const toastStack = document.getElementById('toast-stack');
+  /* --------------------------------------------------------------- polling */
 
-  function toast(message, type) {
-    if (!toastStack) return;
-    const node = document.createElement('div');
-    node.className = 'toast' + (type ? ' is-' + type : '');
-    node.textContent = message;
-    toastStack.appendChild(node);
-    const life = type === 'error' ? 3600 : 2400;
-    window.setTimeout(function () {
-      node.classList.add('is-out');
-      window.setTimeout(function () { node.remove(); }, 220);
-    }, life);
-  }
-
-  const sheet = document.getElementById('sheet');
-  const backdrop = document.getElementById('sheet-backdrop');
-  const sheetTitle = document.getElementById('sheet-title');
-  const sheetBody = document.getElementById('sheet-body');
-  let lastFocus = null;
-
-  function openSheet(title, html, onMount) {
-    if (!sheet) return;
-    lastFocus = document.activeElement;
-    sheetTitle.textContent = title;
-    sheetBody.innerHTML = html;
-    backdrop.hidden = false;
-    window.requestAnimationFrame(function () {
-      backdrop.classList.add('is-open');
-      sheet.classList.add('is-open');
-    });
-    sheet.setAttribute('aria-hidden', 'false');
-    window.FlClashIcons.mount(sheet);
-    if (onMount) onMount(sheetBody);
-    const focusable = sheet.querySelector('button, input, select, textarea');
-    if (focusable) window.setTimeout(function () { focusable.focus(); }, 120);
-  }
-
-  function closeSheet() {
-    if (!sheet) return;
-    sheet.classList.remove('is-open');
-    backdrop.classList.remove('is-open');
-    sheet.setAttribute('aria-hidden', 'true');
-    window.setTimeout(function () {
-      backdrop.hidden = true;
-      sheetBody.innerHTML = '';
-    }, 320);
-    if (lastFocus && lastFocus.focus) lastFocus.focus();
-  }
-
-  /** Press feedback shared by every tappable surface. */
-  function pressable(node, onActivate) {
-    let pressed = false;
-    const down = function () {
-      pressed = true;
-      node.classList.add('is-pressed');
-    };
-    const up = function () {
-      if (!pressed) return;
-      pressed = false;
-      node.classList.remove('is-pressed');
-    };
-    node.addEventListener('pointerdown', down);
-    node.addEventListener('pointerup', up);
-    node.addEventListener('pointerleave', up);
-    node.addEventListener('pointercancel', up);
-    node.addEventListener('click', function (event) {
-      if (node.classList.contains('is-disabled')) return;
-      if (onActivate) onActivate(event);
-    });
-    node.addEventListener('keydown', function (event) {
-      if (event.key === 'Enter' || event.key === ' ') {
-        event.preventDefault();
-        if (onActivate) onActivate(event);
-      }
-    });
-    if (!node.hasAttribute('tabindex') && node.tagName !== 'BUTTON') node.setAttribute('tabindex', '0');
-  }
-
-  const series = new WeakMap();
-
-  function smoothPath(points) {
-    if (points.length < 2) return points.length ? 'M' + points[0][0] + ' ' + points[0][1] : '';
-    let d = 'M' + points[0][0].toFixed(2) + ' ' + points[0][1].toFixed(2);
-    for (let i = 0; i < points.length - 1; i += 1) {
-      const p0 = points[i - 1] || points[i];
-      const p1 = points[i];
-      const p2 = points[i + 1];
-      const p3 = points[i + 2] || p2;
-      const t = 0.18;
-      const c1x = p1[0] + (p2[0] - p0[0]) * t;
-      const c1y = p1[1] + (p2[1] - p0[1]) * t;
-      const c2x = p2[0] - (p3[0] - p1[0]) * t;
-      const c2y = p2[1] - (p3[1] - p1[1]) * t;
-      d += ' C' + c1x.toFixed(2) + ' ' + c1y.toFixed(2) + ',' + c2x.toFixed(2) + ' ' + c2y.toFixed(2) +
-        ',' + p2[0].toFixed(2) + ' ' + p2[1].toFixed(2);
-    }
-    return d;
-  }
-
-  /**
-   * Traffic chart: values are bytes/s, baseline at the bottom, minimum scale
-   * 8 KiB/s like the dashboard's line chart.
-   */
-  function renderChart(container, values, options) {
-    const opts = options || {};
-    const width = 300;
-    const height = opts.height || 88;
-    const data = (values && values.length ? values : [0, 0]).map(function (v) { return Math.max(0, Number(v) || 0); });
-    let max = Math.max.apply(null, data);
-    max = Math.max(max, opts.minScale || 8192);
-    const points = data.map(function (v, i) {
-      const x = (i / Math.max(1, data.length - 1)) * width;
-      const y = height - 2 - (v / max) * (height - 8);
-      return [x, y];
-    });
-    const line = smoothPath(points);
-    const area = line + ' L' + width + ' ' + height + ' L0 ' + height + ' Z';
-    const previous = series.get(container);
-    const key = line;
-    if (previous !== key) {
-      series.set(container, key);
-      container.innerHTML =
-        '<svg viewBox="0 0 ' + width + ' ' + height + '" preserveAspectRatio="none">' +
-        '<path class="area" d="' + area + '"></path>' +
-        '<path class="line" d="' + line + '"></path>' +
-        '</svg>';
-      const path = container.querySelector('path.line');
-      if (path && path.getTotalLength) {
-        const len = path.getTotalLength();
-        path.style.strokeDasharray = len;
-        path.style.strokeDashoffset = len;
-        path.style.transition = 'stroke-dashoffset 520ms cubic-bezier(0.22,1,0.36,1)';
-        window.requestAnimationFrame(function () { path.style.strokeDashoffset = '0'; });
-      }
-    }
-  }
-
-  function sparkline(values, width, height) {
-    const data = (values && values.length ? values : [0, 0]);
-    const max = Math.max.apply(null, data) || 1;
-    const points = data.map(function (v, i) {
-      return [(i / Math.max(1, data.length - 1)) * width, height - (v / max) * (height - 4) - 2];
-    });
-    return smoothPath(points);
-  }
-
-  /** Usage wave: a sine track that turns solid up to `share`. */
-  function wave(share, width, height) {
-    const value = Math.max(0, Math.min(1, Number(share) || 0));
-    const mid = height / 2;
-    const end = width - 2;
-    const split = 2 + (end - 2) * value;
-    let solid = 'M2 ' + mid;
-    for (let x = 2; x <= split; x += 2) {
-      solid += ' L' + x.toFixed(1) + ' ' + (mid + (height / 4) * Math.sin(((x - 2) / 10) * 2 * Math.PI)).toFixed(2);
-    }
-    let track = '';
-    if (split < end - 4) {
-      track = 'M' + (split + 6).toFixed(1) + ' ' + mid;
-      for (let x = split + 6; x <= end; x += 2) {
-        track += ' L' + x.toFixed(1) + ' ' + (mid + (height / 4) * Math.sin(((x - 2) / 10) * 2 * Math.PI)).toFixed(2);
-      }
-    }
-    return '<path d="' + solid + '" fill="none" stroke="var(--primary)" stroke-width="2.6" stroke-linecap="round"/>' +
-      (track ? '<path d="' + track + '" fill="none" stroke="var(--track)" stroke-width="2.6" stroke-linecap="round"/>' : '');
-  }
-
-  const counters = new WeakMap();
-
-  function countUp(node, target, formatter) {
-    if (!node) return;
-    const from = counters.get(node) || 0;
-    const to = Number(target) || 0;
-    counters.set(node, to);
-    if (Math.abs(to - from) < 0.001) {
-      node.textContent = formatter ? formatter(to) : String(to);
-      return;
-    }
-    const start = performance.now();
-    const span = 420;
-    function step(now) {
-      const t = Math.min(1, (now - start) / span);
-      const eased = 1 - Math.pow(1 - t, 3);
-      const value = from + (to - from) * eased;
-      node.textContent = formatter ? formatter(value) : String(Math.round(value));
-      if (t < 1) window.requestAnimationFrame(step);
-    }
-    window.requestAnimationFrame(step);
-  }
-
-  const timers = new Map();
+  const timers = {};
 
   function every(key, fn, interval) {
     stop(key);
-    timers.set(key, window.setInterval(fn, interval));
+    timers[key] = window.setInterval(fn, interval || 2000);
+    fn();
   }
 
   function stop(key) {
-    if (timers.has(key)) {
-      window.clearInterval(timers.get(key));
-      timers.delete(key);
-    }
+    if (timers[key]) { window.clearInterval(timers[key]); delete timers[key]; }
   }
 
   function stopAll() {
-    timers.forEach(function (id) { window.clearInterval(id); });
-    timers.clear();
+    Object.keys(timers).forEach(stop);
   }
 
-  function debounce(fn, wait) {
-    let id = 0;
+  function debounce(fn, ms) {
+    let timer = null;
     return function () {
-      const args = arguments;
-      window.clearTimeout(id);
-      id = window.setTimeout(function () { fn.apply(null, args); }, wait || 200);
+      const args = arguments, self = this;
+      window.clearTimeout(timer);
+      timer = window.setTimeout(function () { fn.apply(self, args); }, ms || 150);
     };
   }
 
-  function card(className, html, onTap) {
-    const node = document.createElement('section');
-    node.className = 'card ' + (className || '');
-    node.innerHTML = html;
-    if (onTap) {
-      node.classList.add('is-tappable');
-      pressable(node, onTap);
-    }
-    return node;
+  /* ----------------------------------------------------------------- toast */
+
+  function toast(message, kind) {
+    const stack = document.getElementById('toast-stack');
+    if (!stack) return;
+    const node = document.createElement('div');
+    node.className = 'toast ' + (kind === 'error' ? 'is-error' : kind === 'ok' ? 'is-ok' : '');
+    node.innerHTML = '<span class="toast-dot"></span><span>' + esc(message) + '</span>';
+    stack.appendChild(node);
+    window.requestAnimationFrame(function () { node.classList.add('is-in'); });
+    window.setTimeout(function () {
+      node.classList.remove('is-in');
+      window.setTimeout(function () { node.remove(); }, 240);
+    }, 3200);
   }
 
-  function empty(text, iconName) {
-    return '<div class="empty">' + icon(iconName || 'info') + '<span>' + esc(text) + '</span></div>';
+  /* ----------------------------------------------------------------- sheet */
+
+  /* Responsive config dialog: right drawer on desktop, bottom sheet on
+   * mobile. Dismissal rules are strict on purpose:
+   *   - clicking the backdrop NEVER closes (no accidental config loss)
+   *   - closing goes only through the explicit close button (or Esc)
+   *   - with unsaved edits the close request is intercepted and an inline
+   *     bar offers 继续编辑 / 放弃更改 */
+
+  let sheetDirty = false;
+  let sheetBusy = false;
+
+  function isMobileViewport() { return window.innerWidth < 860; }
+
+  function openSheet(title, html, bind, opts) {
+    const options = opts || {};
+    const backdrop = document.getElementById('sheet-backdrop');
+    const sheet = document.getElementById('sheet');
+    if (!sheet) return;
+    sheetDirty = false;
+    sheetBusy = typeof options.busy === 'function' ? options.busy : null;
+
+    document.getElementById('sheet-title').textContent = title;
+    const body = document.getElementById('sheet-body');
+    body.innerHTML = html;
+    window.FlClashIcons.mount(body);
+
+    document.documentElement.classList.toggle('is-mobile-sheet', isMobileViewport());
+    backdrop.hidden = false;
+    sheet.setAttribute('aria-hidden', 'false');
+    window.requestAnimationFrame(function () {
+      backdrop.classList.add('is-in');
+      sheet.classList.add('is-in');
+    });
+
+    document.getElementById('sheet-close').onclick = function () { requestSheetClose(); };
+    /* Deliberately NOT closing on backdrop/outside click. */
+    backdrop.onclick = null;
+
+    body.addEventListener('input', function () { sheetDirty = true; }, true);
+    body.addEventListener('change', function () { sheetDirty = true; }, true);
+    removeUnsavedBar(body);
+
+    if (typeof bind === 'function') bind(body, requestSheetClose, {
+      markSaved: function () { sheetDirty = false; removeUnsavedBar(body); }
+    });
   }
 
-  function head(title, options) {
-    const opts = options || {};
-    return '<div class="card-head">' +
-      (opts.glyph ? glyph(opts.glyph) : '') +
+  function removeUnsavedBar(body) {
+    const bar = $('.unsaved-bar', body);
+    if (bar) bar.remove();
+  }
+
+  function requestSheetClose() {
+    const body = document.getElementById('sheet-body');
+    if (sheetBusy && sheetBusy()) return; /* async work in flight */
+    if (sheetDirty) { showUnsavedBar(body); return; }
+    closeSheet();
+  }
+
+  function showUnsavedBar(body) {
+    let bar = $('.unsaved-bar', body);
+    if (bar) { bar.classList.remove('is-shown'); void bar.offsetWidth; bar.classList.add('is-shown'); return; }
+    bar = document.createElement('div');
+    bar.className = 'unsaved-bar is-shown';
+    bar.innerHTML = '<span>有未保存的更改</span>' +
+      '<button class="btn" data-keep type="button">继续编辑</button>' +
+      '<button class="btn is-danger" data-discard type="button">放弃更改</button>';
+    body.insertBefore(bar, body.firstChild);
+    $('[data-keep]', bar).addEventListener('click', function () {
+      sheetDirty = false;
+      bar.remove();
+    });
+    $('[data-discard]', bar).addEventListener('click', function () {
+      sheetDirty = false;
+      closeSheet();
+    });
+  }
+
+  function closeSheet() {
+    const backdrop = document.getElementById('sheet-backdrop');
+    const sheet = document.getElementById('sheet');
+    if (!sheet || sheet.getAttribute('aria-hidden') === 'true') return;
+    backdrop.classList.remove('is-in');
+    sheet.classList.remove('is-in');
+    sheet.setAttribute('aria-hidden', 'true');
+    sheetDirty = false;
+    window.setTimeout(function () { backdrop.hidden = true; }, 260);
+  }
+
+  document.addEventListener('keydown', function (event) {
+    if (event.key !== 'Escape') return;
+    const sheet = document.getElementById('sheet');
+    if (sheet && sheet.getAttribute('aria-hidden') === 'false') requestSheetClose();
+  });
+
+  function confirmSheet(title, text, onConfirm, danger) {
+    openSheet(title,
+      '<p class="sheet-note">' + esc(text) + '</p>' +
+      '<div class="sheet-actions"><button class="btn" data-cancel type="button">取消</button>' +
+      '<button class="btn ' + (danger === false ? 'is-primary' : 'is-danger') + '" data-confirm type="button">确定</button></div>',
+      function (body, close) {
+        $('[data-cancel]', body).addEventListener('click', close);
+        $('[data-confirm]', body).addEventListener('click', function () {
+          close();
+          onConfirm();
+        });
+      });
+  }
+
+  /* --------------------------------------------------------------- widgets */
+
+  function switchHtml(key, on, label) {
+    return '<button class="switch' + (on ? ' is-on' : '') + '" role="switch" aria-checked="' +
+      (!!on) + '" aria-label="' + esc(label || key) + '" data-switch="' + esc(key) + '" type="button">' +
+      '<span class="thumb"></span></button>';
+  }
+
+  function head(title, opts) {
+    const options = opts || {};
+    return '<div class="card-head"><span class="glyph" data-icon="' + options.glyph + '"></span>' +
       '<span class="card-title">' + esc(title) + '</span>' +
-      (opts.leading || '') +
-      (opts.end ? '<span class="card-end">' + opts.end + '</span>' : '') +
-      (opts.chevron ? '<span class="chevron">' + icon('chevron') + '</span>' : '') +
+      (options.end ? '<span class="card-end">' + options.end + '</span>' : '') +
+      (options.chevron ? '<span class="chevron" data-icon="chevron"></span>' : '') +
       '</div>';
   }
 
-  function switchHtml(name, on, label) {
-    return '<button class="switch' + (on ? ' is-on' : '') + '" type="button" role="switch" ' +
-      'aria-checked="' + (!!on) + '" aria-label="' + esc(label || name) + '" data-switch="' + esc(name) + '"></button>';
+  function empty(text, glyph) {
+    return '<div class="empty"><span class="empty-icon" data-icon="' + (glyph || 'info') + '"></span>' +
+      '<span>' + esc(text) + '</span></div>';
+  }
+
+  function skeletonRows(count) {
+    let rows = '';
+    for (let i = 0; i < (count || 3); i++) {
+      rows += '<div class="sk-row" style="animation-delay:' + (i * 0.12) + 's"></div>';
+    }
+    return '<div class="skeleton">' + rows + '</div>';
+  }
+
+  /* Press feedback: a Material-style ripple + pressed scale. */
+  function pressable(node, handler) {
+    node.classList.add('pressable');
+    node.addEventListener('pointerdown', function (event) {
+      const rect = node.getBoundingClientRect();
+      const ripple = document.createElement('span');
+      ripple.className = 'ripple';
+      const size = Math.max(rect.width, rect.height);
+      ripple.style.width = ripple.style.height = size + 'px';
+      ripple.style.left = (event.clientX - rect.left - size / 2) + 'px';
+      ripple.style.top = (event.clientY - rect.top - size / 2) + 'px';
+      node.appendChild(ripple);
+      window.setTimeout(function () { ripple.remove(); }, 520);
+    });
+    node.addEventListener('click', function (event) { handler(event); });
+  }
+
+  function countUp(node, target, format) {
+    const from = Number(node.dataset.value || 0);
+    const to = Number(target) || 0;
+    if (Math.abs(to - from) < 0.01) {
+      node.textContent = format ? format(to) : String(to);
+      node.dataset.value = String(to);
+      return;
+    }
+    const start = performance.now();
+    const step = function (now) {
+      const t = Math.min(1, (now - start) / 360);
+      const eased = 1 - Math.pow(1 - t, 3);
+      const value = from + (to - from) * eased;
+      node.textContent = format ? format(value) : String(Math.round(value));
+      if (t < 1) window.requestAnimationFrame(step);
+      else node.dataset.value = String(to);
+    };
+    window.requestAnimationFrame(step);
+  }
+
+  /* Smooth sparkline with area fill; animates on each redraw. */
+  function renderChart(node, values, opts) {
+    const options = opts || {};
+    const height = options.height || 64;
+    const width = node.clientWidth || 300;
+    const data = (values || []).slice(-60);
+    if (!data.length) { node.innerHTML = ''; return; }
+    const max = Math.max.apply(null, data.concat([options.minScale || 1024])) * 1.15;
+    const stepX = data.length > 1 ? width / (data.length - 1) : width;
+    const points = data.map(function (v, i) {
+      const x = i * stepX;
+      const y = height - (v / max) * (height - 6) - 3;
+      return [x.toFixed(1), y.toFixed(1)];
+    });
+    let path = 'M' + points[0][0] + ' ' + points[0][1];
+    for (let i = 1; i < points.length; i++) {
+      const prev = points[i - 1], cur = points[i];
+      const mx = ((Number(prev[0]) + Number(cur[0])) / 2).toFixed(1);
+      path += ' C' + mx + ' ' + prev[1] + ' ' + mx + ' ' + cur[1] + ' ' + cur[0] + ' ' + cur[1];
+    }
+    const area = path + ' L' + width + ' ' + height + ' L0 ' + height + ' Z';
+    const tone = options.tone || (node.classList.contains('is-up') ? 'up' : node.classList.contains('is-down') ? 'down' : 'up');
+    node.innerHTML =
+      '<svg viewBox="0 0 ' + width + ' ' + height + '" preserveAspectRatio="none" class="chart-svg">' +
+      '<defs><linearGradient id="grad-' + tone + '-' + Math.round(Math.random() * 1e6) + '" x1="0" y1="0" x2="0" y2="1">' +
+      '<stop offset="0" stop-color="var(--chart-' + tone + ')" stop-opacity="0.35"/>' +
+      '<stop offset="1" stop-color="var(--chart-' + tone + ')" stop-opacity="0"/></linearGradient></defs>' +
+      '<path class="chart-area" d="' + area + '" fill="url(#grad-' + tone + '-' + Math.round(Math.random() * 1e6) + ')"/>' +
+      '<path class="chart-line" d="' + path + '" stroke="var(--chart-' + tone + ')" stroke-width="2" fill="none" stroke-linecap="round"/>' +
+      '</svg>';
+  }
+
+  /* Wave usage bar (profile cards). */
+  function wave(share, width, height) {
+    const w = width || 300, h = height || 12;
+    const p = Math.max(0, Math.min(100, Math.round((Number(share) || 0) * 100)));
+    return '<rect x="0" y="' + ((h - 4) / 2) + '" width="' + w + '" height="4" rx="2" class="wave-track"/>' +
+      '<rect x="0" y="' + ((h - 4) / 2) + '" width="' + Math.max(6, w * p / 100) + '" height="4" rx="2" class="wave-fill"/>';
+  }
+
+  function letterTile(name, cls) {
+    const text = String(name || '?').trim();
+    const first = text ? text.charAt(0).toUpperCase() : '?';
+    return '<span class="letter-tile ' + (cls || '') + '">' + esc(first) + '</span>';
   }
 
   return {
-    $: $, $$: $$, esc: esc, icon: icon, glyph: glyph,
-    bytes: bytes, rate: rate, splitBytes: splitBytes, count: count,
-    duration: duration, clock: clock, dayTime: dayTime, delayTone: delayTone,
-    toast: toast, openSheet: openSheet, closeSheet: closeSheet, pressable: pressable,
-    renderChart: renderChart, sparkline: sparkline, wave: wave, countUp: countUp,
+    $: $, $$: $$, esc: esc, bytes: bytes, splitBytes: splitBytes, rate: rate,
+    count: count, duration: duration, clock: clock, delayTone: delayTone,
     every: every, stop: stop, stopAll: stopAll, debounce: debounce,
-    card: card, empty: empty, head: head, switchHtml: switchHtml
+    toast: toast, openSheet: openSheet, closeSheet: closeSheet, confirmSheet: confirmSheet,
+    switchHtml: switchHtml, head: head, empty: empty, skeletonRows: skeletonRows,
+    pressable: pressable, countUp: countUp, renderChart: renderChart, wave: wave,
+    letterTile: letterTile
   };
 })();

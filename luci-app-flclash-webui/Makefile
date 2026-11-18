@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-flclash-webui
 PKG_VERSION:=1.1.0
-PKG_RELEASE:=3
+PKG_RELEASE:=4
 
 PKG_MAINTAINER:=FlClash WebUI
 PKG_LICENSE:=GPL-3.0-only
@@ -40,12 +40,17 @@ define Package/luci-app-flclash-webui/install
 	$(INSTALL_DIR) $(1)/usr/share/rpcd/ucode
 	$(INSTALL_DATA) ./files/usr/share/rpcd/ucode/flclash.uc $(1)/usr/share/rpcd/ucode/flclash.uc
 
+	$(INSTALL_DIR) $(1)/usr/libexec/flclash
+	$(INSTALL_BIN) ./files/usr/libexec/flclash/core-update.sh $(1)/usr/libexec/flclash/core-update.sh
+
 	$(INSTALL_DIR) $(1)/etc/uci-defaults
 	$(INSTALL_BIN) ./files/etc/uci-defaults/99-flclash-webui $(1)/etc/uci-defaults/
 
 	# Static WebUI assets
 	$(INSTALL_DIR) $(1)/www/flclash/css
-	$(INSTALL_DIR) $(1)/www/flclash/js
+	$(INSTALL_DIR) $(1)/www/flclash/js/views
+	$(INSTALL_DIR) $(1)/www/flclash/fonts
+	$(INSTALL_DIR) $(1)/www/flclash/img
 	$(INSTALL_DATA) ./webui/index.html $(1)/www/flclash/index.html
 	$(INSTALL_DATA) ./webui/css/app.css $(1)/www/flclash/css/app.css
 	$(INSTALL_DATA) ./webui/css/views.css $(1)/www/flclash/css/views.css
@@ -56,6 +61,9 @@ define Package/luci-app-flclash-webui/install
 	$(INSTALL_DATA) ./webui/js/api.js $(1)/www/flclash/js/api.js
 	$(INSTALL_DATA) ./webui/js/views.js $(1)/www/flclash/js/views.js
 	$(INSTALL_DATA) ./webui/js/app.js $(1)/www/flclash/js/app.js
+	$(INSTALL_DATA) ./webui/js/views/*.js $(1)/www/flclash/js/views/
+	$(INSTALL_DATA) ./webui/fonts/material-symbols.woff2 $(1)/www/flclash/fonts/
+	$(INSTALL_DATA) ./webui/img/icon.png $(1)/www/flclash/img/
 endef
 
 $(eval $(call BuildPackage,luci-app-flclash-webui))
