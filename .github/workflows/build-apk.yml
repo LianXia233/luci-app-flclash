@@ -11,9 +11,9 @@ permissions:
 
 env:
   GO_VERSION: '1.27.3'
-  TARGET_SUBTARGET: armsr/armv8
+  TARGET_SUBTARGET: mediatek/filogic
   SDK_DIR: sdk
-  RELEASE_TAG: apk-aarch64-cortex-a53
+  RELEASE_TAG: apk-aarch64-cortex-a53-v2
 
 jobs:
   build:
@@ -31,7 +31,7 @@ jobs:
             g++-multilib gettext git libncurses-dev libssl-dev python3 \
             rsync unzip zlib1g-dev file wget curl zstd xz-utils
 
-      - name: Setup Go ${{ env.GO_VERSION }}
+      - name: Setup Go 1.27.3
         uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}
@@ -54,9 +54,10 @@ jobs:
               -o "$GITHUB_WORKSPACE/flclash-core/files/usr/bin/mihomo-arm64" .
           file "$GITHUB_WORKSPACE/flclash-core/files/usr/bin/mihomo-arm64"
 
-      - name: Download OpenWrt SNAPSHOT SDK (${{ env.TARGET_SUBTARGET }})
+      - name: Download OpenWrt SNAPSHOT SDK (mediatek/filogic)
         run: |
           BASE="https://downloads.openwrt.org/snapshots/targets/${TARGET_SUBTARGET}"
+          echo "SDK base: $BASE"
           SDK_FILE=$(curl -fsSL "$BASE/" \
             | grep -oE 'openwrt-sdk-[^"<> ]+\.tar\.zst' | sort -u | head -n1)
           test -n "$SDK_FILE" || { echo "SDK not found at $BASE"; exit 1; }
@@ -78,17 +79,19 @@ jobs:
           make defconfig
           make -j"$(nproc)" package/flclash-core/compile
           make -j"$(nproc)" package/luci-app-flclash-webui/compile
-          echo "=== built apk ==="
-          find bin -type f -name '*.apk' -print
+          echo "=== built flclash apk ==="
+          find bin -type f \( -name 'flclash-core-*.apk' -o -name 'luci-app-flclash-webui-*.apk' \) -print
 
       - name: Collect artifacts
         run: |
           mkdir -p "$GITHUB_WORKSPACE/artifacts"
-          find "$SDK_DIR/bin" -type f -name '*.apk' \
+          # 只收集本项目的两个包，避免上传整个 bin 的 kmod 触发 GitHub 速率限制
+          find "$SDK_DIR/bin" -type f \
+            \( -name 'flclash-core-*.apk' -o -name 'luci-app-flclash-webui-*.apk' \) \
             -exec cp -v {} "$GITHUB_WORKSPACE/artifacts/" \;
           ls -lh "$GITHUB_WORKSPACE/artifacts"
-          test -n "$(find "$GITHUB_WORKSPACE/artifacts" -name '*.apk' -print -quit)" \
-            || { echo "No apk produced"; exit 1; }
+          test "$(find "$GITHUB_WORKSPACE/artifacts" -name '*.apk' | wc -l)" -ge 2 \
+            || { echo "Expected 2 flclash apk, got fewer"; exit 1; }
 
       - name: Upload apk artifact
         uses: actions/upload-artifact@v4
