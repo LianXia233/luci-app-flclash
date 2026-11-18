@@ -39,6 +39,10 @@ SNAPSHOT 快照版，目标架构 `aarch64_cortex-a53`。
 
 - 静态资源：`/flclash/` 由 `http.FileServer` 提供，`/` 302 到 `/flclash/`；
 - 认证：设置 `api.secret` 后，API 需 `X-FlClash-Secret` 或 `Authorization: Bearer`；
+- 启动后自动把 `mixed-port` / `socks-port` `PATCH` 到控制器：随包内核会忽略 YAML 里的端口，
+  不补这一步重启后不会监听代理端口；
+- LuCI 菜单不声明 `depends.acl`，避免 root 会话没有 ACL 组时入口被隐藏；
+  启动脚本的执行权限仍由 `rpcd` ACL 控制；
 - 后台采样：`/traffic`（速率与历史）、`/logs`（最近 500 条）、`/connections`
   （累计流量），供 `/status` 使用；
 - 语义映射：
