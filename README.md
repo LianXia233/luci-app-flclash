@@ -119,5 +119,5 @@ CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "-s -w" \
 
 - OpenWrt master / SNAPSHOT（apk）；24.10（opkg）同样适用，包定义未使用 apk 专有语法。
 - 内核与桥接均为静态 ELF，无 glibc/musl 运行时依赖。
-- 包架构跟随 `ARCH_PACKAGES`；不支持的架构在解析阶段直接报错，不会误装 arm64 二进制。
+- 包架构由 OpenWrt 构建系统自动推导，不硬编码板型；不支持的架构在打包阶段直接报错，不会误装 arm64 二进制。
 - `flclash-core` 首启自动生成最小 `config.yaml`，不再因缺配置进入 respawn 循环。

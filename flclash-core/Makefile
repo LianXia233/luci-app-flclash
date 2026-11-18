@@ -9,6 +9,9 @@ PKG_LICENSE:=GPL-3.0-only
 
 # Prebuilt static Go core (CGO_ENABLED=0, with_gvisor).
 # Binary assets are architecture-specific; never fall back to a foreign arch.
+# PKGARCH is intentionally left to the build system: hard-coding a board name
+# (or $(ARCH), which is not a package architecture) makes the package vanish
+# from the SDK index and no .apk is produced.
 ifeq ($(ARCH),aarch64)
   CORE_BIN:=mihomo-arm64
 else ifeq ($(ARCH),arm)
@@ -18,11 +21,8 @@ else ifeq ($(ARCH),x86_64)
 else ifeq ($(ARCH),mipsel)
   CORE_BIN:=mihomo-mipsle
 else
-  $(error flclash-core: unsupported ARCH '$(ARCH)'; build a matching core with scripts/build-core.sh)
+  CORE_BIN:=
 endif
-
-# Package architecture follows the target, not a hard-coded board name.
-PKGARCH:=$(if $(ARCH_PACKAGES),$(ARCH_PACKAGES),$(ARCH))
 
 include $(INCLUDE_DIR)/package.mk
 
@@ -32,7 +32,6 @@ define Package/flclash-core
   SUBMENU:=Virtual Private Network (VPN)
   TITLE:=FlClash mihomo static core
   DEPENDS:=+kmod-tun +kmod-nft-core +kmod-nft-nat +kmod-nft-fib
-  PKGARCH:=$(PKGARCH)
 endef
 
 define Package/flclash-core/description
@@ -52,6 +51,10 @@ define Build/Compile
 endef
 
 define Package/flclash-core/install
+	@[ -n "$(CORE_BIN)" ] || { \
+		echo "flclash-core: unsupported ARCH '$(ARCH)'; build a matching core with scripts/build-core.sh"; \
+		exit 1; \
+	}
 	$(INSTALL_DIR) $(1)/usr/bin
 	$(INSTALL_BIN) ./files/usr/bin/$(CORE_BIN) $(1)/usr/bin/mihomo
 	$(INSTALL_DIR) $(1)/etc/config
