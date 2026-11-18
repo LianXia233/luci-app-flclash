@@ -21,7 +21,7 @@ jobs:
     timeout-minutes: 120
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install build dependencies
         run: |
@@ -32,7 +32,7 @@ jobs:
             rsync unzip zlib1g-dev file wget curl zstd xz-utils
 
       - name: Setup Go 1.27.3
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: false
@@ -94,14 +94,14 @@ jobs:
             || { echo "Expected 2 flclash apk, got fewer"; exit 1; }
 
       - name: Upload apk artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: flclash-apk-aarch64-cortex-a53
           path: artifacts/*.apk
           if-no-files-found: error
 
       - name: Publish Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ env.RELEASE_TAG }}
           name: FlClash OpenWrt apk - aarch64_cortex-a53
