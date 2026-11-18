@@ -1,0 +1,16 @@
+{
+  "admin/services/flclash": {
+    "title": "FlClash",
+    "order": 35,
+    "action": {
+      "type": "view",
+      "path": "flclash/launch"
+    },
+    "depends": {
+      "acl": [
+        "luci-app-flclash-webui"
+      ]
+    },
+    "firstchild_ineligible": true
+  }
+}

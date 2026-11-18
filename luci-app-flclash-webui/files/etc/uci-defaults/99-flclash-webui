@@ -1,0 +1,20 @@
+#!/bin/sh
+# First-boot defaults for FlClash WebUI on OpenWrt master / SNAPSHOT.
+# /etc/config/flclash is installed by the flclash-core package.
+# This script only fills missing keys and never writes credentials.
+
+uci -q get flclash.main >/dev/null || uci add flclash main
+uci -q get flclash.main.enabled || uci set flclash.main.enabled='1'
+uci -q get flclash.main.config_file || uci set flclash.main.config_file='/etc/flclash/config.yaml'
+uci -q get flclash.main.external_controller || uci set flclash.main.external_controller='127.0.0.1:9097'
+uci -q get flclash.main.mixed_port || uci set flclash.main.mixed_port='7892'
+uci -q get flclash.main.mode || uci set flclash.main.mode='rule'
+uci -q get flclash.main.log_level || uci set flclash.main.log_level='info'
+
+uci -q get flclash.webui >/dev/null || uci add flclash webui
+uci -q get flclash.webui.enabled || uci set flclash.webui.enabled='1'
+uci -q get flclash.webui.webui_path || uci set flclash.webui.webui_path='/flclash/'
+uci -q get flclash.webui.webui_port || uci set flclash.webui.webui_port='80'
+
+uci commit flclash
+exit 0

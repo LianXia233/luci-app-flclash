@@ -1,0 +1,13 @@
+config flclash 'main'
+	option enabled '1'
+	option config_file '/etc/flclash/config.yaml'
+	option external_controller '127.0.0.1:9097'
+	option mixed_port '7892'
+	option mode 'rule'
+	option log_level 'info'
+	option tun_enabled '0'
+
+config flclash 'webui'
+	option enabled '1'
+	option webui_path '/flclash/'
+	option webui_port '80'

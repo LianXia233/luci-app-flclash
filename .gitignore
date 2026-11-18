@@ -1,0 +1,18 @@
+# Local build outputs (cloud build compiles the core from source)
+scripts/src/
+flclash-core/files/usr/bin/*
+!flclash-core/files/usr/bin/.gitkeep
+*.apk
+*.ipk
+
+# Editor / OS / Python
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db
+*.swp
+
+# Local preview / debug
+preview/
+dump.html
+*.log

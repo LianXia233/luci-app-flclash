@@ -1,0 +1,12 @@
+{
+  "luci-app-flclash-webui": {
+    "description": "Grant read-only access to live system proxy information",
+    "read": {
+      "ubus": {
+        "flclash": ["system_proxy"]
+      },
+      "uci": ["flclash", "homeproxy"]
+    },
+    "write": {}
+  }
+}
