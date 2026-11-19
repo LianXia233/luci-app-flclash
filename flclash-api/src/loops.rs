@@ -210,6 +210,32 @@ async fn fetch_ipfinal_card() -> Option<serde_json::Value> {
     }))
 }
 
+/// Geo databases fill unknown owners with generic placeholders ("Private
+/// Customer", bare RIR names, ...). Showing those as the IP owner is
+/// meaningless — treat them as missing so the fallback chain keeps going.
+fn junk_org(s: &str) -> bool {
+    let t = s.trim().to_ascii_lowercase();
+    if t.len() < 3 {
+        return true;
+    }
+    const JUNK: [&str; 13] = [
+        "private customer",
+        "private use",
+        "private ip space",
+        "private",
+        "not routed",
+        "unrouted",
+        "reserved",
+        "iana",
+        "apnic",
+        "arin",
+        "lacnic",
+        "ripencc",
+        "ripe ncc",
+    ];
+    JUNK.iter().any(|k| t == *k)
+}
+
 /// Caches the outbound IP profile (country/city/ISP/ASN + quality flags).
 /// Source order (user preference): Cloudflare edge trace first — it always
 /// answers and reports exactly what the takeover's egress path sees — then
@@ -335,17 +361,26 @@ pub async fn refresh_outbound(st: std::sync::Arc<AppState>) {
                 ok = !info.ip.is_empty();
             }
         }
-        // Enrichment: CF trace (and skk) carry no ISP data. Fill org/isp/asn
-        // from the discovered sources; a failed enrichment never undoes the
-        // primary lookup.
-        if ok && info.org.is_empty() && info.isp.is_empty() {
+        // Enrichment: CF trace (and skk's own db) carry no usable ISP owner
+        // for many exits, and some sources answer junk placeholders. Fill
+        // org/isp/asn from the discovered sources; junk never counts as data
+        // and a failed enrichment never undoes the primary lookup.
+        let mut have_org = !junk_org(&info.org) || !junk_org(&info.isp);
+        let mut zh_region = String::new();
+        if ok && !have_org {
             if let Some(v) = fetch_skk_geoip().await {
-                info.org = v.get("asOrg").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                info.asn = v
-                    .get("asn")
-                    .and_then(|v| v.as_u64())
-                    .map(|a| format!("AS{}", a))
-                    .unwrap_or_default();
+                let org = v.get("asOrg").and_then(|v| v.as_str()).unwrap_or("");
+                if !junk_org(org) {
+                    info.org = org.to_string();
+                    have_org = true;
+                }
+                if info.asn.is_empty() {
+                    info.asn = v
+                        .get("asn")
+                        .and_then(|v| v.as_u64())
+                        .map(|a| format!("AS{}", a))
+                        .unwrap_or_default();
+                }
                 if info.city.is_empty() {
                     info.city = v
                         .get("city")
@@ -357,21 +392,29 @@ pub async fn refresh_outbound(st: std::sync::Arc<AppState>) {
                 }
             }
         }
-        if ok && info.org.is_empty() && info.isp.is_empty() {
+        if ok && !have_org {
             if let Some(v) = fetch_ipfinal_card().await {
                 // zh locale: country/region/city read natively (中国 · 广东 · 深圳).
                 let zh_country = v.get("country").and_then(|v| v.as_str()).unwrap_or("");
-                if !zh_country.is_empty() {
-                    info.country = zh_country.to_string();
-                }
                 let region = v.get("region").and_then(|v| v.as_str()).unwrap_or("");
                 let city = v.get("city").and_then(|v| v.as_str()).unwrap_or("");
-                if !region.is_empty() && info.city.is_empty() {
-                    info.city = if city.is_empty() {
-                        region.to_string()
-                    } else {
-                        format!("{} {}", region, city)
-                    };
+                let mut segs: Vec<&str> = Vec::new();
+                if !zh_country.is_empty() {
+                    info.country = zh_country.to_string();
+                    segs.push(zh_country);
+                }
+                if !region.is_empty() {
+                    segs.push(region);
+                }
+                if !city.is_empty() && city != region {
+                    segs.push(city);
+                }
+                if !segs.is_empty() {
+                    zh_region = segs.join(" ");
+                    if info.city.is_empty() {
+                        info.city = segs[1..].join(" ");
+                    }
+                    have_org = true;
                 }
                 let asn = v.get("asn").and_then(|v| v.as_str()).unwrap_or("");
                 if !asn.is_empty() && info.asn.is_empty() && asn.chars().all(|c| c.is_ascii_digit()) {
@@ -379,33 +422,52 @@ pub async fn refresh_outbound(st: std::sync::Arc<AppState>) {
                 }
             }
         }
-        if ok && info.org.is_empty() && info.isp.is_empty() {
+        if ok && !have_org {
             if let Ok(v) = curl_json::<serde_json::Value>("https://api.ip.sb/geoip", 8).await {
-                info.isp = v.get("isp").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                info.org = v
+                let isp = v.get("isp").and_then(|v| v.as_str()).unwrap_or("");
+                let org = v
                     .get("asn_organization")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                info.asn = v.get("asn").map(|a| format!("AS{}", a)).unwrap_or_default();
+                    .unwrap_or("");
+                if !junk_org(org) {
+                    info.org = org.to_string();
+                    have_org = true;
+                }
+                if !junk_org(isp) {
+                    info.isp = isp.to_string();
+                    have_org = true;
+                }
+                if info.asn.is_empty() {
+                    info.asn = v.get("asn").map(|a| format!("AS{}", a)).unwrap_or_default();
+                }
                 info.hosting = v.get("hosting").and_then(|v| v.as_bool()).unwrap_or(false);
             } else if let Ok(v) = curl_json::<serde_json::Value>("https://ipwho.is/", 10).await {
                 let conn = v.get("connection");
-                info.isp = conn
+                let isp = conn
                     .and_then(|c| c.get("isp"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                info.org = conn
+                let org = conn
                     .and_then(|c| c.get("org"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                info.asn = conn
-                    .and_then(|c| c.get("asn"))
-                    .and_then(|v| v.as_u64())
-                    .map(|a| format!("AS{}", a))
-                    .unwrap_or_default();
+                if !junk_org(&org) {
+                    info.org = org;
+                    have_org = true;
+                }
+                if !junk_org(&isp) {
+                    info.isp = isp;
+                    have_org = true;
+                }
+                if info.asn.is_empty() {
+                    info.asn = conn
+                        .and_then(|c| c.get("asn"))
+                        .and_then(|v| v.as_u64())
+                        .map(|a| format!("AS{}", a))
+                        .unwrap_or_default();
+                }
             }
         }
         let succeeded = ok;
@@ -414,9 +476,37 @@ pub async fn refresh_outbound(st: std::sync::Arc<AppState>) {
             if ok {
                 hist.outbound_ip = info.ip.clone();
                 hist.outbound_cc = info.country_code.clone();
-                hist.outbound_org = if info.isp.is_empty() { info.org.clone() } else { info.isp.clone() };
-                if hist.outbound_org.is_empty() {
-                    hist.outbound_org = "未知".into();
+                // IP 资料 display: owner first; without one fall back to the
+                // zh region line (香港 九龙 style), then country/city. Never
+                // surface the geo databases' "Private Customer" placeholders.
+                let display = if !junk_org(&info.isp) {
+                    info.isp.clone()
+                } else if !junk_org(&info.org) {
+                    info.org.clone()
+                } else {
+                    String::new()
+                };
+                if !display.is_empty() {
+                    hist.outbound_org = display;
+                } else if !zh_region.is_empty() {
+                    hist.outbound_org = if info.asn.is_empty() {
+                        zh_region.clone()
+                    } else {
+                        format!("{} · {}", zh_region, info.asn)
+                    };
+                } else {
+                    let mut segs: Vec<String> = Vec::new();
+                    if !info.country.trim().is_empty() {
+                        segs.push(info.country.trim().to_string());
+                    }
+                    if !info.city.trim().is_empty() {
+                        segs.push(info.city.trim().to_string());
+                    }
+                    hist.outbound_org = if segs.is_empty() {
+                        "未知".into()
+                    } else {
+                        segs.join(" · ")
+                    };
                 }
                 hist.outbound_ok = true;
                 hist.ipinfo = Some(info);
