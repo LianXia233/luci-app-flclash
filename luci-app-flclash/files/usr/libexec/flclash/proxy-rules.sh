@@ -205,6 +205,46 @@ EOF
 			END {if (t) exclusions()}
 		' "$CFG" > "$tmp" && cp "$tmp" "$CFG" && rm -f "$tmp" && PREPARE_CHANGED=1
 	fi
+
+	# The prerouting REDIRECT delivers LAN packets to the INCOMING interface's
+	# address (192.168.x.1:$REDIR_PORT), not to 127.0.0.1. With allow-lan false
+	# mihomo binds the redir/tproxy listeners to 127.0.0.1 only, so every
+	# redirected LAN connection is refused while the router's own traffic
+	# (loopback-destined) keeps working — the classic "本机可代理、下挂设备不通"
+	# failure. allow-lan true makes the listeners bind "*" so LAN takeover
+	# actually connects; the WAN-side exposure is closed by fw4_input_on().
+	if ! grep -qE '^allow-lan:[[:space:]]*true([[:space:]]|$)' "$CFG"; then
+		if grep -qE '^allow-lan:' "$CFG"; then
+			awk '{if ($0 ~ /^allow-lan:/) print "allow-lan: true"; else print}' "$CFG" > "$tmp" && \
+				cp "$tmp" "$CFG" && rm -f "$tmp" && PREPARE_CHANGED=1
+		else
+			printf 'allow-lan: true\n' > "$tmp" && cat "$CFG" >> "$tmp" && \
+				cp "$tmp" "$CFG" && rm -f "$tmp" && PREPARE_CHANGED=1
+		fi
+	fi
+
+	# Client DNS queries are hijacked straight to the core's :$DNS_PORT
+	# listener and never pass through dnsmasq, so a dnsmasq-side filter_aaaa
+	# can never see them. Filter AAAA at the source instead: with
+	# flclash.proxy.filter_aaaa=1 (the default) mihomo's DNS stops answering
+	# AAAA, keeping dual-stack LAN clients on the v4 path the takeover covers.
+	local want_dns_ipv6=true
+	[ "$(uci -q get flclash.proxy.filter_aaaa 2>/dev/null)" != "0" ] && want_dns_ipv6=false
+	local cur_dns_ipv6
+	cur_dns_ipv6=$(awk '/^dns:/{d=1;next} d && /^[^ \t#]/{d=0} d && /^[ \t]*ipv6:/{print $2; exit}' "$CFG")
+	if [ -n "$cur_dns_ipv6" ]; then
+		if [ "$cur_dns_ipv6" != "$want_dns_ipv6" ]; then
+			awk -v w="$want_dns_ipv6" '
+				/^dns:/ {d=1; print; next}
+				d && /^[^ \t#]/ {d=0}
+				d && /^[ \t]*ipv6:/ {print "  ipv6: " w; next}
+				{print}
+			' "$CFG" > "$tmp" && cp "$tmp" "$CFG" && rm -f "$tmp" && PREPARE_CHANGED=1
+		fi
+	else
+		awk -v w="$want_dns_ipv6" '/^dns:/ {print; print "  ipv6: " w; next} {print}' "$CFG" > "$tmp" && \
+			cp "$tmp" "$CFG" && rm -f "$tmp" && PREPARE_CHANGED=1
+	fi
 	rm -f "$tmp"
 	return 0
 }
@@ -347,6 +387,11 @@ purge_core_artifacts() {
 
 fw4_input_on() {
 	nft list chain inet fw4 input >/dev/null 2>&1 || return 0
+	# allow-lan binds the proxy listeners to "*" — keep them LAN-only so an
+	# open WAN zone cannot turn the router into an open proxy. Inserted first,
+	# ahead of the accept rules below.
+	nft list chain inet fw4 input 2>/dev/null | grep -q 'FlClash WAN Proxy Guard' || \
+		nft insert rule inet fw4 input position 0 "iifname != \"$LAN_IF\" meta l4proto { tcp, udp } th dport { $REDIR_PORT, $TPROXY_PORT } reject comment \"FlClash WAN Proxy Guard\"" 2>/dev/null
 	nft list chain inet fw4 input 2>/dev/null | grep -q 'FlClash Redirect Accept' || \
 		nft insert rule inet fw4 input position 0 ct status dnat accept comment '"FlClash Redirect Accept"' 2>/dev/null
 	nft list chain inet fw4 input 2>/dev/null | grep -q 'FlClash TPROXY Accept' || \
@@ -355,7 +400,7 @@ fw4_input_on() {
 
 fw4_input_off() {
 	local handles h
-	handles=$(nft -a list chain inet fw4 input 2>/dev/null | awk '/FlClash (Redirect|TPROXY) Accept/ {print $NF}')
+	handles=$(nft -a list chain inet fw4 input 2>/dev/null | awk '/FlClash (Redirect|TPROXY) Accept|FlClash WAN Proxy Guard/ {print $NF}')
 	for h in $handles; do nft delete rule inet fw4 input handle "$h" 2>/dev/null; done
 }
 
