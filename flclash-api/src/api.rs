@@ -380,7 +380,7 @@ pub async fn status(State(st): State<Arc<AppState>>) -> Response {
     });
     let dns_json = json!({
         "enable": cfg.dns_enable,
-        "enhanced-mode": if cfg.dns_mode.is_empty() { "fake-ip" } else { cfg.dns_mode.as_str() },
+        "enhanced-mode": if cfg.dns_mode.is_empty() { "redir-host" } else { cfg.dns_mode.as_str() },
         "nameserver": cfg.dns_nameservers,
         "default-nameserver": cfg.dns_default_nameservers,
         "fake-ip-range": if cfg.dns_fake_ip_range.is_empty() { "198.18.0.1/16" } else { cfg.dns_fake_ip_range.as_str() },

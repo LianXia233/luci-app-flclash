@@ -106,6 +106,7 @@ WebUI 的「出站模式」（`mode: rule / global / direct`）与「透明代�
 - **出站模式**：即 mihomo 的 `mode`，决定流量走规则 / 全局 / 直连；在「设置 → 网络」或首页模式条切换，运行时通过 controller `PATCH /configs` 生效。
 - **透明代理（局域网接管）**：由 `POST /proxy/start` 调用 `proxy-rules.sh`，按检测到的防火墙后端（`fw4` → nftables）在 LAN 接口（`br-lan`）的 prerouting 链劫持流量：TCP `REDIRECT` 到 `7893`、UDP `TPROXY` 到 `7894`、DNS（TCP/UDP 53）`REDIRECT` 到 `1053`；同时写入 dnsmasq 片段将系统 DNS 指向 `127.0.0.1#1053`。私网地址段（RFC1918 等）被排除，路由器管理面（SSH / LuCI）不受影响。状态保存在 UCI `flclash.proxy.enabled`、`/tmp/flclash-proxy.state` 与 nft 规则三处，重启后由 `/etc/init.d/flclash-proxy` 恢复。
 - **DNS（进阶）**：设置页写入 `config.yaml` 的 `dns` 块（fake-ip / redir-host、`nameserver`、`default-nameserver` 等）。后端在渲染该块时会固定写出 `dns.listen: 0.0.0.0:1053`，确保内核始终提供 DNS 监听；`proxy-rules.sh` 另有兜底自愈，启用接管时若发现该字段缺失会自动补回并重载内核。因此修改 DNS 设置不会破坏透明代理的 DNS 劫持。
+- **默认 DNS 模式为 redir-host（真实 IP）**：新导入订阅与未显式指定 `enhanced-mode` 时，后端统一生成 `redir-host`，DNS 返回真实 IP 而非 `198.18.0.0/15` 假地址。这样 LAN 客户端拿到真实目标 IP，nftables 的 `REDIRECT` / `TPROXY` 才能按 IP 正确分流，避免假地址绕过。需要 fake-ip 加速时可在「设置 → DNS（进阶）」显式切换；`mixed`（fake-ip + sniffer）模式语义不变。注意：切换 DNS 模式后需重启 dnsmasq 清缓存（`service dnsmasq restart`），否则 53 端口会短暂返回旧缓存记录。
 
 典型旁路由拓扑下，`eth0` 为 WAN（上级路由），`br-lan` 为 LAN（客户端网关指向本机）；透明代理应挂在 `br-lan` 才能接管客户端流量。可用 `LAN_IF` 环境变量覆盖默认接口。
 
@@ -373,8 +374,9 @@ nft list table inet flclash | grep iifname
 # 3. 内核各监听端口就绪（含 DNS 1053）
 netstat -lntup | grep -E ':1053|:7893|:7894|:9097'
 
-# 4. DNS 经劫持返回 fake-ip（198.18.0.0/15）
-nslookup www.example.com 127.0.0.1     # 应返回 198.18.x.x
+# 4. DNS 经劫持由内核应答（默认 redir-host，返回真实 IP）
+nslookup www.example.com 127.0.0.1     # 应返回真实 IP；若显式启用 fake-ip 则为 198.18.x.x
+# 切换 DNS 模式后若仍返回旧记录，先清缓存：service dnsmasq restart
 
 # 5. LAN 客户端默认网关指向本机，访问外网应出现在连接列表
 wget -q -O - http://<设备IP>:9098/flclash/api/connections

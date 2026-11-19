@@ -939,7 +939,11 @@ fn build_node_config(header: &[(&'static str, String)], nodes: Vec<Vec<Kv>>) -> 
     write_header(&mut out, header);
     out.push_str("\ndns:\n");
     out.push_str("  enable: true\n");
-    out.push_str("  enhanced-mode: fake-ip\n");
+    // Default to redir-host (real IPs) rather than fake-ip. The router's
+    // transparent proxy hijacks port 53 and feeds the core a DNS listener;
+    // real-IP answers let nftables REDIRECT/TPROXY do IP-based splitting and
+    // avoid handing LAN clients unreachable 198.18.x addresses.
+    out.push_str("  enhanced-mode: redir-host\n");
     out.push_str("  fake-ip-range: 198.18.0.1/16\n");
     out.push_str("  fake-ip-filter:\n");
     out.push_str("    - '*.lan'\n");

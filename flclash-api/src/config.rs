@@ -206,7 +206,7 @@ fn render_dns_block(patch: &Value) -> Option<String> {
     let mode = dns
         .get("enhanced-mode")
         .and_then(|v| v.as_str())
-        .unwrap_or("fake-ip");
+        .unwrap_or("redir-host");
     // "mixed" is a WebUI-level mode: mihomo itself only understands
     // fake-ip / redir-host. Mixed = fake-ip addressing + domain sniffing,
     // which is how FlClash/OpenClash reconcile fake-ip speed with the
