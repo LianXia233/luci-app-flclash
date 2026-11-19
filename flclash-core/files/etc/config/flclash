@@ -11,6 +11,7 @@ config flclash 'main'
 	option log_level 'info'
 	option tun_enabled '0'
 	option core_type 'mihomo'
+	option core_mode 'ipc'
 
 config flclash 'api'
 	option enabled '1'

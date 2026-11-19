@@ -35,15 +35,17 @@ jobs:
         with:
           targets: aarch64-unknown-linux-musl
 
-      - name: Build FlClash API bridge (Rust/Tokio, static musl)
+      - name: Build FlClash API + core-bridge (Rust/Tokio, static musl)
         run: |
           mkdir -p "$GITHUB_WORKSPACE/flclash-api/files/usr/bin"
           cd flclash-api
           cargo test
           RUSTFLAGS="-C link-self-contained=yes -C linker=rust-lld" \
-            cargo build --release --target aarch64-unknown-linux-musl
-          file target/aarch64-unknown-linux-musl/release/flclash-api
+            cargo build --release --target aarch64-unknown-linux-musl --bins
+          file target/aarch64-unknown-linux-musl/release/flclash-api \
+               target/aarch64-unknown-linux-musl/release/flclash-core-bridge
           cp target/aarch64-unknown-linux-musl/release/flclash-api files/usr/bin/flclash-api
+          cp target/aarch64-unknown-linux-musl/release/flclash-core-bridge files/usr/bin/flclash-core-bridge
 
       - name: Fetch FlClash source and core submodule
         run: |
@@ -51,15 +53,23 @@ jobs:
           cd "$RUNNER_TEMP/FlClash"
           git -c url.https://github.com/.insteadOf=git@github.com: \
             submodule update --init --depth 1 core/Clash.Meta
-          echo "FLCLASH_SRC=$RUNNER_TEMP/FlClash/core/Clash.Meta" >> "$GITHUB_ENV"
+          # The native IPC entry point is core/cmd/core (module `core`), not the
+          # Clash.Meta CLI root. Building ./cmd/core keeps the source pristine.
+          echo "FLCLASH_CORE=$RUNNER_TEMP/FlClash/core" >> "$GITHUB_ENV"
 
-      - name: Build static mihomo core (linux/arm64, cortex-a53)
+      - name: Setup Go (FlClash core requires go >= 1.27)
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.27'
+          cache-dependency-path: "${{ env.FLCLASH_CORE }}/go.sum"
+
+      - name: Build static FlClash IPC core (linux/arm64, cortex-a53)
         run: |
           mkdir -p "$GITHUB_WORKSPACE/flclash-core/files/usr/bin"
-          cd "$FLCLASH_SRC"
-          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 GOARM64=v8.0 \
+          cd "$FLCLASH_CORE"
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 GOARM64=v8.0 GOTOOLCHAIN=local \
             go build -tags with_gvisor -ldflags "-w -s" \
-              -o "$GITHUB_WORKSPACE/flclash-core/files/usr/bin/mihomo-arm64" .
+              -o "$GITHUB_WORKSPACE/flclash-core/files/usr/bin/mihomo-arm64" ./cmd/core
           file "$GITHUB_WORKSPACE/flclash-core/files/usr/bin/mihomo-arm64"
 
       - name: Download OpenWrt SNAPSHOT SDK (mediatek/filogic)
@@ -121,12 +131,128 @@ jobs:
           tag_name: ${{ env.RELEASE_TAG }}
           name: FlClash OpenWrt apk - aarch64_cortex-a53
           body: |
-            FlClash WebUI + static mihomo core + Rust/Tokio API bridge for OpenWrt master / SNAPSHOT (aarch64_cortex-a53).
+            FlClash WebUI + native-IPC core + Rust/Tokio bridge + core-bridge for OpenWrt master / SNAPSHOT (aarch64_cortex-a53).
 
             Packages:
-            - flclash-core: static mihomo core, installed as /usr/bin/mihomo
+            - flclash-core: static FlClash native-IPC core (go build ./cmd/core), installed as /usr/bin/mihomo; driven by flclash-core-bridge over IPC (core.init/setup/listener.start), no source patching
             - flclash-api: Rust/Tokio bridge (static musl), exposes /flclash/api on port 9098; subscription conversion, graceful stop-core degradation, DNS/DoT/DoH profile
-            - luci-app-flclash-webui: LuCI launcher (service switch, core update, logs) + HTML5 WebUI
+            - flclash-core-bridge (inside flclash-api package): native IPC host with auto respawn/re-handshake
+            - luci-app-flclash-webui: LuCI launcher (service switch, core update, logs) + HTML5 WebUI, switchable mihomo/sing-box core
           files: artifacts/*.apk
+          generate_release_notes: false
+          fail_on_unmatched_files: false
+
+  build-x86:
+    name: Build x86_64 (generic)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      TARGET_SUBTARGET: x86/64
+      SDK_DIR: sdk-x86
+      RELEASE_TAG: apk-x86-64-v6
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang flex bison g++ gawk gcc-multilib \
+            g++-multilib gettext git libncurses-dev libssl-dev python3 \
+            rsync unzip zlib1g-dev file wget curl zstd xz-utils
+
+      - name: Setup Rust (stable, x86_64-musl)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Build FlClash API + core-bridge (Rust/Tokio, static musl, x86_64)
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/flclash-api/files/usr/bin"
+          cd flclash-api
+          RUSTFLAGS="-C link-self-contained=yes -C linker=rust-lld" \
+            cargo build --release --target x86_64-unknown-linux-musl --bins
+          file target/x86_64-unknown-linux-musl/release/flclash-api \
+               target/x86_64-unknown-linux-musl/release/flclash-core-bridge
+          cp target/x86_64-unknown-linux-musl/release/flclash-api files/usr/bin/flclash-api
+          cp target/x86_64-unknown-linux-musl/release/flclash-core-bridge files/usr/bin/flclash-core-bridge
+
+      - name: Fetch FlClash source and core submodule
+        run: |
+          git clone --depth 1 https://github.com/chen08209/FlClash.git "$RUNNER_TEMP/FlClash"
+          cd "$RUNNER_TEMP/FlClash"
+          git -c url.https://github.com/.insteadOf=git@github.com: \
+            submodule update --init --depth 1 core/Clash.Meta
+          echo "FLCLASH_CORE=$RUNNER_TEMP/FlClash/core" >> "$GITHUB_ENV"
+
+      - name: Setup Go (FlClash core requires go >= 1.27)
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.27'
+          cache-dependency-path: "${{ env.FLCLASH_CORE }}/go.sum"
+
+      - name: Build static FlClash IPC core (GOAMD64=v1, generic x86_64)
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/flclash-core/files/usr/bin"
+          cd "$FLCLASH_CORE"
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOAMD64=v1 GOTOOLCHAIN=local \
+            go build -tags with_gvisor -ldflags "-w -s" \
+              -o "$GITHUB_WORKSPACE/flclash-core/files/usr/bin/mihomo-amd64" ./cmd/core
+          file "$GITHUB_WORKSPACE/flclash-core/files/usr/bin/mihomo-amd64"
+
+      - name: Download OpenWrt SNAPSHOT SDK (x86/64)
+        run: |
+          BASE="https://downloads.openwrt.org/snapshots/targets/${TARGET_SUBTARGET}"
+          SDK_FILE=$(curl -fsSL "$BASE/" | grep -oE 'openwrt-sdk-[^"<> ]+\.tar\.zst' | sort -u | head -n1)
+          test -n "$SDK_FILE" || { echo "SDK not found at $BASE"; exit 1; }
+          echo "Using SDK: $SDK_FILE"
+          curl -fsSL "$BASE/$SDK_FILE" -o "$RUNNER_TEMP/sdk.tar.zst"
+          mkdir -p "$SDK_DIR"
+          tar --zstd -xf "$RUNNER_TEMP/sdk.tar.zst" -C "$SDK_DIR" --strip-components=1
+
+      - name: Stage packages into SDK
+        run: |
+          mkdir -p "$SDK_DIR/package/flclash-core" \
+                   "$SDK_DIR/package/flclash-api" \
+                   "$SDK_DIR/package/luci-app-flclash-webui"
+          cp -a "$GITHUB_WORKSPACE/flclash-core/." "$SDK_DIR/package/flclash-core/"
+          cp -a "$GITHUB_WORKSPACE/flclash-api/." "$SDK_DIR/package/flclash-api/"
+          cp -a "$GITHUB_WORKSPACE/luci-app-flclash-webui/." "$SDK_DIR/package/luci-app-flclash-webui/"
+
+      - name: Build apk packages
+        run: |
+          cd "$SDK_DIR"
+          make defconfig
+          make -j"$(nproc)" package/flclash-core/compile
+          make -j"$(nproc)" package/flclash-api/compile
+          make -j"$(nproc)" package/luci-app-flclash-webui/compile
+          find bin -type f \( -name 'flclash-core-*.apk' -o -name 'flclash-api-*.apk' -o -name 'luci-app-flclash-webui-*.apk' \) -print
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/artifacts-x86"
+          find "$SDK_DIR/bin" -type f \
+            \( -name 'flclash-core-*.apk' -o -name 'flclash-api-*.apk' -o -name 'luci-app-flclash-webui-*.apk' \) \
+            -exec cp -v {} "$GITHUB_WORKSPACE/artifacts-x86/" \;
+          test "$(find "$GITHUB_WORKSPACE/artifacts-x86" -name '*.apk' | wc -l)" -ge 3 \
+            || { echo "Expected 3 flclash apk"; exit 1; }
+
+      - name: Upload apk artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: flclash-apk-x86-64
+          path: artifacts-x86/*.apk
+          if-no-files-found: error
+
+      - name: Publish Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: FlClash OpenWrt apk - x86_64 (generic GOAMD64=v1)
+          body: |
+            FlClash WebUI + native-IPC core + Rust/Tokio bridge + core-bridge for OpenWrt x86_64 (generic).
+            Core runs via IPC host (core.init/setup/listener.start); switchable mihomo/sing-box.
+          files: artifacts-x86/*.apk
           generate_release_notes: false
           fail_on_unmatched_files: false

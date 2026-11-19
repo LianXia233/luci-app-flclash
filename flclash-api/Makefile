@@ -19,8 +19,9 @@ define Package/flclash-api
 endef
 
 define Package/flclash-api/description
-  Static Go bridge (stdlib only) exposing the FlClash WebUI contract on top of
-  mihomo's loopback controller, and serving /flclash/ from the same origin.
+  Static Rust/Tokio bridge exposing the FlClash WebUI contract on top of
+  mihomo's loopback controller, plus flclash-core-bridge: the native IPC host
+  that drives the FlClash gomobile core (core.init/setup/listener.start).
 endef
 
 define Build/Prepare
@@ -35,6 +36,9 @@ define Package/flclash-api/install
 	$(INSTALL_BIN) ./files/usr/bin/flclash-api $(1)/usr/bin/flclash-api
 	$(INSTALL_DIR) $(1)/etc/init.d
 	$(INSTALL_BIN) ./files/etc/init.d/flclash-api $(1)/etc/init.d/flclash-api
+ifneq ($(wildcard ./files/usr/bin/flclash-core-bridge),)
+	$(INSTALL_BIN) ./files/usr/bin/flclash-core-bridge $(1)/usr/bin/flclash-core-bridge
+endif
 endef
 
 define Package/flclash-api/postinst

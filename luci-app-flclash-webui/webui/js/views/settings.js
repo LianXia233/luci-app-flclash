@@ -202,7 +202,9 @@
         .then(function () {
           ctx.state.status = ctx.state.status || {};
           ctx.state.status.coreType = next;
-          ctx.state.status.coreVersion = next === 'sing-box' ? 'v1.11.0' : 'v1.19.33';
+          // Clear the stale version; refreshStatus() below repopulates the real
+          // one from the core so we never show a hard-coded wrong version.
+          ctx.state.status.coreVersion = '';
           ctx.state.config = ctx.state.config || {};
           ctx.state.config.coreType = next;
           ui.toast('已切换到 ' + (next === 'sing-box' ? 'sing-box' : 'mihomo') + ' 内核', 'ok');

@@ -194,6 +194,11 @@ const methods = {
 				return { code: 1, error: '内核未安装,请先在线更新' };
 
 			system('uci -q set flclash.main.core_type=' + core);
+			# Switching back to the bundled mihomo restores native IPC mode; the
+			# online updater sets core_mode=cli only when it installs the
+			# standalone CLI mihomo. sing-box ignores core_mode.
+			if (core == 'mihomo')
+				system('uci -q set flclash.main.core_mode=ipc');
 			system('uci -q commit flclash');
 			system('/etc/init.d/flclash-core restart >/dev/null 2>&1');
 			return { code: 0, core: core, running: core_state().running };
