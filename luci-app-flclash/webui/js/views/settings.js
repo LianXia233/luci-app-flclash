@@ -165,6 +165,18 @@
       }).catch(function () { /* backend not available: leave switch untouched */ });
     }
 
+    /* Lifecycle calls answer 202 {taskId}; wait for the task result so the
+     * toast reflects the real outcome, not just that the request was queued. */
+    function settleTask(reply) {
+      if (reply && reply.taskId && ctx.comm) {
+        return ctx.comm.waitTask(reply.taskId).then(function (task) {
+          if (task && task.state === 'failed') throw new Error(task.error || '任务失败');
+          return task || reply;
+        });
+      }
+      return reply;
+    }
+
     api.config().then(function (data) { ctx.state.config = data; fill(); }).catch(function () { fill(); });
     fill();
     fillProxy();
@@ -274,6 +286,7 @@
     ui.$('[data-act="toggle"]', root).addEventListener('click', function () {
       const running = !!(ctx.state.status && ctx.state.status.running);
       ctx.api.service(running ? 'stop' : 'start')
+        .then(settleTask)
         .then(function () { ui.toast(running ? '内核已停止' : '内核已启动', 'ok'); return ctx.refreshStatus(); })
         .then(fill)
         .catch(function (error) { ui.toast('操作失败: ' + error.message, 'error'); });
@@ -281,6 +294,7 @@
 
     ui.$('[data-act="restart"]', root).addEventListener('click', function () {
       ctx.api.service('restart')
+        .then(settleTask)
         .then(function () { ui.toast('内核已重启', 'ok'); return ctx.refreshStatus(); })
         .then(fill)
         .catch(function (error) { ui.toast('重启失败: ' + error.message, 'error'); });

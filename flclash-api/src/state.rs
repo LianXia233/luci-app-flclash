@@ -1,6 +1,12 @@
 //! Shared application state and small helpers used across modules.
 
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+
+use serde_json::{json, Value};
+
+use crate::events::{now_millis, EventBus};
+use crate::tasks::TaskManager;
 
 pub const MAX_HISTORY: usize = 60;
 pub const MAX_LOGS: usize = 500;
@@ -81,9 +87,81 @@ pub struct AppState {
     pub init_script: String,
     pub secret: Option<String>,
     pub hist: Mutex<History>,
+    /// Cross-transport event bus (WebSocket fan-out + task progress).
+    pub bus: EventBus,
+    /// Long-running operation registry.
+    pub tasks: TaskManager,
+    /// Latest authoritative status snapshot. REST `/status` and the WebSocket
+    /// `status`/`snapshot` events both read this, so no two views can disagree.
+    latest: tokio::sync::watch::Sender<Arc<Value>>,
+    snapshot_at: AtomicI64,
+    /// Connected WebSocket clients (monitoring).
+    pub ws_clients: AtomicUsize,
+    pub started_at: i64,
+    /// Random-ish identifier of this process, echoed in `hello` so clients can
+    /// tell a restart (state must be re-synced) from a reconnect.
+    pub boot_id: String,
 }
 
 impl AppState {
+    pub fn new(
+        controller: String,
+        ui_dir: String,
+        data_dir: String,
+        init_script: String,
+        secret: Option<String>,
+    ) -> Arc<Self> {
+        let bus = EventBus::new();
+        let tasks = TaskManager::new(bus.clone());
+        let (latest, _initial_rx) = tokio::sync::watch::channel(Arc::new(json!({
+            "running": false,
+            "generatedAt": 0,
+        })));
+        Arc::new(Self {
+            controller,
+            ui_dir,
+            data_dir,
+            init_script,
+            secret,
+            hist: Mutex::default(),
+            bus,
+            tasks,
+            latest,
+            snapshot_at: AtomicI64::new(0),
+            ws_clients: AtomicUsize::new(0),
+            started_at: now_millis(),
+            boot_id: format!("{}-{}", now_millis(), std::process::id()),
+        })
+    }
+
+    /// Current authoritative status snapshot (never blocks on the controller).
+    pub fn snapshot(&self) -> Arc<Value> {
+        self.latest.borrow().clone()
+    }
+
+    pub fn snapshot_age_ms(&self) -> i64 {
+        let at = self.snapshot_at.load(Ordering::Relaxed);
+        if at == 0 {
+            i64::MAX
+        } else {
+            now_millis() - at
+        }
+    }
+
+    /// Marks the cached snapshot as just verified without re-publishing it.
+    /// Used by the sampler when the payload is byte-identical.
+    pub fn touch_snapshot(&self) {
+        self.snapshot_at.store(now_millis(), Ordering::Relaxed);
+    }
+
+    /// Publishes a new snapshot to REST readers and WS subscribers simultaneously.
+    pub fn publish_snapshot(&self, value: Value) {
+        self.snapshot_at.store(now_millis(), Ordering::Relaxed);
+        let value = Arc::new(value);
+        let _ = self.latest.send_replace(value.clone());
+        self.bus.publish("status", "status", (*value).clone());
+    }
+
     pub fn index_path(&self) -> std::path::PathBuf {
         std::path::Path::new(&self.data_dir).join("index.json")
     }

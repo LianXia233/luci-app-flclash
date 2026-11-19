@@ -207,6 +207,31 @@ svg { display: block; }
 
 .header-actions { display: flex; align-items: center; gap: 12px; }
 
+/* Realtime channel indicator: green pulse = WebSocket live, amber = retrying,
+ * grey = REST polling, hollow = mock mode. */
+.live-dot {
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  flex: 0 0 8px;
+  background: transparent;
+  border: 1.5px solid var(--muted);
+  transition: background 0.2s var(--ease), border-color 0.2s var(--ease);
+  cursor: default;
+}
+.live-dot.is-live {
+  background: var(--ok);
+  border-color: var(--ok);
+  box-shadow: 0 0 0 0 var(--ok);
+  animation: live-pulse 2.4s var(--ease) infinite;
+}
+.live-dot.is-wait { background: var(--warn); border-color: var(--warn); animation: live-pulse 1.2s var(--ease) infinite; }
+.live-dot.is-mock { background: var(--muted); border-color: var(--muted); opacity: 0.5; }
+@keyframes live-pulse {
+  0% { box-shadow: 0 0 0 0 rgba(52, 199, 123, 0.45); }
+  70% { box-shadow: 0 0 0 7px rgba(52, 199, 123, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(52, 199, 123, 0); }
+}
+
 .header-traffic { display: flex; gap: 14px; }
 .header-traffic span {
   display: inline-flex; align-items: center; gap: 6px;
@@ -235,6 +260,7 @@ svg { display: block; }
 /* View root */
 .view-root {
   flex: 1;
+  min-width: 0;
   opacity: 0;
   transform: translateY(8px);
   transition: opacity 0.3s var(--ease), transform 0.3s var(--ease);
@@ -336,11 +362,13 @@ html[data-theme='light'] .bottom-item.is-active .nav-label { color: var(--primar
 /* ------------------------------------------------------------------- cards */
 
 .card {
+  --card-pad: 20px;
   background: var(--card);
   border-radius: var(--radius-card);
-  padding: 18px 20px;
+  padding: 18px var(--card-pad);
   box-shadow: var(--shadow);
   position: relative;
+  min-width: 0;
   transition: transform 0.2s var(--ease), box-shadow 0.2s var(--ease);
 }
 
@@ -485,7 +513,9 @@ html[data-theme='light'] .bottom-item.is-active .nav-label { color: var(--primar
   border: 1px solid var(--line);
   border-radius: var(--radius-pill);
   padding: 0 14px;
-  flex: 0 1 260px;
+  flex: 1 1 220px;
+  min-width: 0;
+  max-width: 340px;
   color: var(--muted);
 }
 .search .input { border: none; background: transparent; flex: 1; padding: 9px 0; }
@@ -516,29 +546,60 @@ html[data-theme='light'] .bottom-item.is-active .nav-label { color: var(--primar
 .seg-chips {
   display: flex; gap: 8px;
   overflow-x: auto;
-  padding: 2px 2px 10px;
+  overscroll-behavior-x: contain;
+  scroll-snap-type: x proximity;
+  /* Fade the trailing edge so a clipped chip reads as "scrollable" instead of
+   * "broken layout". */
+  padding: 2px 22px 10px 2px;
   scrollbar-width: none;
+  -webkit-overflow-scrolling: touch;
+  mask-image: linear-gradient(90deg, #000 0, #000 calc(100% - 18px), transparent 100%);
+  -webkit-mask-image: linear-gradient(90deg, #000 0, #000 calc(100% - 18px), transparent 100%);
 }
 .seg-chips::-webkit-scrollbar { display: none; }
 .seg-chip {
   border: 1px solid var(--line);
   background: var(--card);
   color: var(--muted);
-  border-radius: var(--radius-pill);
-  padding: 8px 16px;
+  border-radius: 18px;
+  padding: 7px 16px;
   font-size: 13px;
   cursor: pointer;
   white-space: nowrap;
-  display: inline-flex; flex-direction: column; align-items: center; gap: 1px;
-  transition: all 0.2s var(--ease);
+  display: inline-flex; flex-direction: column; align-items: flex-start; justify-content: center; gap: 1px;
+  min-height: 46px;
+  flex: 0 0 auto;
+  scroll-snap-align: start;
+  transition: background 0.2s var(--ease), color 0.2s var(--ease), border-color 0.2s var(--ease), transform 0.15s var(--ease);
 }
-.seg-chip-name { font-weight: 600; }
-.seg-chip-now { font-size: 10.5px; opacity: 0.75; }
+.seg-chip:active { transform: scale(0.97); }
+.seg-chip-name { font-weight: 600; line-height: 1.2; }
+.seg-chip-now {
+  max-width: 190px;
+  font-size: 10.5px;
+  line-height: 1.3;
+  opacity: 0.75;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.seg-auto {
+  display: inline-block;
+  margin-right: 4px;
+  padding: 0 5px;
+  border-radius: 6px;
+  background: var(--warn-soft, rgba(255, 178, 66, 0.14));
+  color: var(--warn);
+  font-style: normal;
+  font-size: 9.5px;
+  line-height: 1.5;
+  vertical-align: 1px;
+}
 .seg-chip.is-active {
   background: var(--primary);
   border-color: var(--primary);
   color: #fff;
 }
+.seg-chip.is-active .seg-chip-now { opacity: 0.85; }
 
 /* dashboard grid */
 .dashboard { display: flex; flex-direction: column; gap: 16px; }
@@ -551,7 +612,7 @@ html[data-theme='light'] .bottom-item.is-active .nav-label { color: var(--primar
 .status-card { overflow: hidden; }
 .status-inner { display: flex; align-items: stretch; gap: 10px; min-height: 168px; }
 .status-main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
-.status-head { display: flex; align-items: center; gap: 10px; }
+.status-head { display: flex; align-items: center; gap: 10px; min-width: 0; }
 .status-head .glyph {
   width: 34px; height: 34px;
   display: grid; place-items: center;
@@ -590,9 +651,12 @@ html[data-theme='light'] .bottom-item.is-active .nav-label { color: var(--primar
   padding: 0;
   cursor: pointer;
   font-variant-numeric: tabular-nums;
-  word-break: break-all;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
 }
-.ip-chips { display: flex; gap: 8px; }
+.ip-chips { display: flex; flex-wrap: wrap; gap: 6px 8px; }
 /* Dual-stack display: the node's IPv6 egress under the v4 address. */
 .ip-stack .ip6 {
   font-size: 11.5px;
@@ -650,14 +714,23 @@ html[data-theme='light'] .bottom-item.is-active .nav-label { color: var(--primar
 .speed-label svg { color: var(--primary); }
 .speed-card.is-down .speed-label svg { color: var(--chart-down); }
 .peak { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
-.speed-figure { display: flex; align-items: baseline; gap: 6px; margin: 10px 0 2px; }
-.speed-value { font-size: 34px; font-weight: 800; font-variant-numeric: tabular-nums; letter-spacing: -0.01em; }
+.speed-figure { display: flex; align-items: baseline; gap: 6px; margin: 10px 0 2px; min-width: 0; }
+.speed-value {
+  font-size: clamp(24px, 5.2vw, 34px);
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+  line-height: 1.05;
+  min-width: 0;
+  white-space: nowrap;
+}
 .speed-unit { color: var(--muted); font-size: 13px; font-weight: 600; }
 .speed-total { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
-.speed-chart { height: 56px; margin: 12px -20px 0; position: relative; }
+.speed-chart { height: 56px; margin: 12px calc(-1 * var(--card-pad)) 0; position: relative; }
 .chart-svg { width: 100%; height: 100%; }
 
-.speed-tiles { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.speed-tiles { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; min-width: 0; }
+.speed-tile { min-width: 0; }
 .speed-tile {
   background: var(--tile);
   border-radius: var(--radius-tile);
@@ -666,7 +739,7 @@ html[data-theme='light'] .bottom-item.is-active .nav-label { color: var(--primar
   display: flex; flex-direction: column;
 }
 .speed-tile .speed-figure { margin: 6px 0 0; }
-.speed-tile .speed-value { font-size: 26px; }
+.speed-tile .speed-value { font-size: clamp(19px, 5vw, 26px); }
 .speed-tile .speed-chart { height: 46px; margin: 10px -16px 0; }
 
 /* mode bar */
@@ -734,9 +807,32 @@ html[data-theme='light'] .bottom-item.is-active .nav-label { color: var(--primar
 .stat-count { font-weight: 800; font-size: 15px; color: var(--primary); font-variant-numeric: tabular-nums; }
 .stat-label { font-size: 12.5px; color: var(--muted); }
 
-.table-wrap { margin: 0 -20px; padding: 0 20px; overflow-x: auto; }
-table.data { width: 100%; border-collapse: collapse; font-size: 13px; }
+.table-wrap {
+  margin: 0 calc(-1 * var(--card-pad));
+  padding: 0 var(--card-pad);
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+}
+table.data {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+  table-layout: fixed;
+}
+/* Column widths give the host column the remaining space and keep the
+ * numeric columns stable, so a table never pushes past its card. */
+table.data .c-target { width: 32%; }
+table.data .c-proto { width: 11%; }
+table.data .c-chain { width: 18%; }
+table.data .c-up, table.data .c-down { width: 15%; }
+table.data .c-age { width: 11%; }
+table.data .c-rule { width: 26%; }
+table.data .c-type { width: 20%; }
+table.data .c-out { width: 22%; }
+table.data .c-act { width: 40px; }
 table.data th {
+  overflow: hidden;
+  text-overflow: ellipsis;
   text-align: left;
   color: var(--muted);
   font-weight: 600;
@@ -795,7 +891,8 @@ table.data .is-muted { color: var(--muted); }
   .dash-row .span-2, .dash-row.is-control .mode-bar { grid-column: span 2; }
   /* FAB pinned inside the status card's top-right corner, like the app */
   .status-inner { display: block; position: relative; }
-  .status-main { padding-right: 84px; }
+  .status-main { padding-right: 78px; }
+  .status-head { padding-right: 0; }
   .start-toggle {
     position: absolute;
     top: 8px;
@@ -804,15 +901,26 @@ table.data .is-muted { color: var(--muted); }
     margin: 0;
   }
   .status-cells { gap: 20px; }
-  .status-ip-row { margin: 14px 0 10px; }
+  .status-ip-row { margin: 14px 0 10px; gap: 12px; }
+  .ip-text { font-size: 20px; }
 }
 
 @media (max-width: 560px) {
+  .card { --card-pad: 16px; padding-top: 16px; }
   .dash-row { grid-template-columns: 1fr; }
   .dash-row .span-2, .dash-row.is-control .mode-bar { grid-column: span 1; }
   .mode-bar { flex-direction: column; align-items: stretch; }
   .segmented { justify-content: space-between; }
   .segment { flex: 1; justify-content: center; padding: 9px 8px; }
+  .status-cell .status-cell-value { font-size: 20px; }
+  .status-ip-row { display: flex; align-items: center; gap: 8px; }
+  .status-ip-row .ip-text { flex: 1; min-width: 0; }
+  /* Optional columns drop out instead of overflowing the card. */
+  table.data .c-opt, table.data .c-age { display: none; }
+  table.data .c-target { width: 46%; }
+  table.data .c-up, table.data .c-down { width: 19%; }
+  table.data { font-size: 12.5px; }
+  table.data th, table.data td { padding: 8px 6px; }
 }
 
 /* ----------------------------------------------------------------- toast */

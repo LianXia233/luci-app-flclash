@@ -1,6 +1,10 @@
 //! Background loops: traffic/log samplers, totals polling, transparent-proxy
 //! reconciliation and subscription auto-update. The outbound IP profile
 //! lookup lives in its own module (`ipinfo.rs`).
+//!
+//! Every sampler is the single producer for its topic: REST readers and
+//! WebSocket subscribers consume the same snapshot/event, so N browser tabs
+//! no longer mean N controller polls.
 
 use std::time::Duration;
 use tokio::io::AsyncBufReadExt;
@@ -10,6 +14,51 @@ use crate::state::{now_secs, AppState, LogEntry, MAX_HISTORY, MAX_LOGS};
 
 fn controller_url(controller: &str, path: &str) -> String {
     format!("http://{}{}", controller, path)
+}
+
+/// Recomputes `/status` and publishes it when it actually changed. This is
+/// the authoritative status source for both `GET /status` and WS `status`.
+pub async fn refresh_snapshot(st: &AppState) {
+    let value = crate::api::status_payload(st).await;
+    st.publish_snapshot(value);
+}
+
+pub async fn sample_status(st: std::sync::Arc<AppState>) {
+    loop {
+        let value = crate::api::status_payload(&st).await;
+        if *st.snapshot() == value {
+            // Same bytes: keep the REST cache fresh without emitting a redundant
+            // event (clients already hold this state).
+            st.touch_snapshot();
+        } else {
+            st.publish_snapshot(value);
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+/// `/proxies` snapshots for the proxies page, only while someone is listening.
+pub async fn sample_proxies(st: std::sync::Arc<AppState>) {
+    loop {
+        if st.bus.receivers() > 0 {
+            if let Ok(mut payload) = crate::api::proxies_payload(&st).await {
+                payload["running"] = serde_json::json!(true);
+                st.bus.publish("proxies", "proxies", payload);
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+}
+
+/// `/connections` snapshots (dashboard table + connections page).
+pub async fn sample_connections(st: std::sync::Arc<AppState>) {
+    loop {
+        if st.bus.receivers() > 0 {
+            let payload = crate::api::connections_payload(&st).await;
+            st.bus.publish("connections", "connections", payload);
+        }
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+    }
 }
 
 /// /traffic → rate history for the dashboard charts.
@@ -42,27 +91,42 @@ pub async fn sample_traffic(st: std::sync::Arc<AppState>) {
             };
             let up = value.get("up").and_then(|v| v.as_f64()).unwrap_or(0.0);
             let down = value.get("down").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let mut hist = st.hist.lock().unwrap();
-            hist.up.push(up);
-            hist.down.push(down);
-            if hist.up.len() > MAX_HISTORY {
-                let excess = hist.up.len() - MAX_HISTORY;
-                hist.up.drain(..excess);
-                hist.down.drain(..excess);
-            }
-            if up > hist.peak_up {
-                hist.peak_up = up;
-            }
-            if down > hist.peak_down {
-                hist.peak_down = down;
-            }
+            let snapshot = {
+                let mut hist = st.hist.lock().unwrap();
+                hist.up.push(up);
+                hist.down.push(down);
+                if hist.up.len() > MAX_HISTORY {
+                    let excess = hist.up.len() - MAX_HISTORY;
+                    hist.up.drain(..excess);
+                    hist.down.drain(..excess);
+                }
+                if up > hist.peak_up {
+                    hist.peak_up = up;
+                }
+                if down > hist.peak_down {
+                    hist.peak_down = down;
+                }
+                serde_json::json!({
+                    "up": hist.up.last().copied().unwrap_or(0.0),
+                    "down": hist.down.last().copied().unwrap_or(0.0),
+                    "upRate": hist.up.last().copied().unwrap_or(0.0),
+                    "downRate": hist.down.last().copied().unwrap_or(0.0),
+                    "peakUp": hist.peak_up,
+                    "peakDown": hist.peak_down,
+                    "totalUp": hist.total_up,
+                    "totalDown": hist.total_dn,
+                    "history": {"up": hist.up.clone(), "down": hist.down.clone()},
+                })
+            };
+            // Live chart data without waiting for the next status snapshot.
+            st.bus.publish("traffic", "traffic", snapshot);
         }
         let _ = child.kill().await;
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }
 
-/// /logs?level=info → ring buffer for the logs page.
+/// /logs?level=info → ring buffer for the logs page + batched WS pushes.
 pub async fn sample_logs(st: std::sync::Arc<AppState>) {
     loop {
         let mut cmd = tokio::process::Command::new("curl");
@@ -86,33 +150,39 @@ pub async fn sample_logs(st: std::sync::Arc<AppState>) {
         };
         let reader = tokio::io::BufReader::new(stdout);
         let mut lines = reader.lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
-                continue;
-            };
-            let payload = value
-                .get("payload")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            if payload.is_empty() {
-                continue;
+        let mut pending: Vec<serde_json::Value> = Vec::new();
+        let mut ticker = tokio::time::interval(Duration::from_millis(300));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                line = lines.next_line() => {
+                    let Ok(Some(line)) = line else { break };
+                    let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
+                    let payload = value.get("payload").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    if payload.is_empty() { continue; }
+                    let level = value.get("type").and_then(|v| v.as_str()).unwrap_or("info").to_string();
+                    let entry = LogEntry { time: now_secs(), level: level.clone(), message: payload.clone() };
+                    {
+                        let mut hist = st.hist.lock().unwrap();
+                        hist.logs.push(entry);
+                        if hist.logs.len() > MAX_LOGS {
+                            let excess = hist.logs.len() - MAX_LOGS;
+                            hist.logs.drain(..excess);
+                        }
+                    }
+                    pending.push(serde_json::json!({"time": now_secs(), "level": level, "message": payload}));
+                }
+                _ = ticker.tick() => {
+                    if !pending.is_empty() {
+                        let batch = std::mem::take(&mut pending);
+                        st.bus.publish("logs", "logs.append", serde_json::json!({"lines": batch}));
+                    }
+                }
             }
-            let level = value
-                .get("type")
-                .and_then(|v| v.as_str())
-                .unwrap_or("info")
-                .to_string();
-            let mut hist = st.hist.lock().unwrap();
-            hist.logs.push(LogEntry {
-                time: now_secs(),
-                level,
-                message: payload,
-            });
-            if hist.logs.len() > MAX_LOGS {
-                let excess = hist.logs.len() - MAX_LOGS;
-                hist.logs.drain(..excess);
-            }
+        }
+        if !pending.is_empty() {
+            let batch = std::mem::take(&mut pending);
+            st.bus.publish("logs", "logs.append", serde_json::json!({"lines": batch}));
         }
         let _ = child.kill().await;
         tokio::time::sleep(Duration::from_secs(1)).await;

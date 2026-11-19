@@ -17,6 +17,19 @@
       '<div class="profile-list" data-role="list"></div>';
 
     const list = ui.$('[data-role="list"]', root);
+    const comm = ctx.comm;
+
+    /* Mutating endpoints answer 202 {taskId}; wait for the pushed task result
+     * instead of assuming the work finished when the HTTP call returns. */
+    function settle(reply) {
+      if (reply && reply.taskId && comm) {
+        return comm.waitTask(reply.taskId).then(function (task) {
+          if (task && task.state === 'failed') throw new Error(task.error || '任务失败');
+          return task || reply;
+        });
+      }
+      return reply;
+    }
 
     function render() {
       const items = ctx.state.profiles || [];
@@ -55,6 +68,7 @@
           const id = button.getAttribute('data-update');
           button.classList.add('is-spinning');
           api.updateProfile(id)
+            .then(settle)
             .then(function () { ui.toast('订阅已更新', 'ok'); return ctx.reloadProfiles(); })
             .catch(function (error) { ui.toast('更新失败: ' + error.message, 'error'); })
             .then(function () { button.classList.remove('is-spinning'); });
@@ -90,6 +104,7 @@
         button.addEventListener('click', function () {
           button.disabled = true;
           api.applyProfile(button.getAttribute('data-apply'))
+            .then(settle)
             .then(function () { ui.toast('配置已启用,内核已加载', 'ok'); return ctx.reloadProfiles(); })
             .catch(function (error) { ui.toast('启用失败: ' + error.message, 'error'); button.disabled = false; });
         });
@@ -122,10 +137,11 @@
             if (!value) { ui.toast('请输入链接', 'error'); urlInput.focus(); return; }
             ui.$('[data-confirm]', body).disabled = true;
             api.importProfile(value)
-              .then(function (item) {
+              .then(settle)
+              .then(function () {
                 helpers.markSaved();
                 close();
-                ui.toast('已导入 ' + (item.proxies || 0) + ' 个节点', 'ok');
+                ui.toast('订阅已导入', 'ok');
                 return ctx.reloadProfiles();
               })
               .catch(function (error) {
@@ -144,9 +160,9 @@
       list.innerHTML = ui.empty(error.message, 'info');
     });
     ctx.onProfiles = render;
-    ui.every('profiles', function () {
-      api.profiles().then(function (data) { ctx.state.profiles = data; render(); }).catch(function () {});
-    }, 8000);
+    if (ctx.state.profiles) render();
+    const off = ctx.watch('profiles', function () { render(); });
+    if (ctx.onTeardown) ctx.onTeardown(off);
     return root;
   }
 

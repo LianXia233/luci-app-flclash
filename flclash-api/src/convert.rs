@@ -554,7 +554,7 @@ fn parse_share_url(raw: &str, scheme: &str) -> Result<Vec<Kv>, String> {
     };
     let (host, port) = split_host_port(hostport)?;
 
-    let mut pairs = Vec::new();
+    let mut pairs;
     match scheme {
         "vless" => {
             pairs = vec![
@@ -803,6 +803,7 @@ fn node_lines_from(body: &str) -> (Vec<Vec<Kv>>, usize) {
 
 // -------------------------------------------------------------- yaml assembly
 
+#[allow(dead_code)] // documents subscription header priority order
 pub const HEADER_ORDER: [&str; 10] = [
     "mixed-port",
     "socks-port",

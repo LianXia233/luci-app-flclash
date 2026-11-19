@@ -1,8 +1,8 @@
 /* FlClash WebUI — per-view styles (proxies / profiles / requests / logs /
  * rules / dns / tools / settings). */
 
-.view { padding-bottom: 26px; }
-.page { display: flex; flex-direction: column; gap: 14px; }
+.view { padding-bottom: 26px; min-width: 0; }
+.page { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
 
 .page-toolbar {
   display: flex;
@@ -10,17 +10,33 @@
   gap: 10px;
   flex-wrap: wrap;
 }
+.page-toolbar > .search { flex: 1 1 240px; max-width: 360px; }
+.page-toolbar > .btn { flex: 0 0 auto; white-space: nowrap; }
 .grow { flex: 1; }
 .muted { color: var(--muted); font-size: 12.5px; }
 .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.col { display: flex; }
+.col { display: flex; flex-direction: column; min-width: 0; }
+
+/* Phones: the search field owns the first row, action buttons split the
+ * second row evenly — no button is left orphaned or squeezed into two lines. */
+@media (max-width: 620px) {
+  .page-toolbar { row-gap: 10px; }
+  .page-toolbar > .search { flex: 1 1 100%; max-width: none; order: -2; }
+  .page-toolbar > .grow:empty { display: none; }
+  .page-toolbar > .btn,
+  .page-toolbar > .btn.is-ghost { flex: 1 1 0; min-width: 0; justify-content: center; padding-left: 10px; padding-right: 10px; }
+  /* A lone action stays compact and right-aligned instead of stretching. */
+  .page-toolbar > .btn:only-of-type,
+  .page-toolbar > .btn.is-ghost:only-of-type { flex: 0 0 auto; margin-left: auto; }
+}
 
 /* ------------------------------------------------------------- proxies */
 
 .node-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(215px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(206px, 1fr));
   gap: 12px;
+  min-width: 0;
 }
 
 .node-card {
@@ -28,23 +44,61 @@
   border-radius: var(--radius-tile);
   padding: 13px 15px;
   cursor: pointer;
+  min-width: 0;
   transition: transform 0.16s var(--ease), background 0.2s var(--ease);
 }
 .node-card:hover { transform: translateY(-2px); background: var(--tile); }
 .node-card.is-active { background: var(--primary-soft); }
 .node-card.is-active .ms { font-variation-settings: 'FILL' 1, 'wght' 500, 'GRAD' 0, 'opsz' 24; }
-.node-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
+.node-card.is-locked { cursor: default; opacity: 0.72; }
+.node-card.is-locked:hover { transform: none; background: var(--card); }
+.node-card.is-pending { opacity: 0.6; pointer-events: none; }
+.node-card:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+.node-top > .chip { flex: 0 0 auto; white-space: nowrap; }
+.node-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; min-width: 0; }
 .node-name {
   font-weight: 600;
   font-size: 13px;
   line-height: 1.35;
-  word-break: break-all;
+  overflow-wrap: anywhere;
+  word-break: normal;
+  min-width: 0;
   display: -webkit-box;
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
   overflow: hidden;
 }
-.node-meta { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
+.node-meta { display: flex; align-items: center; gap: 6px; margin-top: 10px; min-width: 0; flex-wrap: nowrap; }
+.node-meta .chip { flex: 0 0 auto; font-size: 10.5px; padding: 2px 7px; }
+.node-group {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.node-group b { color: var(--text); font-weight: 600; }
+.node-meta .icon-button { margin-left: auto; flex: 0 0 32px; }
+.node-chip-muted { color: var(--muted); }
+
+/* Group hint shown when the active group is auto-managed. */
+.group-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--muted);
+  background: var(--tile);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 9px 14px;
+}
+.group-note .ms { color: var(--warn); flex: 0 0 auto; }
+.group-note span { min-width: 0; overflow-wrap: anywhere; }
+.group-note.is-quiet .ms { color: var(--muted); }
 
 /* ------------------------------------------------------------- profiles */
 
@@ -60,6 +114,7 @@
 }
 .profile-item.is-active { background: var(--primary-soft); }
 .profile-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 8px; }
+.profile-meta { flex-wrap: wrap; row-gap: 4px; }
 .profile-actions {
   display: flex;
   flex-direction: column;
@@ -172,10 +227,32 @@
 .row-title { font-weight: 600; font-size: 13.5px; }
 .row-desc { font-size: 12px; color: var(--muted); }
 
+/* multiline settings inputs must fill the card instead of the browser default */
+.dns-area {
+  width: 100%;
+  margin: 4px 0 12px;
+  resize: vertical;
+  min-height: 74px;
+  line-height: 1.5;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+}
+.settings-row + .dns-area { margin-top: -4px; }
+
 @media (max-width: 560px) {
   .tool-grid { grid-template-columns: 1fr; }
   .profile-item { flex-direction: column; }
   .profile-actions { flex-direction: row; }
-  .node-grid { grid-template-columns: 1fr 1fr; }
+  .node-grid { grid-template-columns: 1fr 1fr; gap: 10px; }
+  /* Two-column cards are too narrow for the target-group hint; the group bar
+   * above already carries that information. */
+  .node-meta .node-group { display: none; }
   .node-card { padding: 11px 12px; }
+  .node-name { font-size: 12.5px; }
+  .settings-row { gap: 10px; }
+  .dns-area { min-height: 64px; }
+}
+
+@media (max-width: 380px) {
+  .node-grid { grid-template-columns: 1fr; }
 }

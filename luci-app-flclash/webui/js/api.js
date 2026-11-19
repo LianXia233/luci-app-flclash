@@ -155,11 +155,13 @@ window.FlClashAPI = (function () {
     deleteProfile: function (id) {
       return live('deleteProfile', { path: '/profiles/' + encodeURIComponent(id), method: 'DELETE' });
     },
-    selectProxy: function (group, name) {
-      return live('selectProxy', { path: '/proxies/select', method: 'POST' }, { group: group, name: name });
+    selectProxy: function (group, name, extra) {
+      const body = Object.assign({ group: group, name: name }, extra || {});
+      return live('selectProxy', { path: '/proxies/select', method: 'POST' }, body);
     },
-    testDelay: function (name) {
-      return live('testDelay', { path: '/proxies/delay', method: 'POST' }, { name: name });
+    testDelay: function (name, group) {
+      const body = group ? { name: name, group: group } : { name: name };
+      return live('testDelay', { path: '/proxies/delay', method: 'POST' }, body);
     },
     testGroupDelay: function (group) {
       return live('testGroupDelay', { path: '/proxies/group-delay', method: 'POST' }, { group: group });

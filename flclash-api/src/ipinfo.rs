@@ -349,11 +349,9 @@ async fn lookup_once(st: &AppState) -> bool {
                 .unwrap_or("");
             if !junk_org(org) {
                 info.org = org.to_string();
-                have_org = true;
             }
             if !junk_org(isp) {
                 info.isp = isp.to_string();
-                have_org = true;
             }
             if info.asn.is_empty() {
                 info.asn = v.get("asn").map(|a| format!("AS{}", a)).unwrap_or_default();
@@ -373,11 +371,9 @@ async fn lookup_once(st: &AppState) -> bool {
                 .to_string();
             if !junk_org(&org) {
                 info.org = org;
-                have_org = true;
             }
             if !junk_org(&isp) {
                 info.isp = isp;
-                have_org = true;
             }
             if info.asn.is_empty() {
                 info.asn = conn

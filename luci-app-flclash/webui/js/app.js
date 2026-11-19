@@ -6,6 +6,7 @@
   'use strict';
 
   const api = window.FlClashAPI;
+  const comm = window.FlClashComm;
   const cfg = window.FlClashConfig;
   const ui = window.FlClashUI;
   const views = window.FlClashViews;
@@ -19,17 +20,8 @@
   const miniUp = document.getElementById('mini-up');
   const miniDown = document.getElementById('mini-down');
 
-  const state = {
-    status: null,
-    proxies: null,
-    profiles: null,
-    connections: null,
-    logs: null,
-    rules: null,
-    config: null,
-    history: { up: [], down: [] },
-    offline: false
-  };
+  // The communication layer owns the only copy of shared state.
+  const state = comm.state;
 
   const NAV = [
     { id: 'dashboard', label: '仪表盘', glyph: 'dashboard' },
@@ -47,6 +39,8 @@
   let current = 'dashboard';
   let mountToken = 0;
   let dashboardNode = null;
+  let dashboardUnsubs = [];
+  let viewTeardown = [];
 
   /* ------------------------------------------------------------- utilities */
 
@@ -151,26 +145,40 @@
     ui.toast('后端不可达: ' + (error && error.message ? error.message : '网络错误'), 'error');
   }
 
+  /// Force a REST refresh; the status subscription below paints the UI.
   async function refreshStatus() {
     try {
-      const status = await api.status();
-      updateChrome(status);
-      const traffic = status.traffic || {};
-      const history = traffic.history;
-      if (history && history.up && history.down) {
-        state.history.up = history.up.slice(-60);
-        state.history.down = history.down.slice(-60);
-      }
-      if (current === 'dashboard' && dashboardNode) updateDashboard(status);
-      if (current === 'settings') {
-        const node = ui.$('[data-role="state"]', viewRoot);
-        if (node) node.textContent = status.running ? '运行中' : '已停止';
-      }
-      return status;
+      return await comm.refresh('status', { force: true });
     } catch (error) {
       markOffline(error);
       throw error;
     }
+  }
+
+  function paintLive(info) {
+    const dot = document.getElementById('live-dot');
+    if (!dot) return;
+    let tone = 'off';
+    if (info.connected) tone = 'live';
+    else if (info.transport === 'reconnecting') tone = 'wait';
+    else if (info.transport === 'mock') tone = 'mock';
+    dot.className = 'live-dot is-' + tone;
+    dot.title = info.connected
+      ? '实时通道已连接 · 序号 ' + info.lastSequence
+      : info.transport === 'reconnecting'
+        ? '实时通道断开，正在重连…'
+        : info.transport === 'mock'
+          ? '演示数据（未连接后端）'
+          : '轮询模式（REST 回退）';
+  }
+
+  function notifyTaskFailures(tasks) {
+    if (!tasks || !tasks.length) return;
+    tasks.forEach(function (task) {
+      if (!task || task.state !== 'failed' || task.__notified) return;
+      task.__notified = true;
+      ui.toast((task.label || '任务') + '失败: ' + (task.error || '未知错误'), 'error');
+    });
   }
 
   /* -------------------------------------------------------------- dashboard */
@@ -249,7 +257,7 @@
         '<span class="speed-label">' + icon(up ? 'arrowUp' : 'arrowDown', 16) + '<span>' + (up ? '上传' : '下载') + '</span></span>' +
         '<div class="speed-figure"><span class="speed-value" data-role="m-' + (up ? 'up' : 'down') + '">' + value.value + '</span>' +
           '<span class="speed-unit" data-role="m-unit-' + (up ? 'up' : 'down') + '">' + value.unit + '/s</span></div>' +
-        '<div class="speed-total">累计 ' + ui.bytes(up ? traffic.totalUp : traffic.totalDown) + '</div>' +
+        '<div class="speed-total" data-role="m-total-' + (up ? 'up' : 'down') + '">累计 ' + ui.bytes(up ? traffic.totalUp : traffic.totalDown) + '</div>' +
         '<div class="speed-chart ' + (up ? 'is-up' : 'is-down') + '" data-role="m-chart-' + (up ? 'up' : 'down') + '"></div>' +
       '</div>';
     }
@@ -615,6 +623,8 @@
       if (mobileValue) ui.countUp(mobileValue, Number(value.value), function (v) { return v.toFixed(1); });
       const mobileUnit = ui.$('[data-role="m-unit-' + dir + '"]', node);
       if (mobileUnit) mobileUnit.textContent = value.unit + '/s';
+      const mobileTotal = ui.$('[data-role="m-total-' + dir + '"]', node);
+      if (mobileTotal) mobileTotal.textContent = '累计 ' + ui.bytes(row[2] || 0);
       const mobileChart = ui.$('[data-role="m-chart-' + dir + '"]', node);
       if (mobileChart) ui.renderChart(mobileChart, dir === 'up' ? state.history.up : state.history.down, { height: 46, minScale: 8192 });
     });
@@ -649,14 +659,6 @@
 
     const connCount = ui.$('[data-role="conn-count"]', node);
     if (connCount) connCount.textContent = ui.count(status.stats ? status.stats.connections : 0);
-
-    const table = ui.$('[data-role="connections-table"]', node);
-    if (table) {
-      api.connections().then(function (list) {
-        if (!list || !list.length) return;
-        table.innerHTML = connectionsTable(list.slice(0, 8));
-      }).catch(function () {});
-    }
 
     /* Service / memory / profile cards must track live status too, not just
      * the values captured at first render. */
@@ -742,6 +744,8 @@
 
   async function renderDashboard() {
     const token = ++mountToken;
+    dashboardUnsubs.forEach(function (off) { off(); });
+    dashboardUnsubs = [];
     dashboardNode = renderDashboardShell(state.status || { running: false, proxyGroups: {} });
     viewRoot.innerHTML = '';
     viewRoot.appendChild(dashboardNode);
@@ -749,15 +753,14 @@
     window.FlClashIcons.mount(dashboardNode);
     bindDashboard(dashboardNode);
     bindLayoutEditor(dashboardNode);
-    ui.every('status', function () { refreshStatus().catch(function () {}); }, cfg.pollInterval);
-    ui.every('dash-connections', function () {
-      api.connections().then(function (list) {
-        if (token !== mountToken || !dashboardNode) return;
-        state.connections = list;
-        const table = ui.$('[data-role="connections-table"]', dashboardNode);
-        if (table && list && list.length) table.innerHTML = connectionsTable(list.slice(0, 8));
-      }).catch(function () {});
-    }, 3000);
+
+    /* Connections are pushed on the realtime channel; the fallback poller
+     * inside the communication layer covers an unavailable socket. */
+    dashboardUnsubs.push(comm.watch('connections', function (list) {
+      if (token !== mountToken || !dashboardNode || !list) return;
+      const table = ui.$('[data-role="connections-table"]', dashboardNode);
+      if (table && list.length) table.innerHTML = connectionsTable(list.slice(0, 8));
+    }));
   }
 
   /* ----------------------------------------------------------------- router */
@@ -773,6 +776,8 @@
   }
 
   async function renderView(name, force) {
+    viewTeardown.forEach(function (fn) { try { fn(); } catch (error) { console.error(error); } });
+    viewTeardown = [];
     if (name === 'dashboard') { await renderDashboard(); return; }
     ui.stopAll();
     if (!force) skeleton();
@@ -780,23 +785,30 @@
     const token = ++mountToken;
     const ctx = {
       api: api,
+      comm: comm,
       state: state,
+      meta: comm.meta,
       navigate: function (next) { window.location.hash = '#/' + next; },
       refreshStatus: refreshStatus,
+      /* Subscribe to a shared topic; the returned function must be called
+       * on unmount (view teardown). */
+      watch: function (topic, handler) { return comm.watch(topic, handler); },
+      refresh: function (topic) { return comm.refresh(topic, { force: true }); },
       reloadProfiles: async function () {
-        state.profiles = await api.profiles().catch(function () { return state.profiles; });
+        await comm.refresh('profiles', { force: true }).catch(function () {});
         if (token === mountToken && ctx.onProfiles) ctx.onProfiles();
       },
       reloadProxies: async function () {
-        state.proxies = await api.proxies().catch(function () { return state.proxies; });
+        await comm.refresh('proxies', { force: true }).catch(function () {});
         if (token === mountToken && ctx.onProxies) ctx.onProxies();
       },
       reloadConnections: async function () {
-        state.connections = await api.connections().catch(function () { return state.connections; });
+        await comm.refresh('connections', { force: true }).catch(function () {});
         if (token === mountToken && ctx.onConnections) ctx.onConnections();
       },
       setTheme: setTheme,
-      copy: copy
+      copy: copy,
+      onTeardown: function (fn) { viewTeardown.push(fn); }
     };
     const node = builder(ctx);
     viewRoot.innerHTML = '';
@@ -873,6 +885,22 @@
   bindRail();
   applyTheme();
   window.FlClashIcons.mount(document);
+
+  /* Single status subscription for the whole shell: header, rail, dashboard
+   * and the settings page all read the same pushed snapshot. */
+  comm.watch('status', function (status) {
+    if (!status) return;
+    updateChrome(status);
+    if (current === 'dashboard' && dashboardNode) updateDashboard(status);
+    if (current === 'settings') {
+      const node = ui.$('[data-role="state"]', viewRoot);
+      if (node) node.textContent = status.running ? '运行中' : '已停止';
+    }
+  });
+  comm.watch('tasks', notifyTaskFailures);
+  comm.onMeta(paintLive);
+  comm.start();
+
   navigate((window.location.hash || '#/dashboard').replace('#/', ''));
   refreshStatus().catch(function () {});
 })();

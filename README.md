@@ -184,7 +184,9 @@ sync() ─────┼─ config.tun.enable=true 且 TUN 在线 ──► TUN
 
 ## API 总览
 
-所有接口以 `/flclash/api` 为前缀。若设置 `api.secret`，请求需携带 `X-FlClash-Secret: <secret>` 或 `Authorization: Bearer <secret>`。
+所有接口以 `/flclash/api` 为前缀。若设置 `api.secret`，请求需携带 `X-FlClash-Secret: <secret>` 或 `Authorization: Bearer <secret>`（WebSocket 用首帧 `auth` 消息）。
+
+REST 只负责**控制与查询**；实时数据由 `GET /ws` 推送。两者读取同一份构造器（`status_payload` / `build_proxies`），不会出现数值分叉。完整设计见 [docs/architecture-comm.md](docs/architecture-comm.md)。
 
 ### 状态与内核
 
@@ -193,7 +195,7 @@ sync() ─────┼─ config.tun.enable=true 且 TUN 在线 ──► TUN
 | `GET /status` | 运行状态、出口 IP（`outboundIp` / `outboundIp6`）/ 归属 / 质量、`takeoverState`、内存等 |
 | `GET /version` | 内核与桥接版本 |
 | `GET /memory` | 内存统计 |
-| `POST /service/{action}` | `start` / `stop` / `restart` 内核服务（启停后自动收敛接管） |
+| `POST /service/{action}` | `start` / `stop` / `restart` 内核服务，返回 `202 {taskId}`；启停后自动收敛接管 |
 | `GET /system/proxy` | 系统透明代理状态摘要 |
 | `GET /proxy`、`POST /proxy/{action}` | 透明代理开关与状态（`takeover` / `tunActive` / `coreRunning` / `proxyWish`） |
 
@@ -202,12 +204,16 @@ sync() ─────┼─ config.tun.enable=true 且 TUN 在线 ──► TUN
 | 方法与路径 | 说明 |
 | --- | --- |
 | `GET /proxies` | 代理组与节点；内核停止时返回空集（200） |
-| `POST /proxies/select` | 切换节点 / 组 |
+| `POST /proxies/select` | 切换节点：校验组与成员关系，自动组解析到首个 selector，返回 `{ok,group,name,autoFallback}` |
 | `POST /proxies/delay` | 单节点测速 |
 | `POST /proxies/group-delay` | 整组测速 |
 | `GET /connections` | 连接列表 |
 | `DELETE /connections/{id}` | 关闭指定连接 |
 | `GET /logs` | 日志采样（环形缓冲） |
+| `GET /tasks`、`GET /tasks/{id}` | 后台任务列表与单个任务状态 |
+| `GET /core/capabilities` | 当前内核能力矩阵（runtimeMode / ruleProviders / …） |
+| `GET /ws/stats` | WebSocket 客户端数、订阅数、序号、协议版本 |
+| `GET /ws`（升级） | 事件推送通道：`status` / `traffic` / `proxies` / `connections` / `logs` / `tasks` / `system` |
 
 ### 配置、规则与 DNS
 
@@ -223,14 +229,33 @@ sync() ─────┼─ config.tun.enable=true 且 TUN 在线 ──► TUN
 | 方法与路径 | 说明 |
 | --- | --- |
 | `GET /profiles` | 订阅列表与流量 / 到期元数据 |
-| `POST /profiles/import` | 下载 → 转换 → 落库 |
-| `POST /profiles/{id}/update` | 更新订阅 |
-| `POST /profiles/{id}/apply` | 转换 → 原子写 `config.yaml` → 重载或启动内核 |
+| `POST /profiles/import` | 下载 → 转换 → 落库，返回 `202 {taskId}` |
+| `POST /profiles/{id}/update` | 更新订阅，返回 `202 {taskId}` |
+| `POST /profiles/{id}/apply` | 转换 → 原子写 `config.yaml` → 重载或启动内核，返回 `202 {taskId}` |
 | `PATCH /profiles/{id}`、`PUT /profiles/{id}`、`DELETE /profiles/{id}` | 编辑名称 / URL / 自动更新间隔，或删除 |
 
 静态资源：`GET /flclash/`（WebUI 入口）与 `GET /flclash/*`。
 
 > 内核未运行时，读接口返回 `200` + `config.yaml` 文件回显；依赖内核的写操作返回 `503`，不回传底层 dial 错误。
+
+### 实时通道与事件
+
+`GET /ws` 使用 JSON 信封：
+
+```json
+{"id":"evt-…","type":"status","topic":"status","data":{…},
+ "timestamp":1795120571799,"sequence":128,"topicSequence":42,"version":1}
+```
+
+- 客户端命令：`hello` / `auth` / `subscribe` / `unsubscribe` / `sync` / `resume` / `ack` / `ping`
+- 保活：服务端 20s `ping`，70s 空闲关闭（4008）；帧上限 8KB；120 msg/s 限速（4029）；协议不符 4400；认证失败 4401
+- 一致性：`sequence` 排序、`topicSequence` 检测丢帧，缺口或广播滞后时服务端发 `resync` + 全量 `snapshot`
+- 压缩：>4KB 且握手声明 `gzip+base64` 时启用应用层 gzip（axum 0.8 无 permessage-deflate）
+- 前端：`js/comm.js` 统一持有 state；WS 不可用自动退回 REST 轮询，header 圆点颜色表示通道状态
+
+### 后台任务
+
+长操作统一为任务：请求返回 `202 {ok,accepted,taskId}`，进度通过 `tasks/task` 事件推送（`queued → running → done|failed`），失败时全局提示一次；HTTP 断开不影响后台执行，可用 `GET /tasks/{id}` 兜底。
 
 ## rpcd 对象
 
@@ -351,7 +376,9 @@ luci-app-flclash_<ver>-r<rel>_<arch>_immortalwrt-snapshot.apk
 
 | 检查 | 方式 | 结果 |
 | --- | --- | --- |
-| Rust 单元测试 | `cd flclash-api && cargo test --locked` | 全部通过 |
+| Rust 单元测试 | `cd flclash-api && cargo test --locked` | 38 项通过（ws 集成 6 / 任务 1 / 代理 4 / 能力矩阵 2） |
+| WebUI 布局 | headless Chromium 逐视图量宽（360/390/768/1280） | 9 个视图无横向溢出（滚动容器除外） |
+| 端到端 | 假 controller + 真实二进制 + 浏览器 | WS 连接、选择、事件、任务、重连全部通过 |
 | 二进制架构与静态性 | CI `binaries` / `package` 架构闸门 | ELF、静态、目标架构、无 `INTERP` |
 | 单包约束 | `package` job 断言 | 每个组合**恰好 1 个** apk |
 | 发布一致性 | `release` job + `sha256sum -c` | 4 个 apk 全部匹配 |
@@ -400,6 +427,7 @@ wget -q -O - http://127.0.0.1:9098/flclash/api/status | grep -oE '"outboundIp[^,
 ├── .github/workflows/build-apk.yml   # 二进制 → 打包 → 发布
 ├── flclash-api/                      # Rust crate
 │   ├── src/main.rs                   # axum 路由与鉴权
+│   ├── src/{events,tasks,ws,core}.rs # 事件总线 / 任务 / WebSocket / 内核能力
 │   ├── src/ipinfo.rs                 # 出口 IP 多源查询（CF 优先 / 双栈 / 汉化 / 启停感知）
 │   ├── src/{config,convert,profiles,singbox,loops}.rs
 │   └── src/bin/flclash-core-bridge.rs
@@ -408,6 +436,7 @@ wget -q -O - http://127.0.0.1:9098/flclash/api/status | grep -oE '"outboundIp[^,
 │   ├── files/                        # 配置、init、脚本、LuCI、rpcd
 │   │   └── usr/libexec/flclash/proxy-rules.sh   # 透明代理状态机
 │   └── webui/                        # HTML5 WebUI（css / js / views / fonts / img）
+│       └── js/comm.js                # 共享状态 + WS 订阅 + REST 回退
 ├── scripts/
 │   ├── build-core.sh                 # Go 内核交叉编译
 │   └── verify-core.sh                # 静态性与架构校验

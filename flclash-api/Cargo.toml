@@ -14,16 +14,26 @@ path = "src/bin/flclash-core-bridge.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "process", "sync", "fs", "signal"] }
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# preserve_order keeps proxy groups/nodes in the order the core reports them
+# (config order), instead of sorting by name.
+serde_json = { version = "1", features = ["preserve_order"] }
 base64 = "0.22"
 serde_yaml = "0.9"
+# WebSocket fan-out: split sink/stream + application-level gzip for large
+# snapshots.
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+flate2 = "1"
 # Native HTTP(S) for the IP profile lookup and subscription downloads:
 # rustls + webpki-roots (no system CA dependency, no curl binary).
 # Compiled in WSL — ring needs a C cross toolchain that the plain Windows
 # rust-lld setup does not provide.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots"] }
+
+[dev-dependencies]
+# Real WebSocket client for the transport integration tests.
+tokio-tungstenite = "0.26"
 
 [profile.release]
 opt-level = "z"

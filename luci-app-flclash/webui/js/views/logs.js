@@ -6,7 +6,6 @@
   const icon = window.FlClashIcons.svg;
 
   function logs(ctx) {
-    const api = ctx.api;
     const root = document.createElement('div');
     root.className = 'view page';
     let level = '';
@@ -79,9 +78,10 @@
     renderLevels();
     render(true);
     ctx.onLogs = function () { render(false); };
-    ui.every('logs', function () {
-      api.logs().then(function (data) { ctx.state.logs = data; render(); }).catch(function () {});
-    }, 3000);
+    /* Log lines arrive as `logs.append` events; the snapshot poll behind
+     * `watch` only repairs gaps after a reconnect. */
+    const off = ctx.watch('logs', function () { render(false); });
+    if (ctx.onTeardown) ctx.onTeardown(off);
     return root;
   }
 

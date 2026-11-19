@@ -6,7 +6,11 @@
 //! byte-for-byte unchanged.
 //!
 //! Layout (one concern per module):
-//!   state.rs    — shared state, /proc helpers, formatting
+//!   state.rs    — shared state, /proc helpers, formatting, snapshot cache
+//!   events.rs   — event envelope + broadcast bus (single producer model)
+//!   tasks.rs    — long-running operation registry (progress on `tasks` topic)
+//!   ws.rs       — WebSocket transport: auth, subscriptions, gap recovery
+//!   core.rs     — core capability matrix (mihomo vs sing-box)
 //!   ctrl.rs     — loopback controller client + curl-backed fetch/stream
 //!   convert.rs  — subscription format detection and node parsing
 //!   config.rs   — config.yaml view + settings persistence
@@ -18,12 +22,16 @@
 mod api;
 mod config;
 mod convert;
+mod core;
 mod ctrl;
+mod events;
 mod ipinfo;
 mod loops;
 mod profiles;
 mod singbox;
 mod state;
+mod tasks;
+mod ws;
 
 use std::sync::Arc;
 
@@ -77,14 +85,6 @@ async fn auth(
     next.run(req).await
 }
 
-async fn not_found() -> Response {
-    (
-        StatusCode::NOT_FOUND,
-        Json(json!({"error": "not found"})),
-    )
-        .into_response()
-}
-
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -122,23 +122,19 @@ async fn main() {
         .ok()
         .filter(|s| !s.is_empty());
 
-    let st = Arc::new(AppState {
-        controller,
-        ui_dir,
-        data_dir,
-        init_script,
-        secret,
-        hist: std::sync::Mutex::default(),
-    });
+    let st = AppState::new(controller, ui_dir, data_dir, init_script, secret);
 
     eprintln!(
         "flclash-api listening on {}, controller {}, ui {}",
         listen, st.controller, st.ui_dir
     );
 
+    tokio::spawn(loops::sample_status(st.clone()));
     tokio::spawn(loops::sample_traffic(st.clone()));
     tokio::spawn(loops::sample_logs(st.clone()));
     tokio::spawn(loops::sample_totals(st.clone()));
+    tokio::spawn(loops::sample_proxies(st.clone()));
+    tokio::spawn(loops::sample_connections(st.clone()));
     tokio::spawn(loops::sync_proxy(st.clone()));
     tokio::spawn(loops::auto_update(st.clone()));
     tokio::spawn(ipinfo::refresh_outbound(st.clone()));
@@ -160,6 +156,10 @@ async fn main() {
         .route("/connections", get(api::connections))
         .route("/connections/{id}", delete(api::connection_close))
         .route("/logs", get(api::logs))
+        .route("/tasks", get(api::tasks_list))
+        .route("/tasks/{id}", get(api::task_get))
+        .route("/core/capabilities", get(api::core_capabilities))
+        .route("/ws/stats", get(api::ws_stats))
         .route("/system/proxy", get(api::system_proxy))
         .route("/profiles", get(api::profiles_get))
         .route("/profiles/import", post(api::profiles_import))
@@ -176,8 +176,13 @@ async fn main() {
         .route("/proxy/{action}", post(api::proxy_toggle))
         .route_layer(middleware::from_fn_with_state(st.clone(), auth));
 
+    // The WebSocket route authenticates itself: browsers cannot set headers on
+    // an upgrade request, so auth happens in-band (`auth` message / query /
+    // header) together with an Origin check.
+    let realtime = Router::new().route("/ws", get(ws::ws_handler));
+
     let app: Router<()> = Router::new()
-        .nest("/flclash/api", protected)
+        .nest("/flclash/api", protected.merge(realtime))
         .route("/", get(api::static_index))
         .route("/flclash", get(api::static_index))
         .route("/flclash/", get(api::static_root))

@@ -44,17 +44,18 @@
         return;
       }
       tableWrap.innerHTML = '<table class="data"><thead><tr>' +
-        '<th>目标</th><th>规则</th><th>链路</th><th class="num">上传</th><th class="num">下载</th><th>时长</th><th></th>' +
+        '<th class="c-target">目标</th><th class="c-rule c-opt">规则</th><th class="c-chain c-opt">链路</th>' +
+        '<th class="c-up num">上传</th><th class="c-down num">下载</th><th class="c-age">时长</th><th class="c-act"></th>' +
         '</tr></thead><tbody>' + data.slice(0, 100).map(function (item) {
           return '<tr>' +
-            '<td title="' + ui.esc(item.host) + '">' + ui.esc(item.host) + ':' + ui.esc(item.port) +
+            '<td class="c-target" title="' + ui.esc(item.host) + '">' + ui.esc(item.host) + ':' + ui.esc(item.port) +
               '<div class="muted" style="font-size:11px">' + ui.esc(item.source || '') + '</div></td>' +
-            '<td class="is-muted">' + ui.esc(item.rule || '-') + '</td>' +
-            '<td>' + ui.esc(item.chain || '-') + '</td>' +
-            '<td class="num">' + ui.bytes(item.up) + '</td>' +
-            '<td class="num">' + ui.bytes(item.down) + '</td>' +
-            '<td class="is-muted">' + ui.duration(item.duration) + '</td>' +
-            '<td><button class="icon-button" data-close="' + ui.esc(item.id) + '" type="button" aria-label="关闭连接">' + icon('close', 14) + '</button></td>' +
+            '<td class="c-rule c-opt is-muted">' + ui.esc(item.rule || '-') + '</td>' +
+            '<td class="c-chain c-opt">' + ui.esc(item.chain || '-') + '</td>' +
+            '<td class="c-up num">' + ui.bytes(item.up) + '</td>' +
+            '<td class="c-down num">' + ui.bytes(item.down) + '</td>' +
+            '<td class="c-age is-muted">' + ui.duration(item.duration) + '</td>' +
+            '<td class="c-act"><button class="icon-button" data-close="' + ui.esc(item.id) + '" type="button" aria-label="关闭连接">' + icon('close', 14) + '</button></td>' +
             '</tr>';
         }).join('') + '</tbody></table>';
 
@@ -98,13 +99,14 @@
     });
 
     render();
-    ctx.onConnections = render;
-    ui.every('connections', function () {
-      api.connections().then(function (list) {
-        ctx.state.connections = list;
-        render();
-      }).catch(function () {});
-    }, 3000);
+    ctx.onConnections = function () { if (!paused) render(); };
+    /* Pushed every ~1.5s; pause freezes the table without dropping the
+     * subscription, so resuming is instant. */
+    const off = ctx.watch('connections', function () {
+      if (paused) return;
+      render();
+    });
+    if (ctx.onTeardown) ctx.onTeardown(off);
     return root;
   }
 

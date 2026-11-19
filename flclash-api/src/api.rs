@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 use crate::config::{file_config, save_config};
 use crate::ctrl::{core_reachable, ctrl_json, ctrl_req, CtrlReply};
 use crate::state::{core_pid, core_uptime, local_ipv4, rss_bytes, AppState};
-use crate::{profiles, state::MAX_BODY};
+use crate::profiles;
 
 /// Controller request wrappers bound to the app state (timeout defaults).
 async fn req(st: &AppState, method: &str, path: &str) -> Result<CtrlReply, String> {
@@ -55,6 +55,16 @@ fn core_down() -> Response {
     fail_json(StatusCode::SERVICE_UNAVAILABLE, "内核未运行，请先在 LuCI 或状态页启动 FlClash")
 }
 
+/// 202 for operations that continue after the HTTP response.
+fn accepted(task_id: String) -> Response {
+    (
+        StatusCode::ACCEPTED,
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        axum::Json(json!({"ok": true, "accepted": true, "taskId": task_id})),
+    )
+        .into_response()
+}
+
 async fn body_json(body: &Bytes) -> Result<Value, Response> {
     serde_json::from_slice::<Value>(body)
         .map_err(|e| fail_json(StatusCode::BAD_REQUEST, &e.to_string()))
@@ -72,60 +82,164 @@ fn proxy_delay(proxy: &Value) -> i64 {
         .unwrap_or(0)
 }
 
-/// GET /proxies map → {groups, nodes}, mirroring proxiesPayload().
+/// True when the controller reports a group the user can switch manually.
+pub(crate) fn is_selector(kind: &str) -> bool {
+    kind == "selector"
+}
+
+fn proxy_tested(proxy: &Value) -> bool {
+    proxy
+        .get("history")
+        .and_then(|v| v.as_array())
+        .map(|h| !h.is_empty())
+        .unwrap_or(false)
+}
+
+fn proxy_type(proxy: &Value) -> String {
+    proxy
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_lowercase()
+}
+
+/// GET /proxies map → {groups, nodes}.
+///
+/// Parsing rules (shared by REST, the WebSocket snapshot and the selector):
+/// * groups keep the controller's order (no alphabetical re-sort), because
+///   subscriptions define a meaningful order (节点选择 → 自动选择 → …);
+/// * nodes keep first-seen order and carry *all* groups they belong to;
+/// * `group` is the group a manual click should target: the first *selector*
+///   group that contains the node (falls back to the first group otherwise);
+/// * `selectable` tells the UI whether any manual switch is possible;
+/// * `tested` distinguishes "never measured" from "measured timeout".
 pub async fn proxies_payload(st: &AppState) -> Result<Value, String> {
     let data = ctrl_json(st, "GET", "/proxies", None, Duration::from_secs(10)).await?;
-    let empty = Vec::new();
     let proxies = data
         .get("proxies")
         .and_then(|v| v.as_object())
         .ok_or_else(|| "bad proxies payload".to_string())?;
+    Ok(build_proxies(proxies))
+}
 
+/// Pure part of the proxy parser (unit-testable without a controller).
+pub(crate) fn build_proxies(proxies: &serde_json::Map<String, Value>) -> Value {
+    let empty = Vec::new();
     let mut groups: Vec<Value> = Vec::new();
-    let mut nodes: std::collections::BTreeMap<String, Value> = std::collections::BTreeMap::new();
+    let mut group_names: Vec<String> = Vec::new();
+    let mut group_selectable: Vec<bool> = Vec::new();
+    let mut member_names: Vec<Vec<String>> = Vec::new();
+
     for (name, proxy) in proxies {
         let all = proxy.get("all").and_then(|v| v.as_array()).unwrap_or(&empty);
         if all.is_empty() {
             continue;
         }
+        let kind = proxy_type(proxy);
+        let selectable = is_selector(&kind);
         groups.push(json!({
             "name": name,
-            "type": proxy.get("type").and_then(|v| v.as_str()).unwrap_or("").to_lowercase(),
+            "type": kind,
             "now": proxy.get("now").and_then(|v| v.as_str()).unwrap_or(""),
             "count": all.len(),
+            "selectable": selectable,
         }));
-        for member in all {
-            let member_name = member.as_str().unwrap_or("");
-            let item = match proxies.get(member_name) {
-                Some(item) => item,
-                None => continue,
+        group_names.push(name.clone());
+        group_selectable.push(selectable);
+        member_names.push(
+            all.iter()
+                .filter_map(|m| m.as_str().map(|s| s.to_string()))
+                .collect(),
+        );
+    }
+
+    let mut nodes: Vec<Value> = Vec::new();
+    let mut node_index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (gi, name) in group_names.iter().enumerate() {
+        for member in &member_names[gi] {
+            let Some(item) = proxies.get(member) else {
+                // Provider node currently unavailable: skip it rather than
+                // showing a card that cannot be selected or tested.
+                continue;
             };
-            match nodes.get_mut(member_name) {
-                Some(existing) => {
-                    if let Some(list) = existing.get_mut("groups").and_then(|v| v.as_array_mut()) {
+            if let Some(&idx) = node_index.get(member.as_str()) {
+                let node = &mut nodes[idx];
+                if let Some(list) = node.get_mut("groups").and_then(|v| v.as_array_mut()) {
+                    if !list.iter().any(|g| g.as_str() == Some(name.as_str())) {
                         list.push(Value::String(name.clone()));
                     }
                 }
-                None => {
-                    nodes.insert(
-                        member_name.to_string(),
-                        json!({
-                            "name": member_name,
-                            "type": item.get("type").and_then(|v| v.as_str()).unwrap_or("").to_lowercase(),
-                            "delay": proxy_delay(item),
-                            "group": name,
-                            "groups": [name],
-                        }),
-                    );
+                if group_selectable[gi] && !node["selectable"].as_bool().unwrap_or(false) {
+                    node["selectable"] = json!(true);
+                    node["group"] = json!(name);
                 }
+                continue;
             }
+            node_index.insert(member.clone(), nodes.len());
+            nodes.push(json!({
+                "name": member,
+                "type": proxy_type(item),
+                "delay": proxy_delay(item),
+                "tested": proxy_tested(item),
+                "group": name,
+                "groups": [name],
+                "selectable": group_selectable[gi],
+                // A node that is itself a group (自动选择 inside 节点选择):
+                // the UI renders it as a group shortcut, not as a server.
+                "isGroup": item.get("all").is_some(),
+                "provider": item.get("provider").and_then(|v| v.as_str()),
+            }));
         }
     }
-    groups.sort_by_key(|g| g.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string());
-    Ok(json!({
+
+    json!({
         "groups": groups,
-        "nodes": nodes.into_values().collect::<Vec<_>>(),
-    }))
+        "nodes": nodes,
+    })
+}
+
+/// Validates a proxy selection and resolves the selector group that should
+/// actually receive it. Shared by the REST handler and the tests.
+///
+/// Returns `(group_to_put, fallback_used)` or a user-facing error.
+pub(crate) fn resolve_selector(
+    proxies: &serde_json::Map<String, Value>,
+    group: &str,
+    name: &str,
+) -> Result<(String, bool), String> {
+    let entry = proxies
+        .get(group)
+        .ok_or_else(|| format!("策略组「{}」不存在或内核已重载配置", group))?;
+    let members = entry.get("all").and_then(|v| v.as_array());
+    let has_member = members
+        .map(|list| list.iter().any(|m| m.as_str() == Some(name)))
+        .unwrap_or(false);
+    if !has_member {
+        return Err(format!("节点「{}」不属于策略组「{}」", name, group));
+    }
+    if is_selector(&proxy_type(entry)) {
+        return Ok((group.to_string(), false));
+    }
+    // Legacy or ambiguous callers may address an auto group (url-test /
+    // fallback / load-balance). Manual selection still has a well-defined
+    // meaning: switch the first selector group that contains the node.
+    let mut candidates: Vec<String> = Vec::new();
+    for (other, proxy) in proxies {
+        let list = proxy.get("all").and_then(|v| v.as_array());
+        let contains = list
+            .map(|l| l.iter().any(|m| m.as_str() == Some(name)))
+            .unwrap_or(false);
+        if contains && is_selector(&proxy_type(proxy)) {
+            candidates.push(other.clone());
+        }
+    }
+    match candidates.len() {
+        0 => Err(format!(
+            "策略组「{}」由内核自动选择节点，且该节点不在任何手动策略组中，无法手动切换",
+            group
+        )),
+        _ => Ok((candidates.remove(0), true)),
+    }
 }
 
 /// days-from-civil for RFC3339 timestamps (inverse of Howard Hinnant's
@@ -175,7 +289,7 @@ fn rfc3339_to_unix(s: &str) -> Option<i64> {
     Some(days * 86400 + hh * 3600 + mm * 60 + ss - offset_secs)
 }
 
-async fn connections_payload(st: &AppState) -> Value {
+pub async fn connections_payload(st: &AppState) -> Value {
     let data = match ctrl_json(
         st,
         "GET",
@@ -307,8 +421,10 @@ fn proxy_enabled() -> bool {
     matches!(proxy_state().as_str(), "on" | "tun")
 }
 
-pub async fn status(State(st): State<Arc<AppState>>) -> Response {
-    let reachable = core_reachable(&st).await;
+/// The single status model used by `GET /status`, the WebSocket `status`
+/// event and the `snapshot` payload. Everything else is derived from it.
+pub async fn status_payload(st: &AppState) -> Value {
+    let reachable = core_reachable(st).await;
     let mut running = false;
     let mut version = String::new();
     let mut cfg = file_config(&st.config_path());
@@ -317,7 +433,7 @@ pub async fn status(State(st): State<Arc<AppState>>) -> Response {
 
     if reachable {
         running = true;
-        if let Ok(data) = ctrl_json(&st, "GET", "/configs", None, Duration::from_secs(5)).await {
+        if let Ok(data) = ctrl_json(st, "GET", "/configs", None, Duration::from_secs(5)).await {
             let get_i = |key: &str| data.get(key).and_then(|v| v.as_i64());
             let get_b = |key: &str| data.get(key).and_then(|v| v.as_bool());
             let get_s = |key: &str| data.get(key).and_then(|v| v.as_str()).unwrap_or("");
@@ -348,17 +464,17 @@ pub async fn status(State(st): State<Arc<AppState>>) -> Response {
                 cfg.log_level = get_s("log-level").to_string();
             }
         }
-        if let Ok(data) = ctrl_json(&st, "GET", "/version", None, Duration::from_secs(5)).await {
+        if let Ok(data) = ctrl_json(st, "GET", "/version", None, Duration::from_secs(5)).await {
             version = data
                 .get("version")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
         }
-        if let Ok(data) = ctrl_json(&st, "GET", "/proxies", None, Duration::from_secs(10)).await {
+        if let Ok(data) = ctrl_json(st, "GET", "/proxies", None, Duration::from_secs(10)).await {
             groups_summary = groups_summary_from(&data);
         }
-        if let Ok(data) = ctrl_json(&st, "GET", "/connections", None, Duration::from_secs(10)).await {
+        if let Ok(data) = ctrl_json(st, "GET", "/connections", None, Duration::from_secs(10)).await {
             stats_conns = data
                 .get("connections")
                 .and_then(|v| v.as_array())
@@ -372,10 +488,10 @@ pub async fn status(State(st): State<Arc<AppState>>) -> Response {
     let down_rate = hist.down.last().copied().unwrap_or(0.0);
     let pid = core_pid();
     let core_rss = if pid != 0 { rss_bytes(pid) } else { 0.0 };
-    let profile = profiles::load_profiles(&st)
+    let profile = profiles::load_profiles(st)
         .iter()
         .find(|p| p.active)
-        .map(|p| profiles::profile_payload(&st, p))
+        .map(|p| profiles::profile_payload(st, p))
         .unwrap_or_else(|| json!({}));
 
     let quality = match &hist.ipinfo {
@@ -405,7 +521,7 @@ pub async fn status(State(st): State<Arc<AppState>>) -> Response {
         "fake-ip-filter": cfg.dns_fake_ip_filter,
     });
 
-    ok_json(json!({
+    json!({
         "running": running,
         "version": version,
         "coreVersion": version,
@@ -443,6 +559,78 @@ pub async fn status(State(st): State<Arc<AppState>>) -> Response {
         "stats": {"connections": stats_conns, "requests": 0, "dns": 0},
         "profile": profile,
         "proxyGroups": groups_summary,
+        "generatedAt": crate::events::now_millis(),
+    })
+}
+
+/// `GET /status`: served from the sampler's snapshot so REST readers and
+/// WebSocket subscribers observe the same object (no per-client probing).
+pub async fn status(State(st): State<Arc<AppState>>) -> Response {
+    if st.snapshot_age_ms() < 3000 {
+        return ok_json((*st.snapshot()).clone());
+    }
+    let value = status_payload(&st).await;
+    ok_json(value)
+}
+
+/// Full state for a new WebSocket client (or an explicit `sync`/gap resync):
+/// status + proxies + profiles + tasks + core capabilities. Everything here
+/// is also available over REST, and both come from the same builders.
+pub async fn snapshot_payload(st: &AppState) -> Value {
+    let status = status_payload(st).await;
+    let running = status.get("running").and_then(|v| v.as_bool()).unwrap_or(false);
+    let proxies = if running {
+        match proxies_payload(st).await {
+            Ok(mut payload) => {
+                payload["running"] = json!(true);
+                payload
+            }
+            Err(_) => json!({"groups": [], "nodes": [], "running": false}),
+        }
+    } else {
+        json!({"groups": [], "nodes": [], "running": false})
+    };
+    let profiles = profiles::list_payload(st);
+    json!({
+        "protocol": crate::events::PROTOCOL_VERSION,
+        "bootId": st.boot_id,
+        "sequence": st.bus.last_sequence(),
+        "generatedAt": crate::events::now_millis(),
+        "status": status,
+        "proxies": proxies,
+        "profiles": profiles,
+        "tasks": st.tasks.list(),
+        "capabilities": crate::core::capabilities(&crate::core::configured_core()),
+    })
+}
+
+pub async fn tasks_list(State(st): State<Arc<AppState>>) -> Response {
+    ok_json(json!({"tasks": st.tasks.list()}))
+}
+
+pub async fn task_get(State(st): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    match st.tasks.get(&id) {
+        Some(task) => ok_json(json!({"task": task})),
+        None => fail_json(StatusCode::NOT_FOUND, "任务不存在或已过期"),
+    }
+}
+
+pub async fn core_capabilities(State(st): State<Arc<AppState>>) -> Response {
+    ok_json(crate::core::payload(&st).await)
+}
+
+/// Realtime transport health for monitoring pages and tests.
+pub async fn ws_stats(State(st): State<Arc<AppState>>) -> Response {
+    ok_json(json!({
+        "clients": st.ws_clients.load(std::sync::atomic::Ordering::Relaxed),
+        "busReceivers": st.bus.receivers(),
+        "lastSequence": st.bus.last_sequence(),
+        "protocol": crate::events::PROTOCOL_VERSION,
+        "topics": crate::events::TOPICS,
+        "heartbeatSeconds": crate::ws::HEARTBEAT_SECS,
+        "compression": ["gzip+base64"],
+        "bootId": st.boot_id,
+        "uptimeMs": crate::events::now_millis() - st.started_at,
     }))
 }
 
@@ -453,7 +641,7 @@ pub async fn version(State(st): State<Arc<AppState>>) -> Response {
     }
 }
 
-pub async fn memory(State(st): State<Arc<AppState>>) -> Response {
+pub async fn memory(State(_st): State<Arc<AppState>>) -> Response {
     let pid = core_pid();
     let core = if pid != 0 { rss_bytes(pid) } else { 0.0 };
     let app = rss_bytes(std::process::id());
@@ -558,7 +746,16 @@ pub async fn config_put(State(st): State<Arc<AppState>>, body: Bytes) -> Respons
         Err(resp) => return resp,
     };
     match save_config(&st, &patch).await {
-        Ok(()) => ok_json(json!({"ok": true})),
+        Ok(()) => {
+            // Other tabs/config views must see the change without re-polling.
+            st.bus.publish(
+                "system",
+                "system.config",
+                json!({"changed": patch, "at": crate::events::now_millis()}),
+            );
+            crate::loops::refresh_snapshot(&st).await;
+            ok_json(json!({"ok": true}))
+        }
         Err(err) => bad_gateway(&err),
     }
 }
@@ -573,23 +770,76 @@ pub async fn proxies(State(st): State<Arc<AppState>>) -> Response {
     }
 }
 
+/// Manual selection with an explicit contract:
+///
+/// * the request must name a group the node actually belongs to;
+/// * a node living in an auto group (url-test / fallback / load-balance) is
+///   still switchable if at least one *selector* group contains it — the
+///   selector is resolved server-side and reported back (`autoFallback`);
+/// * otherwise the call fails with 409 and a Chinese explanation instead of
+///   silently doing nothing (the old bug: `PUT` to a non-selector group).
 pub async fn proxies_select(State(st): State<Arc<AppState>>, body: Bytes) -> Response {
     let data = match body_json(&body).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    let group = data.get("group").and_then(|v| v.as_str()).unwrap_or("");
-    let name = data.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    let group = data.get("group").and_then(|v| v.as_str()).unwrap_or("").trim();
+    let name = data.get("name").and_then(|v| v.as_str()).unwrap_or("").trim();
     if group.is_empty() || name.is_empty() {
         return fail_json(StatusCode::BAD_REQUEST, "group and name are required");
+    }
+    if group.len() > 256 || name.len() > 256 {
+        return fail_json(StatusCode::BAD_REQUEST, "group or name too long");
     }
     if !core_reachable(&st).await {
         return core_down();
     }
-    let path = format!("/proxies/{}", urlencode(group));
+    let request_id = data
+        .get("requestId")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let proxy_map = match ctrl_json(&st, "GET", "/proxies", None, Duration::from_secs(10)).await {
+        Ok(value) => value
+            .get("proxies")
+            .and_then(|v| v.as_object())
+            .cloned(),
+        Err(err) => return bad_gateway(&err),
+    };
+    let Some(proxy_map) = proxy_map else {
+        return bad_gateway("controller returned an unexpected /proxies payload");
+    };
+    let (target, fallback) = match resolve_selector(&proxy_map, group, name) {
+        Ok(value) => value,
+        Err(err) => return fail_json(StatusCode::CONFLICT, &err),
+    };
+    let path = format!("/proxies/{}", urlencode(&target));
     match req_body(&st, "PUT", &path, &json!({"name": name}).to_string()).await {
-        Ok(reply) if reply.status < 400 => ok_json(json!({"ok": true})),
-        Ok(reply) => bad_gateway(&format!("controller: {}", String::from_utf8_lossy(&reply.body).trim())),
+        Ok(reply) if reply.status < 400 => {
+            // Push the change to every connected client immediately; the
+            // proxy sampler confirms it with a full payload afterwards.
+            st.bus.publish_with(
+                "proxies",
+                "proxy.select",
+                json!({
+                    "group": target,
+                    "requestedGroup": group,
+                    "name": name,
+                    "autoFallback": fallback,
+                }),
+                request_id.clone(),
+                None,
+            );
+            ok_json(json!({
+                "ok": true,
+                "group": target,
+                "name": name,
+                "autoFallback": fallback,
+            }))
+        }
+        Ok(reply) => bad_gateway(&format!(
+            "controller: {}",
+            String::from_utf8_lossy(&reply.body).trim()
+        )),
         Err(err) => bad_gateway(&err),
     }
 }
@@ -600,6 +850,9 @@ pub async fn proxies_delay(State(st): State<Arc<AppState>>, body: Bytes) -> Resp
         Err(resp) => return resp,
     };
     let name = data.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    if name.is_empty() {
+        return fail_json(StatusCode::BAD_REQUEST, "name is required");
+    }
     if !core_reachable(&st).await {
         return core_down();
     }
@@ -614,7 +867,12 @@ pub async fn proxies_delay(State(st): State<Arc<AppState>>, body: Bytes) -> Resp
                 .ok()
                 .and_then(|v| v.get("delay").and_then(|d| d.as_i64()))
                 .unwrap_or(0);
-            ok_json(json!({"name": name, "value": value}))
+            st.bus.publish(
+                "proxies",
+                "proxy.delay",
+                json!({"name": name, "value": value, "tested": true}),
+            );
+            ok_json(json!({"name": name, "value": value, "tested": true}))
         }
         Err(err) => bad_gateway(&err),
     }
@@ -638,7 +896,16 @@ pub async fn proxies_group_delay(State(st): State<Arc<AppState>>, body: Bytes) -
         urlencode("https://www.gstatic.com/generate_204")
     );
     match req(&st, "GET", &path).await {
-        Ok(reply) => ok_raw(reply.body),
+        Ok(reply) => {
+            if let Ok(value) = serde_json::from_slice::<Value>(&reply.body) {
+                st.bus.publish(
+                    "proxies",
+                    "proxy.delay.batch",
+                    json!({"group": group, "delays": value}),
+                );
+            }
+            ok_raw(reply.body)
+        }
         Err(err) => bad_gateway(&err),
     }
 }
@@ -709,24 +976,64 @@ pub async fn profiles_import(State(st): State<Arc<AppState>>, body: Bytes) -> Re
     if url.is_empty() {
         return fail_json(StatusCode::BAD_REQUEST, "url is required");
     }
-    match profiles::import_profile(&st, &url).await {
-        Ok(item) => ok_json(profiles::profile_payload(&st, &item)),
-        Err(err) => bad_gateway(&err),
-    }
+    // Long operation: answer immediately with a task id, stream progress and
+    // the final result on the `tasks` topic (survives a client disconnect).
+    let handle = st.tasks.begin("profile.import", "导入订阅", None);
+    let task_id = handle.id().to_string();
+    handle.progress(5.0, "下载订阅");
+    let st_bg = st.clone();
+    tokio::spawn(async move {
+        match profiles::import_profile(&st_bg, &url).await {
+            Ok(item) => {
+                let payload = profiles::profile_payload(&st_bg, &item);
+                st_bg
+                    .bus
+                    .publish("profiles", "profiles.changed", profiles::list_payload(&st_bg));
+                crate::loops::refresh_snapshot(&st_bg).await;
+                handle.succeed(json!({"profile": payload}));
+            }
+            Err(err) => handle.fail(&err),
+        }
+    });
+    accepted(task_id)
 }
 
 pub async fn profiles_apply(State(st): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
-    match profiles::apply_profile(&st, &id).await {
-        Ok(()) => ok_json(json!({"ok": true, "id": id})),
-        Err(err) => bad_gateway(&err),
-    }
+    let handle = st.tasks.begin("profile.apply", "应用配置", None);
+    let task_id = handle.id().to_string();
+    let st_bg = st.clone();
+    tokio::spawn(async move {
+        match profiles::apply_profile(&st_bg, &id).await {
+            Ok(()) => {
+                st_bg
+                    .bus
+                    .publish("profiles", "profiles.changed", profiles::list_payload(&st_bg));
+                crate::loops::refresh_snapshot(&st_bg).await;
+                handle.succeed(json!({"id": id}));
+            }
+            Err(err) => handle.fail(&err),
+        }
+    });
+    accepted(task_id)
 }
 
 pub async fn profiles_update(State(st): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
-    match profiles::update_profile(&st, &id).await {
-        Ok(result) => ok_json(json!({"ok": true, "id": id, "result": result})),
-        Err(err) => bad_gateway(&err),
-    }
+    let handle = st.tasks.begin("profile.update", "更新订阅", None);
+    let task_id = handle.id().to_string();
+    let st_bg = st.clone();
+    tokio::spawn(async move {
+        match profiles::update_profile(&st_bg, &id).await {
+            Ok(result) => {
+                st_bg
+                    .bus
+                    .publish("profiles", "profiles.changed", profiles::list_payload(&st_bg));
+                crate::loops::refresh_snapshot(&st_bg).await;
+                handle.succeed(result);
+            }
+            Err(err) => handle.fail(&err),
+        }
+    });
+    accepted(task_id)
 }
 
 pub async fn profiles_edit(State(st): State<Arc<AppState>>, Path(id): Path<String>, body: Bytes) -> Response {
@@ -735,14 +1042,22 @@ pub async fn profiles_edit(State(st): State<Arc<AppState>>, Path(id): Path<Strin
         Err(resp) => return resp,
     };
     match profiles::patch_profile(&st, &id, &patch) {
-        Ok(()) => ok_json(json!({"ok": true, "id": id})),
+        Ok(()) => {
+            st.bus
+                .publish("profiles", "profiles.changed", profiles::list_payload(&st));
+            ok_json(json!({"ok": true, "id": id}))
+        }
         Err(err) => bad_gateway(&err),
     }
 }
 
 pub async fn profiles_delete(State(st): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
     match profiles::delete_profile(&st, &id) {
-        Ok(()) => ok_json(json!({"ok": true, "id": id})),
+        Ok(()) => {
+            st.bus
+                .publish("profiles", "profiles.changed", profiles::list_payload(&st));
+            ok_json(json!({"ok": true, "id": id}))
+        }
         Err(err) => bad_gateway(&err),
     }
 }
@@ -751,10 +1066,27 @@ pub async fn service_action(
     State(st): State<Arc<AppState>>,
     Path(action): Path<String>,
 ) -> Response {
-    match profiles::service(&st, &action).await {
-        Ok(()) => ok_json(json!({"ok": true, "action": action})),
-        Err(err) => bad_gateway(&err),
+    if !matches!(action.as_str(), "start" | "stop" | "restart") {
+        return fail_json(StatusCode::BAD_REQUEST, "unsupported service action");
     }
+    let handle = st.tasks.begin("service", "内核服务", None);
+    let task_id = handle.id().to_string();
+    let st_bg = st.clone();
+    tokio::spawn(async move {
+        match profiles::service(&st_bg, &action).await {
+            Ok(()) => {
+                st_bg.bus.publish(
+                    "system",
+                    "system.service",
+                    json!({"action": action, "state": "done"}),
+                );
+                crate::loops::refresh_snapshot(&st_bg).await;
+                handle.succeed(json!({"action": action}));
+            }
+            Err(err) => handle.fail(&err),
+        }
+    });
+    accepted(task_id)
 }
 
 /// LAN transparent-proxy takeover, ShellClash-style: nft REDIRECT/TPROXY plus
@@ -906,4 +1238,90 @@ fn urlencode(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod proxy_tests {
+    use super::*;
+
+    fn fixture() -> serde_json::Map<String, Value> {
+        json!({
+            "节点选择": {"type": "Selector", "now": "自动选择", "all": ["自动选择", "香港 01", "日本 02"]},
+            "自动选择": {"type": "URLTest", "now": "香港 01", "all": ["香港 01", "日本 02"]},
+            "香港 01": {"type": "Vmess", "history": [{"delay": 42}]},
+            "日本 02": {"type": "Trojan", "history": [{"delay": 0}]},
+            "直连": {"type": "Direct"}
+        })
+        .as_object()
+        .unwrap()
+        .clone()
+    }
+
+    #[test]
+    fn keeps_group_order_and_marks_selectable() {
+        let payload = build_proxies(&fixture());
+        let groups = payload["groups"].as_array().unwrap();
+        let names: Vec<&str> = groups.iter().map(|g| g["name"].as_str().unwrap()).collect();
+        assert_eq!(names, vec!["节点选择", "自动选择"]);
+        assert_eq!(groups[0]["selectable"], true);
+        assert_eq!(groups[1]["selectable"], false);
+        assert_eq!(groups[0]["count"], 3);
+    }
+
+    #[test]
+    fn nodes_carry_membership_and_primary_selector() {
+        let payload = build_proxies(&fixture());
+        let nodes = payload["nodes"].as_array().unwrap();
+        let hk = nodes.iter().find(|n| n["name"] == "香港 01").unwrap();
+        assert_eq!(hk["group"], "节点选择");
+        assert_eq!(hk["groups"].as_array().unwrap().len(), 2);
+        assert_eq!(hk["selectable"], true);
+        assert_eq!(hk["delay"], 42);
+        assert_eq!(hk["tested"], true);
+
+        let jp = nodes.iter().find(|n| n["name"] == "日本 02").unwrap();
+        assert_eq!(jp["delay"], 0);
+        assert_eq!(jp["tested"], true, "measured timeout must not look untested");
+
+        let auto = nodes.iter().find(|n| n["name"] == "自动选择").unwrap();
+        assert_eq!(auto["isGroup"], true);
+        assert_eq!(auto["group"], "节点选择");
+        // Duplicate membership must not repeat the same group name.
+        assert_eq!(auto["groups"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn selector_resolution_prefers_manual_groups() {
+        let map = fixture();
+        assert_eq!(
+            resolve_selector(&map, "节点选择", "日本 02").unwrap(),
+            ("节点选择".to_string(), false)
+        );
+        // Addressing an auto group still resolves to a selector.
+        assert_eq!(
+            resolve_selector(&map, "自动选择", "日本 02").unwrap(),
+            ("节点选择".to_string(), true)
+        );
+        // Membership is validated, not assumed.
+        assert!(resolve_selector(&map, "节点选择", "香港 01").is_ok());
+        assert!(resolve_selector(&map, "节点选择", "直连").is_err());
+        assert!(resolve_selector(&map, "自动选择", "香港 01").is_ok());
+        assert!(resolve_selector(&map, "不存在", "香港 01").is_err());
+    }
+
+    #[test]
+    fn auto_only_nodes_are_rejected_with_reason() {
+        let map = json!({
+            "自动选择": {"type": "URLTest", "now": "A", "all": ["A"]},
+            "A": {"type": "Vless", "history": []}
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let err = resolve_selector(&map, "自动选择", "A").unwrap_err();
+        assert!(err.contains("无法手动切换"), "{}", err);
+        let payload = build_proxies(&map);
+        assert_eq!(payload["nodes"][0]["selectable"], false);
+        assert_eq!(payload["nodes"][0]["tested"], false);
+    }
 }
