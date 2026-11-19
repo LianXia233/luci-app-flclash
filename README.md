@@ -92,9 +92,22 @@ apk add --allow-untrusted ./luci-app-flclash_*.apk
 | --- | --- | --- |
 | `9097` | `127.0.0.1` | mihomo / sing-box 控制器（`external-controller` / `clash_api`） |
 | `7892` | 本机（默认 `allow-lan: false`） | mixed HTTP/SOCKS 代理入口 |
+| `7893` | `127.0.0.1` | 透明代理 TCP REDIRECT 入口（`redir-port`） |
+| `7894` | `127.0.0.1` | 透明代理 UDP TPROXY 入口（`tproxy-port`） |
+| `1053` | `0.0.0.0` | 内核 DNS 监听器（`dns.listen`），供 dnsmasq 与 LAN DNS 劫持使用 |
 | `9098` | `0.0.0.0` | `/flclash/api` 与 `/flclash/` WebUI |
 
 `9098` 默认对 LAN 开放。若 LAN 不完全可信，请在 UCI 中设置 `flclash.api.secret`，并为 WebUI 配置对应的请求头（见 [API 总览](#api-总览)）。
+
+### 透明代理与出站模式
+
+WebUI 的「出站模式」（`mode: rule / global / direct`）与「透明代理（局域网接管）」是两层独立配置，最终都由内核统一分流：
+
+- **出站模式**：即 mihomo 的 `mode`，决定流量走规则 / 全局 / 直连；在「设置 → 网络」或首页模式条切换，运行时通过 controller `PATCH /configs` 生效。
+- **透明代理（局域网接管）**：由 `POST /proxy/start` 调用 `proxy-rules.sh`，按检测到的防火墙后端（`fw4` → nftables）在 LAN 接口（`br-lan`）的 prerouting 链劫持流量：TCP `REDIRECT` 到 `7893`、UDP `TPROXY` 到 `7894`、DNS（TCP/UDP 53）`REDIRECT` 到 `1053`；同时写入 dnsmasq 片段将系统 DNS 指向 `127.0.0.1#1053`。私网地址段（RFC1918 等）被排除，路由器管理面（SSH / LuCI）不受影响。状态保存在 UCI `flclash.proxy.enabled`、`/tmp/flclash-proxy.state` 与 nft 规则三处，重启后由 `/etc/init.d/flclash-proxy` 恢复。
+- **DNS（进阶）**：设置页写入 `config.yaml` 的 `dns` 块（fake-ip / redir-host、`nameserver`、`default-nameserver` 等）。后端在渲染该块时会固定写出 `dns.listen: 0.0.0.0:1053`，确保内核始终提供 DNS 监听；`proxy-rules.sh` 另有兜底自愈，启用接管时若发现该字段缺失会自动补回并重载内核。因此修改 DNS 设置不会破坏透明代理的 DNS 劫持。
+
+典型旁路由拓扑下，`eth0` 为 WAN（上级路由），`br-lan` 为 LAN（客户端网关指向本机）；透明代理应挂在 `br-lan` 才能接管客户端流量。可用 `LAN_IF` 环境变量覆盖默认接口。
 
 ## 配置项
 
@@ -327,6 +340,30 @@ luci-app-flclash_<ver>-r<rel>_<arch>_immortalwrt-snapshot.apk
 | 单包约束 | `package` job 断言 | 每个组合**恰好 1 个** apk |
 | 发布一致性 | `release` job + `sha256sum -c` | 4 个 apk 全部匹配 |
 | 包内容 | 解包核对 | 38 个文件（35 个有效文件 + 3 个 apk 元数据） |
+
+设备端透明代理与 DNS 的复核方法：
+
+```sh
+# 1. 状态三处一致：UCI 开关 / 状态文件 / nft 规则
+uci get flclash.proxy.enabled          # 应为 1
+cat /tmp/flclash-proxy.state           # 应为 on
+/usr/libexec/flclash/proxy-rules.sh status  # 应为 ACTIVE (nftables)
+
+# 2. 劫持规则挂在正确的 LAN 接口（旁路由通常是 br-lan）
+nft list table inet flclash | grep iifname
+#   应见 br-lan 的 53 -> 1053、TCP -> 7893、UDP -> TPROXY 7894
+
+# 3. 内核各监听端口就绪（含 DNS 1053）
+netstat -lntup | grep -E ':1053|:7893|:7894|:9097'
+
+# 4. DNS 经劫持返回 fake-ip（198.18.0.0/15）
+nslookup www.example.com 127.0.0.1     # 应返回 198.18.x.x
+
+# 5. LAN 客户端默认网关指向本机，访问外网应出现在连接列表
+wget -q -O - http://<设备IP>:9098/flclash/api/connections
+```
+
+若第 4 步返回真实 IP 或超时，先检查 `config.yaml` 的 `dns.listen` 是否为 `0.0.0.0:1053`，再确认 dnsmasq 片段 `/tmp/dnsmasq.d/flclash-dns.conf` 是否指向 `127.0.0.1#1053`。管理面（SSH / LuCI）走私网地址，不在劫持范围内，应始终可用。
 
 设备端的 TUN 接管、内核切换与分流效果取决于具体固件与网络环境，建议在目标机型上按[快速开始](#快速开始)复核。
 

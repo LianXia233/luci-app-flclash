@@ -195,6 +195,10 @@ fn render_dns_block(patch: &Value) -> Option<String> {
     let mut out = String::from("dns:\n");
     let enable = dns.get("enable").and_then(|v| v.as_bool()).unwrap_or(true);
     out.push_str(&format!("  enable: {}\n", yaml_bool(enable)));
+    // The LAN transparent-proxy takeover hijacks port 53 to 1053 (see
+    // proxy-rules.sh). Emit a DNS listener unconditionally so rewriting the
+    // dns block from the WebUI never drops it and breaks DNS for LAN clients.
+    out.push_str("  listen: 0.0.0.0:1053\n");
     let mode = dns
         .get("enhanced-mode")
         .and_then(|v| v.as_str())

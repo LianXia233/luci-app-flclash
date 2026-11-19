@@ -65,6 +65,41 @@ function active_core_type() {
 	return type;
 }
 
+/* Resolve a core's version string without invoking the binary directly:
+ *  - sing-box exposes a standard `version` subcommand;
+ *  - the bundled mihomo is the native-IPC build whose `-v` flag is parsed
+ *    as a socket path and panics, so read the version from the local API
+ *    bridge (/flclash/api/version) instead. Results are cached briefly in
+ *    /tmp so the value stays visible even if the controller is restarting.
+ */
+function core_version(type) {
+	let v = '';
+	if (type == 'sing-box') {
+		/* "sing-box version 1.2.3" -> third whitespace-separated field. */
+		const raw = trim(run('/usr/bin/sing-box version 2>/dev/null | head -n1'));
+		const parts = split(raw, ' ');
+		v = (length(parts) >= 3) ? parts[2] : '';
+	} else {
+		/* {"meta":true,"version":"1.2.3"} -> value after "version":" */
+		const raw = trim(run('wget -q -O - --timeout=3 http://127.0.0.1:9098/flclash/api/version 2>/dev/null'));
+		const q = '"';
+		const key = 'version' + q + ':' + q;
+		const p = index(raw, key);
+		if (p >= 0) {
+			const rest = substr(raw, p + length(key));
+			const e = index(rest, q);
+			if (e > 0)
+				v = substr(rest, 0, e);
+		}
+	}
+	if (length(v) > 0) {
+		system('echo "' + v + '" > /tmp/flclash-core-version.' + type);
+		return v;
+	}
+	const cached = readfile('/tmp/flclash-core-version.' + type);
+	return (cached == null) ? '' : trim(cached);
+}
+
 const methods = {
 	system_proxy: {
 		call: function () {
@@ -160,9 +195,7 @@ const methods = {
 			const state = update_state();
 			const log = readfile('/tmp/flclash-update.log');
 			const type = active_core_type();
-			const ver = (type == 'sing-box')
-				? trim(run('/usr/bin/sing-box -v 2>/dev/null | head -n1'))
-				: trim(run('/usr/bin/mihomo -v 2>/dev/null | head -n1'));
+			const ver = core_version(type);
 			return {
 				state: state,
 				log: (log == null) ? '' : log,
@@ -178,8 +211,8 @@ const methods = {
 				active: active_core_type(),
 				mihomo_installed: (system('[ -x /usr/bin/mihomo ]') == 0),
 				singbox_installed: (system('[ -x /usr/bin/sing-box ]') == 0),
-				mihomo_version: trim(run('/usr/bin/mihomo -v 2>/dev/null | head -n1')),
-				singbox_version: trim(run('/usr/bin/sing-box -v 2>/dev/null | head -n1'))
+				mihomo_version: core_version('mihomo'),
+				singbox_version: core_version('sing-box')
 			};
 		}
 	},

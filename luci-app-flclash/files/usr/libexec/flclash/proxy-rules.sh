@@ -57,6 +57,19 @@ detect_backend() {
 
 # --- DNS hand-off (shared by both backends) --------------------------------
 dns_on() {
+	# Self-heal: the core needs a DNS listener on $DNS_PORT for the LAN
+	# DNS hijack to work. The WebUI's DNS save path rewrites the dns: block
+	# without a listen key, so ensure it is present on every takeover.
+	CFG=/etc/flclash/config.yaml
+	if [ -f "$CFG" ] && ! grep -qE '^[[:space:]]*listen:[[:space:]]*0\.0\.0\.0:'"$DNS_PORT" "$CFG"; then
+		if grep -q '^dns:' "$CFG"; then
+			awk -v p="$DNS_PORT" '{print; if ($0 ~ /^dns:/) print "  listen: 0.0.0.0:" p}' "$CFG" > "$CFG.tmp" && \
+				cp "$CFG.tmp" "$CFG" && rm -f "$CFG.tmp"
+			# Reload the core so the new listener takes effect.
+			/etc/init.d/flclash-core restart >/dev/null 2>&1
+			sleep 2
+		fi
+	fi
 	mkdir -p /tmp/dnsmasq.d
 	printf 'no-poll\nno-resolv\nserver=127.0.0.1#%s\n' "$DNS_PORT" > "$DNSCONF"
 	/etc/init.d/dnsmasq restart >/dev/null 2>&1
