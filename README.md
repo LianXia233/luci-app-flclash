@@ -4,7 +4,7 @@
 
 **单包 APK · mihomo + sing-box 双内核 · Rust/Tokio API 桥 · HTML5 WebUI**
 
-<a href="https://github.com/LianXia233/luci-app-flclash/releases"><img alt="version" height="20" src="https://img.shields.io/badge/version-1.3.0-0f766e?style=flat-square"></a>
+<a href="https://github.com/LianXia233/luci-app-flclash/releases"><img alt="version" height="20" src="https://img.shields.io/badge/version-1.4.0-0f766e?style=flat-square"></a>
 <a href="LICENSE"><img alt="license" height="20" src="https://img.shields.io/badge/license-GPL--3.0--only-0f766e?style=flat-square"></a>
 <a href="#兼容性与限制"><img alt="arch" height="20" src="https://img.shields.io/badge/arch-aarch64__cortex--a53%20%7C%20x86__64-0891b2?style=flat-square"></a>
 <a href="https://github.com/LianXia233/luci-app-flclash/actions/workflows/build-apk.yml"><img alt="CI" height="20" src="https://img.shields.io/github/actions/workflow/status/LianXia233/luci-app-flclash/build-apk.yml?style=flat-square&label=CI"></a>
@@ -31,7 +31,7 @@ FlClash 的 OpenWrt 移植：把 **mihomo 内核**、**Rust IPC host**、**Rust/
 - **规则提供者与 Geo 数据**：查看规则提供者条数与更新时间、单条更新；GeoIP / GeoSite 由内核在线升级。
 - **透明代理状态机**：REDIRECT / TPROXY / TUN 三种接管路径由 `proxy-rules.sh sync` 统一收敛（见[透明代理状态机](#透明代理状态机)）；硬件流量卸载自动关闭；核心异常退出自动清理残留规则。
 - **双栈 IP 状态卡**：出口 IPv4 / IPv6 同屏显示，多源查询（Cloudflare 优先）+ 中文归属地 + 启停状态感知（见[状态卡与 IP 资料](#状态卡与-ip-资料)）。
-- **双内核**：内置 mihomo（FlClash native-IPC core，由 `flclash-core-bridge` 驱动）；sing-box 通过在线更新安装，以 `clash_api` 模式接入。WebUI 可查看版本、在线更新、一键切换。
+- **双内核**：内置 mihomo（FlClash native-IPC core，由 `flclash-core-bridge` 驱动）；sing-box 通过在线更新安装，以 `clash_api` 模式接入。WebUI 经 `/core` 系列 REST 端点查看已安装版本、在线更新、一键切换（切 sing-box 前用转换器重新生成 `/tmp/flclash-singbox.json`，不再依赖跨源 `/ubus`）。
 - **优雅降级**：内核停止时读接口回退到 `config.yaml`，仍可查看状态与保存配置；依赖内核的写操作返回明确的 `503`，`apply` 会自动拉起内核。
 - **LuCI 集成**：`服务 → FlClash` 单页。**开关只控制 WebUI 后端（flclash-api）**，代理内核由 WebUI 内的开关手动启停；「一键进入 WebUI」会在后端未运行时自动拉起。
 
@@ -88,7 +88,10 @@ apk add --allow-untrusted ./luci-app-flclash_*.apk
                                               └─ sing-box （clash_api，由 config.yaml 转换）
 
 内核启停 ──► WebUI 核心开关 ──► /etc/init.d/flclash-core ──► 启停后 proxy-rules.sh sync 收敛接管
+内核管理 ──► WebUI「设置 / 工具」──► /flclash/api/core*（REST，走本进程，不经 ubus）
 ```
+
+设计文档：[docs/architecture-comm.md](docs/architecture-comm.md)（REST / WS / 任务通信与一致性）、[docs/feature-matrix.md](docs/feature-matrix.md)（五仓库能力对照、已做与未做项及原因）、[docs/screenshots](docs/screenshots)（浏览器实拍）。
 
 | 组件 | 安装路径 | 说明 |
 | --- | --- | --- |
@@ -179,6 +182,10 @@ sync() ─────┼─ config.tun.enable=true 且 TUN 在线 ──► TUN
 | `proxy` | `backend` | 自动 | `nftables` / `iptables`（自动检测） |
 | `proxy` | `lan_if` | 自动 | 接管接口（默认 ubus 检测 LAN 设备） |
 | `proxy` | `filter_aaaa` | `1` | 接管时过滤 AAAA（源头上设 `dns.ipv6: false`） |
+| `proxy` | `acl_mode` | `all` | 客户端模式：`all`（全部）/ `allow`（仅名单）/ `block`（排除名单） |
+| `proxy` | `acl_ip` / `acl_mac` | 空 | 名单项，可重复（IP / CIDR / MAC，单类上限 256 条） |
+| `proxy` | `bypass_cidr` / `bypass_port` | 空 | 不接管的目标网段 / 目的端口 |
+| `proxy` | `local_takeover` | `1` | 路由器自身出站是否也送入内核 |
 | `proxy` | `saved_*` / `dns_filter_managed` | 空 | dns_off 恢复 dnsmasq 原状用 |
 | `webui` | `enabled` | `1` | WebUI 开关 |
 | `webui` | `webui_path` | `/flclash/` | WebUI 路径 |
@@ -196,9 +203,13 @@ REST 只负责**控制与查询**；实时数据由 `GET /ws` 推送。两者读
 
 | 方法与路径 | 说明 |
 | --- | --- |
-| `GET /status` | 运行状态、出口 IP（`outboundIp` / `outboundIp6`）/ 归属 / 质量、`takeoverState`、内存等 |
+| `GET /status` | 运行状态、出口 IP（`outboundIp` / `outboundIp6`）/ 归属 / 质量、`takeoverState`、内存、`apiVersion`（编译期 `CARGO_PKG_VERSION`，与内核版本分开） |
 | `GET /version` | 内核与桥接版本 |
-| `GET /memory` | 内存统计 |
+| `GET /memory` | 内存统计（`rss` / `app` / `core`） |
+| `GET /core` | 已安装内核二进制与版本（未安装时为空，WebUI 标注「（未安装）」） |
+| `POST /core/switch` | 持久化 `mihomo` / `sing-box` 选择并重启内核；切换前重新生成 sing-box 原生 JSON，返回 `202 {taskId}` |
+| `POST /core/update`、`GET /core/update/status` | 触发内核在线更新 / 查询更新状态与日志 |
+| `POST /system/geo` | 触发 GeoIP / GeoSite 数据更新，返回 `202 {taskId}` |
 | `POST /service/{action}` | `start` / `stop` / `restart` 内核服务，返回 `202 {taskId}`；启停后自动收敛接管 |
 | `GET /system/proxy` | 系统透明代理状态摘要 |
 | `GET /proxy`、`POST /proxy/{action}` | 透明代理开关与状态（`takeover` / `tunActive` / `coreRunning` / `proxyWish`） |
@@ -224,9 +235,23 @@ REST 只负责**控制与查询**；实时数据由 `GET /ws` 推送。两者读
 | 方法与路径 | 说明 |
 | --- | --- |
 | `GET /config`、`PUT /config`、`PATCH /config` | 标量（`mode` / `tun` / `proxyLan`…）与 `dns` 块；持久化到 `config.yaml`；`tun` 变更触发内核完整重启并收敛接管 |
+| `POST /config/validate` | 应用前结构校验：端口区间、枚举、代理组重名、组成员前向引用、规则出口存在性 |
+| `GET /mixin`、`PUT /mixin`、`PATCH /mixin` | 读写 `mixin.yaml`；订阅应用时深合并（映射递归、规则前置去重、`null` 删键） |
 | `GET /rules` | 规则列表 |
-| `GET /providers/proxies` | 代理提供者 |
+| `GET /providers/rules`、`POST /providers/rules/{name}/update` | 规则提供者条数 / 更新时间与单条更新 |
+| `GET /providers/proxies`、`POST /providers/proxies/{name}/update` | 代理提供者列表与单条更新 |
 | `GET /dns/resolve`、`GET /dns/queries`、`POST /dns/flush` | DNS 解析、查询历史、刷新缓存 |
+| `GET /dns/config` | 进阶 DNS 字段（fallback、`proxy-server-nameserver`、`direct-nameserver`、`fallback-filter`、`nameserver-policy`、`dns.ipv6`） |
+
+### 访问控制与备份
+
+| 方法与路径 | 说明 |
+| --- | --- |
+| `GET /proxy/acl`、`PUT /proxy/acl` | 读写 `acl_mode` / `acl_ip` / `acl_mac` / `bypass_cidr` / `bypass_port`（Rust 侧与脚本同规则校验，单类上限 256 条）；保存后 `proxy-rules.sh reapply` 只重建 ACL 相关链路 |
+| `GET /backup`、`POST /backup` | 快照列表 / 立即创建（配置 + 订阅 + 混入，白名单、24 MB 上限、保留 12 份） |
+| `GET /backup/download/{name}` | 鉴权下载（只认请求头 secret，query 里的 `?secret=` 返回 401） |
+| `POST /backup/restore`、`POST /backup/upload` | 恢复已有快照 / 上传恢复；恢复前自动留底、YAML/JSON 预校验、staging + 原子 rename、拒绝路径穿越 |
+| `DELETE /backup/{name}` | 删除快照 |
 
 ### 订阅
 
@@ -236,6 +261,7 @@ REST 只负责**控制与查询**；实时数据由 `GET /ws` 推送。两者读
 | `POST /profiles/import` | 下载 → 转换 → 落库，返回 `202 {taskId}` |
 | `POST /profiles/{id}/update` | 更新订阅，返回 `202 {taskId}` |
 | `POST /profiles/{id}/apply` | 转换 → 原子写 `config.yaml` → 重载或启动内核，返回 `202 {taskId}` |
+| `GET /profiles/{id}/raw`、`PUT /profiles/{id}/raw` | 订阅原始 YAML 读取 / 保存（保存留 `.bak`，启用中的订阅走任务重新应用） |
 | `PATCH /profiles/{id}`、`PUT /profiles/{id}`、`DELETE /profiles/{id}` | 编辑名称 / URL / 自动更新间隔，或删除 |
 
 静态资源：`GET /flclash/`（WebUI 入口）与 `GET /flclash/*`。
@@ -263,7 +289,7 @@ REST 只负责**控制与查询**；实时数据由 `GET /ws` 推送。两者读
 
 ## rpcd 对象
 
-LuCI 侧通过 ubus 对象 `flclash` 调用（定义于 `files/usr/share/rpcd/ucode/flclash.uc`）：
+LuCI 侧通过 ubus 对象 `flclash` 调用（定义于 `files/usr/share/rpcd/ucode/flclash.uc`）。**WebUI 不走这条路径**：内核信息 / 切换 / 更新在 WebUI 里全部走 `/flclash/api/core*`，因为 WebUI 的 origin（`flclash-api:9098`）不提供 `/ubus`；ubus 这些方法只服务 LuCI 入口页及其脚本，两边共享同一份 UCI 与 init 脚本：
 
 | 方法 | 类型 | 说明 |
 | --- | --- | --- |
@@ -283,7 +309,7 @@ LuCI 侧通过 ubus 对象 `flclash` 调用（定义于 `files/usr/share/rpcd/uc
 | 工具 | 用途 |
 | --- | --- |
 | Rust stable + `rust-std` musl target | 编译 `flclash-api` 与 `flclash-core-bridge` |
-| **aarch64 musl C 交叉编译器** | `ring`（reqwest/rustls 引入）需要 C 工具链编译目标平台代码 |
+| **按目标区分的 musl C 编译器** | `ring`（reqwest/rustls 引入）要为 musl 目标编译 C：ARM 用 `aarch64-linux-gnu-gcc`，x86_64 用 `musl-gcc`（Ubuntu 包 `musl-tools`）。cc-rs 按目标名查找 `x86_64-linux-musl-gcc`，缺了会直接 `exit 101` |
 | Go 1.27 | 编译 FlClash IPC 内核 |
 | OpenWrt SDK | 仅组装 / 签名 apk，**不编译 Rust** |
 
@@ -295,7 +321,8 @@ LuCI 侧通过 ubus 对象 `flclash` 调用（定义于 `files/usr/share/rpcd/uc
 # WSL 内一次性环境
 curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain stable --profile minimal
 rustup target add aarch64-unknown-linux-musl
-sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+rustup target add x86_64-unknown-linux-musl
+sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu musl-tools
 
 bash build-wsl.sh   # 产物回传到 flclash-api/target/flclash-api-wsl
 ```
@@ -303,9 +330,15 @@ bash build-wsl.sh   # 产物回传到 flclash-api/target/flclash-api-wsl
 等价的裸命令：
 
 ```bash
+# ARM64
 export CC_aarch64_unknown_linux_musl=aarch64-linux-gnu-gcc
 export AR_aarch64_unknown_linux_musl=aarch64-linux-gnu-ar
 cargo build --release --target aarch64-unknown-linux-musl --bins
+
+# x86_64（musl-gcc 来自 musl-tools）
+export CC_x86_64_unknown_linux_musl=musl-gcc
+export AR_x86_64_unknown_linux_musl=ar
+cargo build --release --target x86_64-unknown-linux-musl --bins
 ```
 
 产物为静态 ELF；`flclash-api` 约 2.4 MiB（内置 rustls/webpki-roots TLS，不再依赖系统 curl）。`flclash-api/.cargo/config.toml` 固定 `rust-lld` 与 `link-self-contained`。
@@ -342,15 +375,17 @@ binaries (2) ──► package (4) ──► release (1)
 
 | 阶段 | 运行内容 | 关键校验 |
 | --- | --- | --- |
-| `binaries` | rustup 官方 SDK（含 aarch64 交叉 gcc 供 ring）+ Go 官方工具链 | `cargo test --locked`；ELF / 静态 / 目标架构 |
+| `binaries` | rustup 官方 SDK + Go 官方工具链；`ring` 的 C 编译器按目标注入（aarch64 → `aarch64-linux-gnu-gcc`，x86_64 → `musl-tools` 的 `musl-gcc`），缺编译器时早失败并给出明确提示 | `cargo test --locked`；ELF / 静态 / 目标架构 |
 | `package` | ImmortalWrt SDK 只组装与签名；四组合并行 | 架构闸门、无 `INTERP`、**恰好 1 个 apk** |
 | `release` | 汇总产物、生成 `sha256sums.txt` | **恰好 4 个 apk**，再发布 |
 
 ### 触发与产物
 
-- `push` 到 `main`：改动 `luci-app-flclash/**`、`flclash-api/**`、`scripts/**`、workflow 或 `README.md` 时触发构建（不发布）。
-- `push` 标签 `v*`：构建并发布（tag 名取 workflow env `PKG_VERSION`）。
+- `push` 到 `main`：改动 `luci-app-flclash/**`、`flclash-api/**`、`scripts/**`、workflow 或 `README.md` 时触发构建（不发布）。改版本号（`Makefile` 的 `PKG_VERSION` 或 `Cargo.toml` 的 `version`）即命中这两个路径，必然重建。
+- `push` 标签 `v*`：构建并发布。
 - 手动：`gh workflow run build-apk.yml -f publish=true`。
+
+版本号只有两个来源：`luci-app-flclash/Makefile` 的 `PKG_VERSION` 与 `flclash-api/Cargo.toml` 的 `version`。workflow 不再硬编码版本——`package` / `release` 各自从 Makefile 解析 `PKG_VERSION` / `PKG_RELEASE`，并断言 `Cargo.toml` 与之一致（不一致直接失败），tag 名与 apk 文件名都由此派生。`Cargo.lock` 随版本变更一起提交，否则 `--locked` 构建会拒绝。
 
 产物命名：
 
@@ -380,8 +415,8 @@ luci-app-flclash_<ver>-r<rel>_<arch>_immortalwrt-snapshot.apk
 
 | 检查 | 方式 | 结果 |
 | --- | --- | --- |
-| Rust 单元测试 | `cd flclash-api && cargo test --locked` | 38 项通过（ws 集成 6 / 任务 1 / 代理 4 / 能力矩阵 2） |
-| WebUI 布局 | headless Chromium 逐视图量宽（360/390/768/1280） | 9 个视图无横向溢出（滚动容器除外） |
+| Rust 单元测试 | `cd flclash-api && cargo test --locked` | 50 项通过（含 ws 集成、任务、代理解析、能力矩阵、备份、混入、ACL、内核管理） |
+| WebUI 布局 | headless Chromium 逐视图量宽（390 / 1280） | 12 个视图无横向溢出（滚动容器除外） |
 | 端到端 | 假 controller + 真实二进制 + 浏览器 | WS 连接、选择、事件、任务、重连全部通过 |
 | 二进制架构与静态性 | CI `binaries` / `package` 架构闸门 | ELF、静态、目标架构、无 `INTERP` |
 | 单包约束 | `package` job 断言 | 每个组合**恰好 1 个** apk |
@@ -432,6 +467,7 @@ wget -q -O - http://127.0.0.1:9098/flclash/api/status | grep -oE '"outboundIp[^,
 ├── flclash-api/                      # Rust crate
 │   ├── src/main.rs                   # axum 路由与鉴权
 │   ├── src/{events,tasks,ws,core}.rs # 事件总线 / 任务 / WebSocket / 内核能力
+│   ├── src/{backup,mixin,acl,coremgmt}.rs # 备份快照 / Mixin 深合并 / 访问控制 / 内核管理
 │   ├── src/ipinfo.rs                 # 出口 IP 多源查询（CF 优先 / 双栈 / 汉化 / 启停感知）
 │   ├── src/{config,convert,profiles,singbox,loops}.rs
 │   └── src/bin/flclash-core-bridge.rs
@@ -447,7 +483,7 @@ wget -q -O - http://127.0.0.1:9098/flclash/api/status | grep -oE '"outboundIp[^,
 └── README.md
 ```
 
-WebUI 按视图拆分：`profiles`、`proxies`、`requests`、`rules`、`dns`、`logs`、`settings`、`tools`，共 8 个视图；首页仪表盘展示双栈出口 IP、归属与质量。
+WebUI 按视图拆分：`profiles`、`proxies`、`requests`、`rules`、`dns`、`dns-advanced`、`acl`、`mixin`、`backup`、`logs`、`settings`、`tools`，共 12 个视图（另加首页仪表盘，展示双栈出口 IP、归属与质量）。
 
 ## 许可证与致谢
 

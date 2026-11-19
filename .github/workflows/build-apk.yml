@@ -30,7 +30,9 @@ permissions:
   contents: write
 
 env:
-  PKG_VERSION: 1.2.0
+  # Version numbers are NOT hard-coded here: every consumer job derives
+  # PKG_VERSION / PKG_RELEASE from luci-app-flclash/Makefile so the workflow,
+  # the Cargo crate and the apk can never drift apart.
   PKG_RELEASE: 1
 
 jobs:
@@ -67,7 +69,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential clang file binutils curl ca-certificates git zstd \
-            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu musl-tools
 
       # Rust official SDK: rustup + rust-std for the musl target.
       # NOT the OpenWrt SDK, NOT an OP rust package.
@@ -80,14 +82,28 @@ jobs:
       - name: Rust tests + static musl build (official SDK)
         working-directory: flclash-api
         env:
-          # ring (via reqwest/rustls) compiles C for the musl target and
-          # needs an aarch64 cross toolchain; x86_64 uses the host gcc.
+          # ring (via reqwest/rustls) compiles C for the musl target, so cc-rs
+          # needs a compiler per target: aarch64 uses the Debian cross gcc,
+          # x86_64 needs musl-gcc from musl-tools (the host gcc targets glibc
+          # and cc-rs would otherwise fail with "x86_64-linux-musl-gcc missing").
           CC_aarch64_unknown_linux_musl: aarch64-linux-gnu-gcc
           AR_aarch64_unknown_linux_musl: aarch64-linux-gnu-ar
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          AR_x86_64_unknown_linux_musl: ar
+          RUST_TARGET: ${{ matrix.rust_target }}
         run: |
           set -euo pipefail
           cargo --version
           rustc --version --verbose
+          # Fail fast with a clear message if the per-target C compiler is missing.
+          case "${RUST_TARGET}" in
+            x86_64-unknown-linux-musl)
+              command -v musl-gcc >/dev/null || { echo "musl-gcc missing (apt install musl-tools)"; exit 1; } ;;
+            aarch64-unknown-linux-musl)
+              command -v aarch64-linux-gnu-gcc >/dev/null || { echo "aarch64-linux-gnu-gcc missing"; exit 1; } ;;
+          esac
+          musl-gcc --version | head -1 || true
+          aarch64-linux-gnu-gcc --version | head -1 || true
           cargo test --locked
           cargo build --release --locked --target "${{ matrix.rust_target }}" --bins
           for b in flclash-api flclash-core-bridge; do
@@ -203,6 +219,21 @@ jobs:
           gcc --version | head -1
           zstd --version
 
+      - name: Resolve package version from Makefile
+        run: |
+          set -euo pipefail
+          v=$(sed -n 's/^PKG_VERSION:=//p' luci-app-flclash/Makefile | tr -d '[:space:]')
+          r=$(sed -n 's/^PKG_RELEASE:=//p' luci-app-flclash/Makefile | tr -d '[:space:]')
+          test -n "$v" || { echo "PKG_VERSION missing in luci-app-flclash/Makefile"; exit 1; }
+          test -n "$r" || r=1
+          # The Cargo crate must carry the same version, otherwise --locked
+          # builds and the apk disagree about what is being shipped.
+          cv=$(sed -n 's/^version = "\(.*\)"/\1/p' flclash-api/Cargo.toml | head -1)
+          test "$cv" = "$v" || { echo "version drift: Makefile=$v Cargo.toml=$cv"; exit 1; }
+          echo "PKG_VERSION=$v" >> "$GITHUB_ENV"
+          echo "PKG_RELEASE=$r" >> "$GITHUB_ENV"
+          echo "package: luci-app-flclash $v-r$r"
+
       - name: Download ${{ matrix.channel }} SDK (${{ matrix.subtarget }})
         run: |
           set -euo pipefail
@@ -316,6 +347,21 @@ jobs:
           pattern: apk-*
           path: release
           merge-multiple: true
+
+      - name: Resolve package version from Makefile
+        run: |
+          set -euo pipefail
+          v=$(sed -n 's/^PKG_VERSION:=//p' luci-app-flclash/Makefile | tr -d '[:space:]')
+          r=$(sed -n 's/^PKG_RELEASE:=//p' luci-app-flclash/Makefile | tr -d '[:space:]')
+          test -n "$v" || { echo "PKG_VERSION missing in luci-app-flclash/Makefile"; exit 1; }
+          test -n "$r" || r=1
+          # The Cargo crate must carry the same version, otherwise --locked
+          # builds and the apk disagree about what is being shipped.
+          cv=$(sed -n 's/^version = "\(.*\)"/\1/p' flclash-api/Cargo.toml | head -1)
+          test "$cv" = "$v" || { echo "version drift: Makefile=$v Cargo.toml=$cv"; exit 1; }
+          echo "PKG_VERSION=$v" >> "$GITHUB_ENV"
+          echo "PKG_RELEASE=$r" >> "$GITHUB_ENV"
+          echo "package: luci-app-flclash $v-r$r"
 
       - name: Inventory
         run: |
