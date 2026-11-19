@@ -135,6 +135,9 @@ cargo build --release --target x86_64-unknown-linux-musl --bins    # x86_64
   (`GOAMD64=v1`,通用);按设备实际架构选择对应 Release 的**单个 apk**。
 - 首次启动自动生成最小 `config.yaml`;订阅导入路径保证写入的配置永远是
   内核可加载的 YAML。
+- 内核依赖:透明代理需要设备内核具备 `TUN` 与 `nftables`(ImmortalWrt 默认镜像
+  已带 `firewall4`/`nftables`)。这些 `kmod-*` 未在 ImmortalWrt 25.12 的 apk
+  源发布,故**不写入硬依赖**,避免 `apk add` 解依赖失败。
 - 安装(签名方为构建 SDK,设备首次安装需显式信任):
 
 ```sh

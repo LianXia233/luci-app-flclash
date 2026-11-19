@@ -35,7 +35,9 @@ define Package/luci-app-flclash
   CATEGORY:=Network
   SUBMENU:=Virtual Private Network (VPN)
   TITLE:=FlClash WebUI — mihomo/sing-box single package
-  DEPENDS:=+luci-base +rpcd +rpcd-mod-ucode +kmod-tun +kmod-nft-core +kmod-nft-nat
+  # kernel modules are NOT published in the immortalwrt 25.12 apk feeds, so
+  # they must not be hard dependencies (apk would fail to resolve them).
+  DEPENDS:=+luci-base +rpcd +rpcd-mod-ucode
   PKGARCH:=$(ARCH_PACKAGES)
 endef
 
