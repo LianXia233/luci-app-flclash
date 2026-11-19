@@ -91,7 +91,7 @@ apk add --allow-untrusted ./luci-app-flclash_*.apk
 内核管理 ──► WebUI「设置 / 工具」──► /flclash/api/core*（REST，走本进程，不经 ubus）
 ```
 
-设计文档：[docs/architecture-comm.md](docs/architecture-comm.md)（REST / WS / 任务通信与一致性）、[docs/feature-matrix.md](docs/feature-matrix.md)（五仓库能力对照、已做与未做项及原因）、[docs/screenshots](docs/screenshots)（浏览器实拍）。
+浏览器实拍见 [docs/screenshots](docs/screenshots)。
 
 | 组件 | 安装路径 | 说明 |
 | --- | --- | --- |
@@ -197,7 +197,7 @@ sync() ─────┼─ config.tun.enable=true 且 TUN 在线 ──► TUN
 
 所有接口以 `/flclash/api` 为前缀。若设置 `api.secret`，请求需携带 `X-FlClash-Secret: <secret>` 或 `Authorization: Bearer <secret>`（WebSocket 用首帧 `auth` 消息）。
 
-REST 只负责**控制与查询**；实时数据由 `GET /ws` 推送。两者读取同一份构造器（`status_payload` / `build_proxies`），不会出现数值分叉。完整设计见 [docs/architecture-comm.md](docs/architecture-comm.md)。
+REST 只负责**控制与查询**；实时数据由 `GET /ws` 推送。两者读取同一份构造器（`status_payload` / `build_proxies`），不会出现数值分叉。
 
 ### 状态与内核
 
