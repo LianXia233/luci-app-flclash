@@ -200,7 +200,8 @@ jobs:
           file=""
           for attempt in 1 2 3 4 5; do
             listing=$(curl -fsSL --retry 5 --retry-all-errors --max-time 120 "$BASE/" || true)
-            file=$(printf '%s\n' "$listing" | grep -oE '[^"/]+\.tar\.zst' \
+            file=$(printf '%s\n' "$listing" \
+                   | grep -oE 'href="[^"]+\.tar\.zst"' | sed -e 's/href="//' -e 's/"$//' \
                    | grep -E '${{ matrix.sdk_glob }}' | sort -u | head -n1 || true)
             [ -n "$file" ] && break
             echo "listing attempt $attempt failed, retrying..."
