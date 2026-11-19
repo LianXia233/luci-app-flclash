@@ -21,7 +21,7 @@ FlClash 的 OpenWrt 移植：把 **mihomo 内核**、**Rust IPC host**、**Rust/
 
 ## 功能
 
-- **订阅导入**：Clash YAML、base64 节点列表，以及分享链接 `ss / ssr / vmess / vless / trojan / hysteria2 / hy2 / tuic`。
+- **订阅导入**：Clash YAML、base64 节点列表，以及分享链接 `ss / ssr / vmess / vless / trojan / hysteria (v1) / hysteria2 / hy2 / tuic / anytls`。
 - **配置管理**：订阅更新、编辑（名称 / URL / 自动更新间隔）、流量与到期展示、一键应用。
 - **代理与连接**：代理组 / 节点测速与切换、连接列表与关闭、规则查看、日志采样。
 - **DNS 进阶**：fake-ip / redir-host、DoH / DoT / bootstrap、DNS 查询与缓存刷新。

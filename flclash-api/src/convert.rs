@@ -418,6 +418,120 @@ fn parse_vmess(raw: &str) -> Result<Vec<Kv>, String> {
     Ok(pairs)
 }
 
+fn csv_yaml_list(value: &str) -> String {
+    let items: Vec<String> = value
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(yaml_str)
+        .collect();
+    format!("[{}]", items.join(", "))
+}
+
+/// mihomo accepts a bare number (Mbps) or a value with a unit. Keep the unit
+/// when the link already carries one, otherwise make the unit explicit.
+fn mbps_yaml(value: &str) -> String {
+    let v = value.trim();
+    if !v.is_empty() && v.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        yaml_str(&format!("{} Mbps", v))
+    } else {
+        yaml_str(v)
+    }
+}
+
+fn truthy(value: &str) -> bool {
+    matches!(value, "1" | "true" | "TRUE" | "yes" | "Yes")
+}
+
+/// Hysteria v1 share link:
+///   hysteria://[auth@]host:port?protocol=udp&auth=...&peer=sni
+///              &insecure=1&upmbps=100&downmbps=100&alpn=h3
+///              &obfsParam=...&mport=443,5000-6000#name
+///
+/// Unlike vless/trojan, the auth string is usually a query parameter instead
+/// of userinfo, so `@` must stay optional.
+fn parse_hysteria(raw: &str) -> Result<Vec<Kv>, String> {
+    let body = raw.trim_start_matches("hysteria://");
+    let (body, frag) = match body.split_once('#') {
+        Some((b, f)) => (b, f),
+        None => (body, ""),
+    };
+    let name = percent_decode_plus(frag);
+    let (body, query_str) = match body.split_once('?') {
+        Some((b, q)) => (b, q),
+        None => (body, ""),
+    };
+    let query = parse_query(query_str);
+
+    let (cred, hostport) = match body.rfind('@') {
+        Some(i) => (Some(&body[..i]), &body[i + 1..]),
+        None => (None, body),
+    };
+    let (host, port) = split_host_port(hostport)?;
+
+    let auth = {
+        let q = qget_any(&query, &["auth", "auth_str", "auth-str"]);
+        if q.is_empty() {
+            cred.map(percent_decode).unwrap_or_default()
+        } else {
+            q.to_string()
+        }
+    };
+
+    let mut pairs = vec![
+        kv("name", yaml_str(&name)),
+        kv("type", "hysteria"),
+        kv("server", yaml_str(&host)),
+        kv("port", port.to_string()),
+    ];
+
+    if !auth.is_empty() {
+        pairs.push(kv("auth-str", yaml_str(&auth)));
+    }
+
+    let sni = qget_any(&query, &["peer", "sni", "server_name"]);
+    if !sni.is_empty() {
+        pairs.push(kv("sni", yaml_str(sni)));
+    }
+
+    let insecure = qget_any(&query, &["insecure", "allowInsecure", "allow_insecure"]);
+    if truthy(insecure) {
+        pairs.push(kv("skip-cert-verify", "true"));
+    }
+
+    let up = qget_any(&query, &["upmbps", "up", "up_mbps"]);
+    if !up.is_empty() {
+        pairs.push(kv("up", mbps_yaml(up)));
+    }
+    let down = qget_any(&query, &["downmbps", "down", "down_mbps"]);
+    if !down.is_empty() {
+        pairs.push(kv("down", mbps_yaml(down)));
+    }
+
+    let protocol = qget(&query, "protocol");
+    if !protocol.is_empty() {
+        pairs.push(kv("protocol", yaml_str(protocol)));
+    }
+
+    // Hysteria v1 obfuscation is a single password (no type selector).
+    let obfs = qget_any(&query, &["obfsParam", "obfs-password", "obfs_password", "obfs"]);
+    if !obfs.is_empty() {
+        pairs.push(kv("obfs", yaml_str(obfs)));
+    }
+
+    let alpn = qget(&query, "alpn");
+    if !alpn.is_empty() {
+        pairs.push(kv("alpn", csv_yaml_list(alpn)));
+    }
+
+    let ports = qget_any(&query, &["mport", "ports"]);
+    if !ports.is_empty() {
+        pairs.push(kv("ports", yaml_str(ports)));
+    }
+
+    Ok(pairs)
+}
+
 fn parse_share_url(raw: &str, scheme: &str) -> Result<Vec<Kv>, String> {
     let prefix = format!("{}://", scheme);
     let body = raw.trim_start_matches(&prefix);
@@ -432,11 +546,13 @@ fn parse_share_url(raw: &str, scheme: &str) -> Result<Vec<Kv>, String> {
     };
     let query = parse_query(query_str);
 
-    let at = body
-        .rfind('@')
-        .ok_or_else(|| format!("missing @ in {} link", scheme))?;
-    let cred = &body[..at];
-    let (host, port) = split_host_port(&body[at + 1..])?;
+    let (cred, hostport) = match body.rfind('@') {
+        Some(at) => (&body[..at], &body[at + 1..]),
+        // AnyTLS links may omit userinfo and carry ?password= instead.
+        None if scheme == "anytls" => ("", body),
+        None => return Err(format!("missing @ in {} link", scheme)),
+    };
+    let (host, port) = split_host_port(hostport)?;
 
     let mut pairs = Vec::new();
     match scheme {
@@ -560,6 +676,46 @@ fn parse_share_url(raw: &str, scheme: &str) -> Result<Vec<Kv>, String> {
                 pairs.push(kv("udp-relay-mode", yaml_str(mode)));
             }
         }
+        "anytls" => {
+            // anytls://password@host:port?insecure=1&sni=...&fp=...
+            // Password lives in userinfo; accept ?password= as a fallback.
+            let password = {
+                let q = qget_any(&query, &["password", "auth", "auth_str", "auth-str"]);
+                if q.is_empty() {
+                    percent_decode(cred)
+                } else {
+                    q.to_string()
+                }
+            };
+            pairs = vec![
+                kv("name", yaml_str(&name)),
+                kv("type", "anytls"),
+                kv("server", yaml_str(&host)),
+                kv("port", port.to_string()),
+                kv("password", yaml_str(&password)),
+                kv("udp", "true"),
+            ];
+            let sni = qget_any(&query, &["sni", "peer", "server_name"]);
+            if !sni.is_empty() {
+                pairs.push(kv("sni", yaml_str(sni)));
+            }
+            let insecure = qget_any(&query, &["insecure", "allowInsecure", "allow_insecure"]);
+            if truthy(insecure) {
+                pairs.push(kv("skip-cert-verify", "true"));
+            }
+            let fp = qget_any(&query, &["fp", "client-fingerprint", "client_fingerprint"]);
+            if !fp.is_empty() {
+                pairs.push(kv("client-fingerprint", yaml_str(fp)));
+            }
+            let alpn = qget(&query, "alpn");
+            if !alpn.is_empty() {
+                pairs.push(kv("alpn", csv_yaml_list(alpn)));
+            }
+            let pin = qget_any(&query, &["pinSHA256", "pin-sha256"]);
+            if !pin.is_empty() {
+                pairs.push(kv("fingerprint", yaml_str(pin)));
+            }
+        }
         _ => return Err(format!("unsupported scheme {}", scheme)),
     }
     Ok(pairs)
@@ -596,7 +752,9 @@ fn ws_grpc_opts(pairs: &mut Vec<Kv>, network: &str, query: &[(String, String)]) 
 
 // ------------------------------------------------------------ node registry
 
-const SUPPORTED_SCHEMES: [&str; 8] = ["ss", "ssr", "vmess", "vless", "trojan", "hysteria2", "hy2", "tuic"];
+const SUPPORTED_SCHEMES: [&str; 10] = [
+    "ss", "ssr", "vmess", "vless", "trojan", "hysteria2", "hy2", "hysteria", "tuic", "anytls",
+];
 
 pub fn scheme_of(line: &str) -> &'static str {
     let lower = line.to_ascii_lowercase();
@@ -620,7 +778,9 @@ fn parse_node(line: &str) -> Result<Vec<Kv>, String> {
         "trojan" => parse_share_url(line, "trojan"),
         "hysteria2" => parse_share_url(line, "hysteria2"),
         "hy2" => parse_share_url(line.trim_start_matches("hy2://").trim_start_matches("hysteria2://"), "hysteria2"),
+        "hysteria" => parse_hysteria(line),
         "tuic" => parse_share_url(line, "tuic"),
+        "anytls" => parse_share_url(line, "anytls"),
         _ => Err("unsupported node line".into()),
     }
 }
@@ -1027,6 +1187,59 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_hysteria_v1_query_auth() {
+        // Hysteria v1 puts auth in the query, not in userinfo: no `@`.
+        let link = "hysteria://1.2.3.4:12854?protocol=udp&auth=peko&peer=wechat.com&insecure=1&upmbps=50&downmbps=250&alpn=h3#Hys";
+        let pairs = parse_hysteria(link).unwrap();
+        assert!(pairs.iter().any(|p| p.k == "type" && p.v == "hysteria"));
+        assert!(pairs.iter().any(|p| p.k == "auth-str" && p.v == "\"peko\""));
+        assert!(pairs.iter().any(|p| p.k == "sni" && p.v == "\"wechat.com\""));
+        assert!(pairs.iter().any(|p| p.k == "skip-cert-verify" && p.v == "true"));
+        assert!(pairs.iter().any(|p| p.k == "up" && p.v == "\"50 Mbps\""));
+        assert!(pairs.iter().any(|p| p.k == "down" && p.v == "\"250 Mbps\""));
+        assert!(pairs.iter().any(|p| p.k == "protocol" && p.v == "\"udp\""));
+        assert!(pairs.iter().any(|p| p.k == "alpn" && p.v == "[\"h3\"]"));
+    }
+
+    #[test]
+    fn test_parse_hysteria_v1_userinfo_and_obfs() {
+        let link = "hysteria://pw@example.com:443?obfsParam=obfs-pw&insecure=0&sni=s.example.com#H2";
+        let pairs = parse_hysteria(link).unwrap();
+        assert!(pairs.iter().any(|p| p.k == "auth-str" && p.v == "\"pw\""));
+        assert!(pairs.iter().any(|p| p.k == "obfs" && p.v == "\"obfs-pw\""));
+        assert!(pairs.iter().any(|p| p.k == "sni" && p.v == "\"s.example.com\""));
+        assert!(!pairs.iter().any(|p| p.k == "skip-cert-verify"));
+    }
+
+    #[test]
+    fn test_parse_anytls() {
+        let link = "anytls://s3cret@1.1.1.1:8443?insecure=1&sni=a.example.com&fp=chrome&alpn=h2%2Chttp%2F1.1&pinSHA256=AA%3ABB#A1";
+        let pairs = parse_share_url(link, "anytls").unwrap();
+        assert!(pairs.iter().any(|p| p.k == "type" && p.v == "anytls"));
+        assert!(pairs.iter().any(|p| p.k == "password" && p.v == "\"s3cret\""));
+        assert!(pairs.iter().any(|p| p.k == "sni" && p.v == "\"a.example.com\""));
+        assert!(pairs.iter().any(|p| p.k == "skip-cert-verify" && p.v == "true"));
+        assert!(pairs.iter().any(|p| p.k == "client-fingerprint" && p.v == "\"chrome\""));
+        assert!(pairs.iter().any(|p| p.k == "alpn" && p.v == "[\"h2\", \"http/1.1\"]"));
+        assert!(pairs.iter().any(|p| p.k == "fingerprint" && p.v == "\"AA:BB\""));
+    }
+
+    #[test]
+    fn test_parse_anytls_without_userinfo() {
+        let link = "anytls://1.1.1.1:8443?password=query-pw&sni=a.example.com#A2";
+        let pairs = parse_share_url(link, "anytls").unwrap();
+        assert!(pairs.iter().any(|p| p.k == "password" && p.v == "\"query-pw\""));
+        assert!(pairs.iter().any(|p| p.k == "sni" && p.v == "\"a.example.com\""));
+    }
+
+    #[test]
+    fn test_scheme_of_hysteria_and_anytls() {
+        assert_eq!(scheme_of("hysteria://1.2.3.4:443#x"), "hysteria");
+        assert_eq!(scheme_of("hysteria2://a@1.2.3.4:443#x"), "hysteria2");
+        assert_eq!(scheme_of("anytls://pw@1.2.3.4:443#x"), "anytls");
+    }
+
+    #[test]
     fn test_convert_base64_nodelist() {
         let nodes = "trojan://pw1@2.3.4.5:443?sni=a.com#N1\nss://YWVzLTEyOC1nY206cHc=@6.7.8.9:1234#N2";
         let encoded = base64::engine::general_purpose::STANDARD.encode(nodes);
@@ -1038,6 +1251,19 @@ mod tests {
         assert!(yaml.contains("\"N1\""));
         assert!(yaml.contains("mixed-port: 7892"));
         assert_eq!(count_top_level_list(&yaml, "proxies"), 2);
+    }
+
+    #[test]
+    fn test_convert_hysteria_and_anytls_nodelist() {
+        let nodes = "hysteria://1.2.3.4:12854?auth=peko&peer=wechat.com&upmbps=50&downmbps=250#Hys\nanytls://pw@5.6.7.8:8443?sni=a.example.com&insecure=1#Any";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(nodes);
+        let dir = std::env::temp_dir();
+        let yaml = convert_subscription(&dir.join("nonexistent.yaml"), &encoded).unwrap();
+        assert_eq!(count_top_level_list(&yaml, "proxies"), 2);
+        assert!(yaml.contains("type: hysteria"));
+        assert!(yaml.contains("type: anytls"));
+        assert!(yaml.contains("\"Hys\""));
+        assert!(yaml.contains("\"Any\""));
     }
 
     #[test]
