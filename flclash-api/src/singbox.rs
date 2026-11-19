@@ -420,6 +420,16 @@ fn proxy_to_outbound(p: &Y) -> Option<J> {
             }
             o
         }
+        "anytls" => {
+            // anytls is TLS-only; password + tls (sni/insecure/fingerprint are
+            // picked up by tls_object from the Clash top-level fields).
+            let mut o = common("anytls", &name, p);
+            {
+                let m = o.as_object_mut().unwrap();
+                m.insert("password".into(), json!(ystr(p, "password").unwrap_or_default()));
+            }
+            o
+        }
         "direct" => json!({"type": "direct", "tag": name}),
         "reject" => return None, // sing-box rejects via route action, not outbound
         _ => return None,
@@ -429,7 +439,7 @@ fn proxy_to_outbound(p: &Y) -> Option<J> {
     obj.entry("tag".to_string()).or_insert(json!(name));
     // Hysteria / Hysteria2 / TUIC are TLS-only; sing-box rejects them without
     // an explicit tls object. Supply a minimal one when the Clash node didn't.
-    if matches!(typ.as_str(), "hysteria" | "hysteria2" | "hy2" | "tuic") && !obj.contains_key("tls") {
+    if matches!(typ.as_str(), "hysteria" | "hysteria2" | "hy2" | "tuic" | "anytls") && !obj.contains_key("tls") {
         obj.insert("tls".into(), json!({"enabled": true}));
     }
     Some(out)

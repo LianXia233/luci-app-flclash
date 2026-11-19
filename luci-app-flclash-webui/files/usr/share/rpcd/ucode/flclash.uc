@@ -194,17 +194,17 @@ const methods = {
 				return { code: 1, error: '内核未安装,请先在线更新' };
 
 			system('uci -q set flclash.main.core_type=' + core);
-			# Switching back to the bundled mihomo restores native IPC mode; the
-			# online updater sets core_mode=cli only when it installs the
-			# standalone CLI mihomo. sing-box ignores core_mode.
+			// Switching back to the bundled mihomo restores native IPC mode; the
+			// online updater sets core_mode=cli only when it installs the
+			// standalone CLI mihomo. sing-box ignores core_mode.
 			if (core == 'mihomo')
 				system('uci -q set flclash.main.core_mode=ipc');
 			system('uci -q commit flclash');
 
-			# Lossless subscription conversion: before starting sing-box,
-			# regenerate its native JSON from the current mihomo config.yaml.
-			# The init script does this too, but doing it here guarantees the
-			# switch sees freshly-converted proxies/groups/rules/DNS/TUN.
+			// Lossless subscription conversion: before starting sing-box,
+			// regenerate its native JSON from the current mihomo config.yaml.
+			// The init script does this too, but doing it here guarantees the
+			// switch sees freshly-converted proxies/groups/rules/DNS/TUN.
 			let converted = false;
 			if (core == 'sing-box') {
 				converted = (system('/usr/libexec/flclash/singbox-convert.sh /etc/flclash/config.yaml /tmp/flclash-singbox.json >/dev/null 2>&1') == 0);
