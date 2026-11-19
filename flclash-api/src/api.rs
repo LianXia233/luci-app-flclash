@@ -404,6 +404,8 @@ pub async fn status(State(st): State<Arc<AppState>>) -> Response {
         "httpPort": cfg.port,
         "systemProxy": false,
         "tun": cfg.tun,
+        "tunStack": cfg.tun_stack,
+        "dnsMode": cfg.dns_mode,
         "allowLan": cfg.allow_lan,
         "ipv6Enabled": cfg.ipv6,
         "logLevel": cfg.log_level,
@@ -522,6 +524,8 @@ pub async fn config_get(State(st): State<Arc<AppState>>) -> Response {
         "allowLan": live.allow_lan,
         "ipv6": live.ipv6,
         "tun": live.tun,
+        "tunStack": live.tun_stack,
+        "dnsMode": live.dns_mode,
         "logLevel": live.log_level,
         "systemProxy": false,
     }))
@@ -739,11 +743,38 @@ pub async fn proxy_status(State(st): State<Arc<AppState>>) -> Response {
     let enabled = std::fs::read_to_string("/tmp/flclash-proxy.state")
         .map(|s| s.trim() == "on")
         .unwrap_or(false);
-    let rules = std::process::Command::new("nft")
-        .args(["list", "table", "inet", "flclash"])
+    let backend = std::process::Command::new("/usr/libexec/flclash/proxy-rules.sh")
+        .arg("backend")
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+        .ok()
+        .and_then(|o| {
+            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if s == "nftables" || s == "iptables" { Some(s) } else { None }
+        })
+        .unwrap_or_else(|| {
+            // Fallback detection mirrors proxy-rules.sh when the helper is
+            // not installed (e.g. local dev): presence of fw4 selects nft.
+            if std::path::Path::new("/sbin/fw4").exists()
+                || std::path::Path::new("/usr/sbin/fw4").exists()
+            {
+                "nftables".to_string()
+            } else {
+                "iptables".to_string()
+            }
+        });
+    let rules = if backend == "iptables" {
+        std::process::Command::new("iptables")
+            .args(["-t", "nat", "-n", "-L", "FLCLASH"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    } else {
+        std::process::Command::new("nft")
+            .args(["list", "table", "inet", "flclash"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    };
     let lan_if = std::fs::read_to_string("/proc/net/route")
         .ok()
         .and_then(|data| {
@@ -759,6 +790,7 @@ pub async fn proxy_status(State(st): State<Arc<AppState>>) -> Response {
     ok_json(json!({
         "enabled": enabled,
         "rulesActive": rules,
+        "firewallBackend": backend,
         "lanInterface": lan_if,
         "dnsPort": 1053,
         "redirPort": 7893,

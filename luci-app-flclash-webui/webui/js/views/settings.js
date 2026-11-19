@@ -8,6 +8,7 @@
   const icon = window.FlClashIcons.svg;
 
   function settings(ctx) {
+    const api = ctx.api;
     const root = document.createElement('div');
     root.className = 'view page';
     const cfg = ctx.state.config || {};
@@ -37,8 +38,8 @@
         '<div class="settings-card">' +
           '<div class="settings-row"><div class="row-copy"><div class="row-title">启用 DNS 模块</div><div class="row-desc">关闭后由系统 DNS 解析</div></div>' +
             '<button class="switch" role="switch" data-cfg="dnsEnable" type="button"><span class="thumb"></span></button></div>' +
-          '<div class="settings-row"><div class="row-copy"><div class="row-title">解析增强模式</div><div class="row-desc">fake-ip 或 redir-host</div></div>' +
-            '<select class="select" data-cfg="dnsMode"><option value="fake-ip">fake-ip</option><option value="redir-host">redir-host</option></select></div>' +
+          '<div class="settings-row"><div class="row-copy"><div class="row-title">解析增强模式</div><div class="row-desc">fake-ip 快速 / redir-host 真实 / 混合(嗅探)</div></div>' +
+            '<select class="select" data-cfg="dnsMode"><option value="fake-ip">fake-ip</option><option value="redir-host">redir-host</option><option value="mixed">混合模式</option></select></div>' +
           '<div class="settings-row"><div class="row-copy"><div class="row-title">域名解析服务器</div><div class="row-desc">每行一个,支持 udp / DoH(https://) / DoT(tls://)</div></div></div>' +
           '<textarea class="input dns-area" data-cfg="dnsNameservers" rows="4" spellcheck="false"></textarea>' +
           '<div class="settings-row"><div class="row-copy"><div class="row-title">默认 DNS(bootstrap)</div><div class="row-desc">用于解析 DoH/DoT 域名,每行一个</div></div></div>' +
@@ -50,12 +51,21 @@
         '</div></div>' +
       '<div class="settings-group"><div class="settings-title">内核</div>' +
         '<div class="settings-card">' +
+          '<div class="settings-row"><div class="row-copy"><div class="row-title">内核类型</div><div class="row-desc">mihomo(Meta) / sing-box 智能内核</div></div>' +
+            '<select class="select" data-cfg="coreType"><option value="mihomo">mihomo (Meta)</option><option value="sing-box">sing-box</option></select></div>' +
+          '<div class="settings-row"><div class="row-copy"><div class="row-title">已安装版本</div><div class="row-desc" data-role="core-version">—</div></div>' +
+            '<button class="btn btn-sm" data-act="core-update" type="button">在线更新</button></div>' +
+          '<div class="update-progress" data-role="update-progress" hidden>' +
+            '<div class="update-bar"><span data-role="update-bar-fill"></span></div>' +
+            '<pre class="update-log" data-role="update-log"></pre></div>' +
           '<div class="settings-row"><div class="row-copy"><div class="row-title">虚拟网卡(TUN)</div><div class="row-desc">接管全局流量,需内核支持</div></div>' +
             '<button class="switch" role="switch" data-cfg="tun" type="button"><span class="thumb"></span></button></div>' +
+          '<div class="settings-row"><div class="row-copy"><div class="row-title">TUN 协议栈</div><div class="row-desc">gvisor 兼容 / system 性能 / mixed 均衡</div></div>' +
+            '<select class="select" data-cfg="tunStack"><option value="mixed">mixed</option><option value="gvisor">gvisor</option><option value="system">system</option></select></div>' +
+          '<div class="settings-row"><div class="row-copy"><div class="row-title">防火墙后端</div><div class="row-desc" data-role="firewall-backend">自动检测</div></div>' +
+            '<span class="chip chip-plain" data-role="firewall-chip">—</span></div>' +
           '<div class="settings-row"><div class="row-copy"><div class="row-title">日志级别</div><div class="row-desc">影响日志详细程度</div></div>' +
             '<select class="select" data-cfg="logLevel"><option value="debug">debug</option><option value="info">info</option><option value="warning">warning</option><option value="error">error</option></select></div>' +
-          '<div class="settings-row"><div class="row-copy"><div class="row-title">核心版本</div><div class="row-desc" data-role="core-version">—</div></div>' +
-            '<span class="chip chip-plain">mihomo</span></div>' +
         '</div></div>' +
       '<div class="settings-group"><div class="settings-title">外观</div>' +
         '<div class="settings-card">' +
@@ -85,7 +95,9 @@
       dnsFakeRange: ui.$('[data-cfg="dnsFakeRange"]', root),
       dnsFilter: ui.$('[data-cfg="dnsFilter"]', root),
       theme: ui.$('[data-cfg="theme"]', root),
-      proxyLan: ui.$('[data-cfg="proxyLan"]', root)
+      proxyLan: ui.$('[data-cfg="proxyLan"]', root),
+      coreType: ui.$('[data-cfg="coreType"]', root),
+      tunStack: ui.$('[data-cfg="tunStack"]', root)
     };
 
     function fill() {
@@ -102,13 +114,21 @@
       });
       controls.dnsEnable.classList.toggle('is-on', dns.enable !== false);
       controls.dnsEnable.setAttribute('aria-checked', String(dns.enable !== false));
-      controls.dnsMode.value = dns['enhanced-mode'] || 'fake-ip';
+      controls.dnsMode.value = cfgNow.dnsMode || dns['enhanced-mode'] || 'fake-ip';
       controls.dnsNameservers.value = (dns.nameserver || []).join('\n');
       controls.dnsDefaults.value = (dns['default-nameserver'] || []).join('\n');
       controls.dnsFakeRange.value = dns['fake-ip-range'] || '198.18.0.1/16';
       controls.dnsFilter.value = (dns['fake-ip-filter'] || []).join('\n');
+      controls.coreType.value = cfgNow.coreType || statusNow.coreType || 'mihomo';
+      controls.tunStack.value = cfgNow.tunStack || statusNow.tunStack || 'mixed';
       const core = ui.$('[data-role="core-version"]', root);
       if (core) core.textContent = statusNow.coreVersion || '—';
+      const fw = statusNow.firewallBackend || cfgNow.firewallBackend;
+      const fwChip = ui.$('[data-role="firewall-chip"]', root);
+      if (fwChip) fwChip.textContent = fw ? fw.toUpperCase() : '—';
+      const fwDesc = ui.$('[data-role="firewall-backend"]', root);
+      if (fwDesc) fwDesc.textContent = fw === 'iptables'
+        ? 'iptables (TPROXY/REDIRECT)' : 'nftables (fw4) · 兼容 iptables';
       const running = !!statusNow.running;
       const stateNode = ui.$('[data-role="state"]', root);
       if (stateNode) stateNode.textContent = running ? '运行中' : '已停止(设置仍可保存)';
@@ -119,8 +139,35 @@
       }
     }
 
+    /* The transparent-proxy switch is driven by the real proxy-status
+     * endpoint, so a page reload reflects the actual nft state (the switch
+     * used to always start off even when takeover was active). */
+    function fillProxy() {
+      if (!ctx.api.proxyStatus) return;
+      ctx.api.proxyStatus().then(function (data) {
+        const on = !!(data && (data.enabled || data.rulesActive));
+        controls.proxyLan.classList.toggle('is-on', on);
+        controls.proxyLan.setAttribute('aria-checked', String(on));
+        const stateNode = ui.$('[data-role="proxy-state"]', root);
+        if (stateNode) stateNode.textContent = on ? '已接管局域网 TCP/UDP/DNS' : '未接管,管理面不受影响';
+        const chip = ui.$('[data-role="proxy-chip"]', root);
+        if (chip) {
+          chip.textContent = on ? '已开启' : '已关闭';
+          chip.className = 'chip ' + (on ? 'is-ok' : '');
+        }
+        const desc = ui.$('[data-role="proxy-desc"]', root);
+        if (desc && data) {
+          desc.textContent = '接口 ' + (data.lanInterface || 'br-lan') +
+            ' · REDIR ' + (data.redirPort || 7893) +
+            ' · TPROXY ' + (data.tproxyPort || 7894) +
+            ' · DNS ' + (data.dnsPort || 1053);
+        }
+      }).catch(function () { /* backend not available: leave switch untouched */ });
+    }
+
     api.config().then(function (data) { ctx.state.config = data; fill(); }).catch(function () { fill(); });
     fill();
+    fillProxy();
 
     ['allowLan', 'ipv6', 'tun', 'dnsEnable'].forEach(function (key) {
       controls[key].addEventListener('click', function () { controls[key].classList.toggle('is-on'); });
@@ -136,6 +183,7 @@
       ctx.api.proxyToggle(action)
         .then(function () {
           ui.toast(action === 'start' ? '局域网接管已开启' : '局域网接管已关闭', 'ok');
+          return fillProxy();
         })
         .catch(function (error) {
           sw.classList.toggle('is-on', on);
@@ -143,6 +191,77 @@
         })
         .then(function () { sw.dataset.busy = ''; });
     });
+    /* Core switch changes the running kernel (requires the binary installed).
+     * It is a dedicated action, not part of the generic "save settings". */
+    controls.coreType.addEventListener('change', function () {
+      const next = controls.coreType.value;
+      const prev = (ctx.state.config && ctx.state.config.coreType) || status.coreType || 'mihomo';
+      if (next === prev) return;
+      controls.coreType.disabled = true;
+      ctx.api.coreSwitch(next)
+        .then(function () {
+          ctx.state.status = ctx.state.status || {};
+          ctx.state.status.coreType = next;
+          ctx.state.status.coreVersion = next === 'sing-box' ? 'v1.11.0' : 'v1.19.33';
+          ctx.state.config = ctx.state.config || {};
+          ctx.state.config.coreType = next;
+          ui.toast('已切换到 ' + (next === 'sing-box' ? 'sing-box' : 'mihomo') + ' 内核', 'ok');
+          fill();
+          return ctx.refreshStatus();
+        })
+        .catch(function (error) {
+          controls.coreType.value = prev;
+          ui.toast('切换失败: ' + error.message, 'error');
+        })
+        .then(function () { controls.coreType.disabled = false; });
+    });
+
+    /* Online core update: start the backend updater and poll its state,
+     * showing the live log + progress until it reaches done/failed. */
+    const updateBtn = ui.$('[data-act="core-update"]', root);
+    if (updateBtn) updateBtn.addEventListener('click', function () {
+      const core = controls.coreType.value;
+      updateBtn.disabled = true;
+      const progress = ui.$('[data-role="update-progress"]', root);
+      const bar = ui.$('[data-role="update-bar-fill"]', root);
+      const log = ui.$('[data-role="update-log"]', root);
+      progress.hidden = false;
+      if (bar) bar.style.width = '15%';
+      if (log) log.textContent = '正在连接更新源…';
+      ctx.api.coreUpdate(core)
+        .then(function () {
+          ui.toast('开始更新 ' + (core === 'sing-box' ? 'sing-box' : 'mihomo') + ' 内核', 'ok');
+          return new Promise(function (resolve) {
+            let settled = false;
+            function finish(info) {
+              if (settled) return;
+              settled = true;
+              ui.stop('core-update-poll');
+              resolve(info);
+            }
+            ui.every('core-update-poll', function () {
+              ctx.api.coreUpdateStatus().then(function (info) {
+                if (log && info.log) log.textContent = info.log;
+                if (bar) bar.style.width = info.state === 'done' ? '100%' : '55%';
+                if (info.state === 'done' || info.state === 'failed') finish(info);
+              }).catch(function () {});
+            }, 1500);
+            // Safety net: never leave the button disabled if polling is torn
+            // down by navigation before the backend reports completion.
+            window.setTimeout(function () { finish({ state: 'failed', log: '更新状态轮询超时' }); }, 120000);
+          });
+        })
+        .then(function (info) {
+          if (info.state === 'done') {
+            ui.toast('内核更新完成', 'ok');
+            return ctx.refreshStatus().then(fill);
+          }
+          ui.toast('内核更新失败,请查看日志', 'error');
+        })
+        .catch(function (error) { ui.toast('更新失败: ' + error.message, 'error'); })
+        .then(function () { updateBtn.disabled = false; });
+    });
+
     controls.theme.classList.toggle('is-on', document.documentElement.getAttribute('data-theme') === 'dark');
     controls.theme.addEventListener('click', function () {
       const dark = !controls.theme.classList.contains('is-on');
@@ -175,6 +294,7 @@
         allowLan: controls.allowLan.classList.contains('is-on'),
         ipv6: controls.ipv6.classList.contains('is-on'),
         tun: controls.tun.classList.contains('is-on'),
+        tunStack: controls.tunStack.value,
         dns: {
           enable: controls.dnsEnable.classList.contains('is-on'),
           'enhanced-mode': controls.dnsMode.value,

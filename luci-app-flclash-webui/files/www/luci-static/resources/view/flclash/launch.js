@@ -54,6 +54,10 @@ return view.extend({
 
 		function paint(state) {
 			var running = !!state.running;
+			/* Keep the data flag in sync with the label: the click handler
+			 * reads it to choose start vs. stop. Without this, "停止服务"
+			 * always issued a start action. */
+			toggleBtn.setAttribute('data-running', running ? '1' : '0');
 			statusChip.className = 'chip ' + (running ? 'chip-ok' : 'chip-warn');
 			statusChip.textContent = running ? _('运行中') : _('已停止');
 			toggleBtn.textContent = running ? _('停止服务') : _('启动服务');

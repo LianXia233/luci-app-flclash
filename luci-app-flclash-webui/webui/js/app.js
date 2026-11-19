@@ -59,12 +59,12 @@
       return '<button class="rail-item" data-view="' + item.id + '" type="button" title="' + item.label + '">' +
         '<span class="rail-glyph" data-icon="' + item.glyph + '"></span><span class="rail-label">' + item.label + '</span></button>';
     }).join('');
-    bottom.innerHTML = NAV.filter(function (item) { return item.id !== 'tools'; }).map(function (item) {
+    const mobile = NAV.filter(function (item) { return item.id !== 'requests'; });
+    bottom.innerHTML = '<span class="nav-slider" aria-hidden="true"></span>' + mobile.map(function (item) {
       return '<button class="bottom-item" data-view="' + item.id + '" type="button">' +
-        '<span class="bottom-inner"><span data-icon="' + item.glyph + '"></span><span>' + item.label + '</span></span></button>';
-    }).join('') +
-      '<button class="bottom-item" data-view="tools" type="button">' +
-      '<span class="bottom-inner"><span data-icon="tools"></span><span>工具</span></span></button>';
+        '<span class="nav-glyph" data-icon="' + item.glyph + '"></span>' +
+        '<span class="nav-label">' + item.label + '</span></button>';
+    }).join('');
     window.FlClashIcons.mount(side);
     window.FlClashIcons.mount(bottom);
     ui.$$('[data-view]').forEach(function (button) {
@@ -81,6 +81,17 @@
     ui.$$('.rail-item,.bottom-item').forEach(function (button) {
       button.classList.toggle('is-active', button.getAttribute('data-view') === root);
     });
+    positionSlider(root);
+  }
+
+  /* Move the pill highlight under the active tab with a sliding transition. */
+  function positionSlider(name) {
+    const bottom = document.getElementById('bottom-nav');
+    const slider = bottom && ui.$('.nav-slider', bottom);
+    const active = bottom && ui.$('.bottom-item.is-active', bottom);
+    if (!slider || !active || !isMobile()) return;
+    const offset = active.offsetLeft + (active.offsetWidth - slider.offsetWidth) / 2;
+    slider.style.transform = 'translateX(' + offset + 'px)';
   }
 
   function applyTheme(theme) {
@@ -235,7 +246,7 @@
       return '<div class="speed-tile">' +
         '<span class="speed-label">' + icon(up ? 'arrowUp' : 'arrowDown', 16) + '<span>' + (up ? '上传' : '下载') + '</span></span>' +
         '<div class="speed-figure"><span class="speed-value" data-role="m-' + (up ? 'up' : 'down') + '">' + value.value + '</span>' +
-          '<span class="speed-unit">' + value.unit + '/s</span></div>' +
+          '<span class="speed-unit" data-role="m-unit-' + (up ? 'up' : 'down') + '">' + value.unit + '/s</span></div>' +
         '<div class="speed-total">累计 ' + ui.bytes(up ? traffic.totalUp : traffic.totalDown) + '</div>' +
         '<div class="speed-chart ' + (up ? 'is-up' : 'is-down') + '" data-role="m-chart-' + (up ? 'up' : 'down') + '"></div>' +
       '</div>';
@@ -332,8 +343,8 @@
       '<div class="memory-bar"><span class="memory-seg app" data-role="mem-app" style="width:' + appShare + '%"></span>' +
         '<span class="memory-seg core" data-role="mem-core" style="width:' + (100 - appShare) + '%"></span></div>' +
       '<div class="memory-legend">' +
-        '<span class="legend-item"><i class="legend-dot"></i>应用 ' + ui.bytes(memory.app || 0) + '</span>' +
-        '<span class="legend-item"><i class="legend-dot core"></i>内核 ' + ui.bytes(memory.core || 0) + '</span>' +
+        '<span class="legend-item"><i class="legend-dot"></i>应用 <b data-role="legend-app">' + ui.bytes(memory.app || 0) + '</b></span>' +
+        '<span class="legend-item"><i class="legend-dot core"></i>内核 <b data-role="legend-core">' + ui.bytes(memory.core || 0) + '</b></span>' +
       '</div>' +
     '</section>';
   }
@@ -591,6 +602,8 @@
       if (chart) ui.renderChart(chart, dir === 'up' ? state.history.up : state.history.down, { minScale: 8192 });
       const mobileValue = ui.$('[data-role="m-' + dir + '"]', node);
       if (mobileValue) ui.countUp(mobileValue, Number(value.value), function (v) { return v.toFixed(1); });
+      const mobileUnit = ui.$('[data-role="m-unit-' + dir + '"]', node);
+      if (mobileUnit) mobileUnit.textContent = value.unit + '/s';
       const mobileChart = ui.$('[data-role="m-chart-' + dir + '"]', node);
       if (mobileChart) ui.renderChart(mobileChart, dir === 'up' ? state.history.up : state.history.down, { height: 46, minScale: 8192 });
     });
@@ -660,6 +673,10 @@
       memApp.style.width = appShare + '%';
       memCore.style.width = (100 - appShare) + '%';
     }
+    const legendApp = ui.$('[data-role="legend-app"]', node);
+    if (legendApp) legendApp.textContent = ui.bytes(memory.app || 0);
+    const legendCore = ui.$('[data-role="legend-core"]', node);
+    if (legendCore) legendCore.textContent = ui.bytes(memory.core || 0);
 
     const profileChip = ui.$('[data-role="profile"] .card-end .chip', node);
     if (profileChip && status.profile) profileChip.textContent = (status.profile.proxies || 0) + ' 节点';
@@ -798,6 +815,7 @@
   });
   window.addEventListener('resize', ui.debounce(function () {
     if (current === 'dashboard') { renderDashboard(); }
+    positionSlider(current);
   }, 250));
 
   buildNav();

@@ -15,6 +15,7 @@ pub struct CoreConfigView {
     pub log_level: String,
     pub ipv6: bool,
     pub tun: bool,
+    pub tun_stack: String,
     pub dns_enable: bool,
     pub dns_mode: String,
     pub dns_nameservers: Vec<String>,
@@ -33,6 +34,7 @@ pub fn file_config(path: &Path) -> CoreConfigView {
     let mut cfg = CoreConfigView {
         mode: "rule".into(),
         log_level: "info".into(),
+        tun_stack: "mixed".into(),
         ..Default::default()
     };
     let Ok(data) = std::fs::read_to_string(path) else {
@@ -40,6 +42,8 @@ pub fn file_config(path: &Path) -> CoreConfigView {
     };
     let mut in_tun = false;
     let mut in_dns = false;
+    let mut in_sniffer = false;
+    let mut sniffer_enabled = false;
     let mut dns_key = String::new();
     for line in data.lines() {
         let trimmed = line.trim();
@@ -52,6 +56,7 @@ pub fn file_config(path: &Path) -> CoreConfigView {
             let value = value.trim();
             in_tun = key == "tun";
             in_dns = key == "dns";
+            in_sniffer = key == "sniffer";
             dns_key.clear();
             match key {
                 "port" => cfg.port = value.parse().unwrap_or(0),
@@ -68,6 +73,19 @@ pub fn file_config(path: &Path) -> CoreConfigView {
         if in_tun {
             if let Some(rest) = trimmed.strip_prefix("enable:") {
                 cfg.tun = rest.trim() == "true";
+            } else if let Some(rest) = trimmed.strip_prefix("stack:") {
+                let stack = rest.trim();
+                if matches!(stack, "gvisor" | "system" | "mixed") {
+                    cfg.tun_stack = stack.to_string();
+                }
+            }
+            continue;
+        }
+        if in_sniffer {
+            if let Some(rest) = trimmed.strip_prefix("enable:") {
+                if rest.trim() == "true" {
+                    sniffer_enabled = true;
+                }
             }
             continue;
         }
@@ -94,6 +112,11 @@ pub fn file_config(path: &Path) -> CoreConfigView {
                 dns_key = key.to_string();
             }
         }
+    }
+    // A sniffer block combined with fake-ip is how persisted "mixed" mode
+    // is represented; surface it back to the UI as mixed, not raw fake-ip.
+    if sniffer_enabled && cfg.dns_mode == "fake-ip" {
+        cfg.dns_mode = "mixed".to_string();
     }
     cfg
 }
@@ -154,8 +177,13 @@ pub async fn save_config(
         .await;
     }
     let result = persist_config(&st.config_path(), patch);
-    // dns and tun patches only take effect from the startup config file.
-    if result.is_ok() && (patch.get("dns").is_some() || patch.get("tun").is_some()) {
+    // dns, tun and tunStack patches only take effect from the startup config
+    // file, so a stopped core is left alone but a live one is reloaded.
+    if result.is_ok()
+        && (patch.get("dns").is_some()
+            || patch.get("tun").is_some()
+            || patch.get("tunStack").is_some())
+    {
         crate::profiles::reload_core(st).await;
     }
     result
@@ -171,7 +199,13 @@ fn render_dns_block(patch: &Value) -> Option<String> {
         .get("enhanced-mode")
         .and_then(|v| v.as_str())
         .unwrap_or("fake-ip");
-    out.push_str(&format!("  enhanced-mode: {}\n", mode));
+    // "mixed" is a WebUI-level mode: mihomo itself only understands
+    // fake-ip / redir-host. Mixed = fake-ip addressing + domain sniffing,
+    // which is how FlClash/OpenClash reconcile fake-ip speed with the
+    // domain accuracy of redir-host. Emit the canonical value fake-ip here;
+    // the sniffer: block is written alongside it by persist_config().
+    let canonical_mode = if mode == "mixed" { "fake-ip" } else { mode };
+    out.push_str(&format!("  enhanced-mode: {}\n", canonical_mode));
     let range = dns
         .get("fake-ip-range")
         .and_then(|v| v.as_str())
@@ -234,7 +268,16 @@ fn render_tun_block(patch: &Value) -> Option<String> {
             .and_then(|v| v.as_str())
             .unwrap_or("mixed")
             .to_string(),
-        _ => "mixed".to_string(),
+        _ => patch
+            .get("tunStack")
+            .and_then(|v| v.as_str())
+            .unwrap_or("mixed")
+            .to_string(),
+    };
+    let stack = if matches!(stack.as_str(), "gvisor" | "system" | "mixed") {
+        stack
+    } else {
+        "mixed".to_string()
     };
     out.push_str("  stack: ");
     out.push_str(&stack);
@@ -248,12 +291,42 @@ fn render_tun_block(patch: &Value) -> Option<String> {
     Some(out)
 }
 
+/// Renders the sniffer: block for the WebUI "mixed" DNS mode. Mixed mode
+/// keeps fake-ip fast-path addressing but recovers the real domain from
+/// HTTP/TLS traffic, matching the behaviour users expect from FlClash's
+/// mixed DNS handling. When the mode is not "mixed" this returns None so
+/// any previously written sniffer block is left untouched.
+fn render_sniffer_block(patch: &Value) -> Option<String> {
+    let dns = patch.get("dns")?.as_object()?;
+    let mode = dns.get("enhanced-mode").and_then(|v| v.as_str()).unwrap_or("");
+    if mode != "mixed" {
+        return None;
+    }
+    let mut out = String::from("sniffer:\n");
+    out.push_str("  enable: true\n");
+    out.push_str("  sniff:\n");
+    out.push_str("    HTTP:\n");
+    out.push_str("      ports: [80, 8080-8880]\n");
+    out.push_str("    TLS:\n");
+    out.push_str("      ports: [443, 8443]\n");
+    out.push_str("  sniff-by-dns: false\n");
+    Some(out)
+}
+
 /// Mirrors a settings patch into config.yaml. Top-level scalar keys are
-/// line-edited in place; tun and dns are block-edited.
+/// line-edited in place; tun, dns and sniffer are block-edited.
 pub fn persist_config(path: &Path, patch: &Value) -> Result<(), String> {
     let data = std::fs::read_to_string(path).map_err(|e| format!("read config: {}", e))?;
     let dns_block = render_dns_block(patch);
     let tun_block = render_tun_block(patch);
+    let sniffer_block = render_sniffer_block(patch);
+    // Whenever the UI explicitly sets a DNS mode, reconcile the sniffer:
+    // block — write it for "mixed", strip a stale one for the other modes.
+    let dns_mode_set = patch
+        .get("dns")
+        .and_then(|d| d.get("enhanced-mode"))
+        .and_then(|v| v.as_str())
+        .is_some();
 
     let mut scalars: Vec<(&str, String)> = Vec::new();
     if let Some(v) = parse_str(patch, "mode") {
@@ -300,6 +373,8 @@ pub fn persist_config(path: &Path, patch: &Value) -> Result<(), String> {
     let mut tun_done = false;
     let mut in_dns = false;
     let mut dns_done = false;
+    let mut in_sniffer = false;
+    let mut sniffer_done = false;
     let mut appended: std::collections::HashSet<String> = std::collections::HashSet::new();
     for line in data.lines() {
         let trimmed = line.trim();
@@ -327,6 +402,26 @@ pub fn persist_config(path: &Path, patch: &Value) -> Result<(), String> {
                     continue; // skip old dns block lines
                 }
                 in_dns = false;
+            }
+        }
+        // Mixed DNS mode writes a canonical sniffer: block; when switching
+        // away from mixed we drop any stale one so sniffing does not linger.
+        if dns_mode_set {
+            if at_root && key == "sniffer" {
+                sniffer_done = true;
+                if let Some(block) = &sniffer_block {
+                    for bline in block.lines() {
+                        out.push(bline.to_string());
+                    }
+                }
+                in_sniffer = true;
+                continue;
+            }
+            if in_sniffer {
+                if line.starts_with(' ') || line.starts_with('\t') || trimmed.is_empty() {
+                    continue; // skip old sniffer block lines
+                }
+                in_sniffer = false;
             }
         }
         if tun_block.is_some() {
@@ -384,11 +479,24 @@ pub fn persist_config(path: &Path, patch: &Value) -> Result<(), String> {
         }
     }
     if tun.is_some() && !tun_done {
-        out.push(format!("tun:"));
-        out.push(format!("  enable: {}", yaml_bool(tun.unwrap())));
+        if let Some(block) = &tun_block {
+            for bline in block.lines() {
+                out.push(bline.to_string());
+            }
+        } else {
+            out.push("tun:".to_string());
+            out.push(format!("  enable: {}", yaml_bool(tun.unwrap())));
+        }
     }
     if dns_block.is_some() && !dns_done {
         if let Some(block) = &dns_block {
+            for bline in block.lines() {
+                out.push(bline.to_string());
+            }
+        }
+    }
+    if let Some(block) = &sniffer_block {
+        if !sniffer_done {
             for bline in block.lines() {
                 out.push(bline.to_string());
             }
@@ -440,6 +548,49 @@ mod tests {
         assert!(text.contains("auto-redirect: true"));
         assert!(text.contains("dns-hijack:"));
         assert!(text.contains("proxies:"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_mixed_dns_and_tun_stack() {
+        let dir = std::env::temp_dir().join(format!("flclash-test3-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.yaml");
+        std::fs::write(&path, "mixed-port: 7892\nmode: rule\ndns:\n  enhanced-mode: fake-ip\n").unwrap();
+
+        let patch = serde_json::json!({
+            "dns": {"enhanced-mode": "mixed"},
+            "tunStack": "gvisor"
+        });
+        persist_config(&path, &patch).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("enhanced-mode: fake-ip"), "mixed maps to canonical fake-ip");
+        assert!(text.contains("sniffer:"), "mixed writes a sniffer block");
+        assert!(text.contains("enable: true"), "sniffer enabled");
+
+        // Reading it back must surface "mixed" again (fake-ip + sniffer).
+        let cfg = file_config(&path);
+        assert_eq!(cfg.dns_mode, "mixed", "round-trip preserves mixed mode");
+
+        // Switching back to fake-ip strips the stale sniffer block.
+        persist_config(&path, &serde_json::json!({"dns": {"enhanced-mode": "fake-ip"}})).unwrap();
+        let text2 = std::fs::read_to_string(&path).unwrap();
+        assert!(!text2.contains("sniffer:"), "leaving mixed removes sniffer block");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_tun_stack_persist() {
+        let dir = std::env::temp_dir().join(format!("flclash-test4-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.yaml");
+        std::fs::write(&path, "mixed-port: 7892\n").unwrap();
+        let patch = serde_json::json!({"tun": true, "tunStack": "system"});
+        persist_config(&path, &patch).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("stack: system"), "tun stack is persisted");
+        let cfg = file_config(&path);
+        assert_eq!(cfg.tun_stack, "system", "tun stack read back");
         std::fs::remove_dir_all(&dir).ok();
     }
 

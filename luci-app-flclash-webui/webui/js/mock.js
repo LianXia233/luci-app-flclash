@@ -17,6 +17,12 @@ window.FlClashMock = (function () {
     socksPort: 7891,
     httpPort: 7892,
     logLevel: 'info',
+    coreType: 'mihomo',
+    dnsMode: 'fake-ip',
+    tunStack: 'mixed',
+    firewallBackend: 'nftables',
+    updateState: 'idle',
+    updateCore: 'mihomo',
     startedAt: Date.now() - 1000 * 60 * 48,
     upRate: 42 * KB,
     downRate: 1.4 * MB,
@@ -236,7 +242,6 @@ window.FlClashMock = (function () {
     return Promise.resolve(clone({
       running: state.running,
       version: '0.9.3',
-      coreVersion: 'v1.19.33',
       uptime: uptime(),
       mode: state.mode,
       outboundIp: '203.0.113.62',
@@ -254,6 +259,11 @@ window.FlClashMock = (function () {
       allowLan: state.allowLan,
       ipv6Enabled: state.ipv6,
       logLevel: state.logLevel,
+      coreType: state.coreType,
+      coreVersion: state.coreType === 'sing-box' ? 'v1.11.0' : 'v1.19.33',
+      dnsMode: state.dnsMode,
+      tunStack: state.tunStack,
+      firewallBackend: state.firewallBackend,
       traffic: traffic(),
       memory: { app: 61.4 * MB, core: 48.9 * MB },
       services: services,
@@ -306,7 +316,17 @@ window.FlClashMock = (function () {
       return Promise.resolve(clone({
         mode: state.mode, mixedPort: state.mixedPort, socksPort: state.socksPort,
         httpPort: state.httpPort, systemProxy: state.systemProxy, tun: state.tun,
-        allowLan: state.allowLan, ipv6: state.ipv6, logLevel: state.logLevel
+        allowLan: state.allowLan, ipv6: state.ipv6, logLevel: state.logLevel,
+        coreType: state.coreType, dnsMode: state.dnsMode, tunStack: state.tunStack,
+        firewallBackend: state.firewallBackend,
+        dns: {
+          enable: true,
+          'enhanced-mode': state.dnsMode,
+          nameserver: ['https://223.5.5.5/dns-query', 'https://doh.pub/dns-query'],
+          'default-nameserver': ['223.5.5.5', '119.29.29.29'],
+          'fake-ip-range': '198.18.0.1/16',
+          'fake-ip-filter': ['*.lan', '*.local']
+        }
       }));
     },
     version: function () { return Promise.resolve({ version: '0.9.3', core: 'v1.19.33' }); },
@@ -322,6 +342,20 @@ window.FlClashMock = (function () {
         read_only: true,
         source: 'mock'
       });
+    },
+    proxyStatus: function () {
+      return Promise.resolve({
+        enabled: !!state.proxyTakeover,
+        rulesActive: !!state.proxyTakeover,
+        lanInterface: 'br-lan',
+        dnsPort: 1053,
+        redirPort: 7893,
+        tproxyPort: 7894
+      });
+    },
+    proxyToggle: function (action) {
+      state.proxyTakeover = action === 'start';
+      return Promise.resolve({ ok: true, action: action });
     },
     importProfile: function (payload) {
       const link = typeof payload === 'string' ? payload : (payload && payload.url) || '';
@@ -357,6 +391,37 @@ window.FlClashMock = (function () {
       });
       return Promise.resolve({ name: name, value: value });
     },
+    testGroupDelay: function (payload) {
+      const group = (payload && payload.group) || '';
+      const delays = {};
+      const target = groups.find(function (g) { return g.name === group; });
+      (target ? target.nodes : []).forEach(function (node) {
+        const value = 20 + Math.floor(Math.random() * 220);
+        node.delay = value;
+        delays[node.name] = value;
+      });
+      return Promise.resolve(delays);
+    },
+    updateProfile: function (id) {
+      const item = profiles.find(function (p) { return p.id === id; });
+      if (item) item.updatedAt = '刚刚';
+      return Promise.resolve({ ok: true, id: id });
+    },
+    editProfile: function (id, patch) {
+      const item = profiles.find(function (p) { return p.id === id; });
+      if (item && patch) {
+        if (patch.name) item.name = patch.name;
+        if (patch.url) item.url = patch.url;
+        if (patch.interval != null) item.interval = patch.interval;
+      }
+      return Promise.resolve({ ok: true, id: id });
+    },
+    dnsResolve: function (name, type) {
+      const answer = (String(name || '').indexOf('198.18.') === 0)
+        ? []
+        : [{ data: '198.18.0.' + (2 + Math.floor(Math.random() * 200)) }, { data: '2606:4700::1111' }];
+      return Promise.resolve({ name: name, type: type || 'A', answer: answer });
+    },
     closeConnection: function (id) {
       connections = connections.filter(function (item) { return item.id !== id; });
       return Promise.resolve({ ok: true, id: id });
@@ -376,6 +441,8 @@ window.FlClashMock = (function () {
         if (typeof patch.allowLan === 'boolean') state.allowLan = patch.allowLan;
         if (typeof patch.ipv6 === 'boolean') state.ipv6 = patch.ipv6;
         if (patch.logLevel) state.logLevel = patch.logLevel;
+        if (patch.tunStack) state.tunStack = patch.tunStack;
+        if (patch.dns && patch.dns['enhanced-mode']) state.dnsMode = patch.dns['enhanced-mode'];
       }
       return Promise.resolve({ ok: true });
     },
@@ -384,6 +451,42 @@ window.FlClashMock = (function () {
       if (action === 'stop') state.running = false;
       if (action === 'restart') { state.running = true; state.startedAt = Date.now(); }
       return Promise.resolve({ ok: true, action: action || 'start' });
+    },
+    coreInfo: function () {
+      return Promise.resolve({
+        active: state.coreType,
+        mihomo_installed: true,
+        singbox_installed: true,
+        mihomo_version: 'v1.19.33',
+        singbox_version: 'v1.11.0'
+      });
+    },
+    coreUpdate: function (core) {
+      state.updateCore = core || 'mihomo';
+      state.updateState = 'running';
+      const self = this;
+      window.setTimeout(function () {
+        state.updateState = 'done';
+        if (self && state.coreType === state.updateCore) { /* no-op */ }
+      }, 2600);
+      return Promise.resolve({ code: 0, state: 'running', core: state.updateCore });
+    },
+    coreUpdateStatus: function () {
+      return Promise.resolve({
+        state: state.updateState,
+        core_type: state.coreType,
+        core_version: state.coreType === 'sing-box' ? 'v1.11.0' : 'v1.19.33',
+        log: state.updateState === 'done'
+          ? '[update] installed: ' + (state.updateCore === 'sing-box' ? 'sing-box 1.11.0' : 'mihomo 1.19.33') + '\n[update] done'
+          : '[update] downloading…'
+      });
+    },
+    coreSwitch: function (core) {
+      if (core !== 'mihomo' && core !== 'sing-box') {
+        return Promise.reject(new Error('未知内核类型'));
+      }
+      state.coreType = core;
+      return Promise.resolve({ code: 0, core: core, running: state.running });
     }
   };
 })();

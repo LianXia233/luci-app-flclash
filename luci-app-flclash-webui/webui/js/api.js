@@ -86,6 +86,9 @@ window.FlClashAPI = (function () {
       return live('proxyToggle', { path: '/proxy/' + encodeURIComponent(action), method: 'POST' });
     },
     dnsResolve: function (name, type) {
+      if (cfg.mock && mock && typeof mock.dnsResolve === 'function') {
+        return mock.dnsResolve(name, type);
+      }
       return request('/dns/resolve?name=' + encodeURIComponent(name) + '&type=' + encodeURIComponent(type || 'A'));
     },
 
@@ -103,6 +106,38 @@ window.FlClashAPI = (function () {
           })
         });
       });
+    },
+
+    /* ---- core management (rpcd ubus `flclash`, mock-backed in demo mode) ---- */
+    ubus: function (method, params) {
+      return request(cfg.ubusBase + '?auth=' + encodeURIComponent(cfg.secret || ''), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ method: 'call', params: ['flclash', method, params || {}] })
+      }).then(function (reply) {
+        if (reply && reply.code) {
+          const err = new Error(reply.error || '操作失败');
+          err.code = reply.code;
+          throw err;
+        }
+        return reply;
+      });
+    },
+    coreInfo: function () {
+      if (cfg.mock && mock && typeof mock.coreInfo === 'function') return mock.coreInfo();
+      return this.ubus('core_type', {});
+    },
+    coreUpdate: function (core) {
+      if (cfg.mock && mock && typeof mock.coreUpdate === 'function') return mock.coreUpdate(core);
+      return this.ubus('core_update', { core: core });
+    },
+    coreUpdateStatus: function () {
+      if (cfg.mock && mock && typeof mock.coreUpdateStatus === 'function') return mock.coreUpdateStatus();
+      return this.ubus('core_update_status', {});
+    },
+    coreSwitch: function (core) {
+      if (cfg.mock && mock && typeof mock.coreSwitch === 'function') return mock.coreSwitch(core);
+      return this.ubus('core_switch', { core: core });
     },
 
     importProfile: function (profileUrl) {

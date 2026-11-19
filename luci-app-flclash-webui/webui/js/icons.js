@@ -12,7 +12,7 @@ window.FlClashIcons = (function () {
     proxies: 'language',
     profiles: 'description',
     requests: 'schedule',
-    tools: 'handyman',
+    tools: 'work',
     edit: 'edit',
     check: 'check_circle',
     pause: 'pause',

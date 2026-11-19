@@ -80,9 +80,21 @@
     });
 
     ui.$('[data-act="close-all"]', root).addEventListener('click', function () {
-      ctx.state.connections = [];
-      render();
-      ui.toast('已清空当前视图');
+      const list = (ctx.state.connections || []).slice();
+      if (!list.length) { ui.toast('当前没有连接'); return; }
+      ui.confirmSheet('关闭所有连接', '确定关闭当前 ' + list.length + ' 条连接吗?', function () {
+        const button = ui.$('[data-act="close-all"]', root);
+        button.disabled = true;
+        Promise.all(list.map(function (item) {
+          return api.closeConnection(item.id).catch(function () { return null; });
+        })).then(function () {
+          ctx.state.connections = [];
+          render();
+          ui.toast('已关闭 ' + list.length + ' 条连接', 'ok');
+        }).catch(function (error) {
+          ui.toast('关闭失败: ' + error.message, 'error');
+        }).then(function () { button.disabled = false; });
+      });
     });
 
     render();

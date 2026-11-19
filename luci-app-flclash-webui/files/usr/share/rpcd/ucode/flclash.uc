@@ -9,8 +9,10 @@
  *   service_state       (read)  { running, enabled } of flclash-core
  *   service_toggle      (write) { action: start|stop|restart } via init.d
  *   core_log            (read)  recent mihomo/flclash lines from logread
- *   core_update         (write) spawn /usr/libexec/flclash/core-update.sh
- *   core_update_status  (read)  { state, log, core_version }
+ *   core_update         (write) spawn core-update.sh with a core argument
+ *   core_update_status  (read)  { state, log, core_version, core_type }
+ *   core_type           (read)  active core + installed binaries
+ *   core_switch         (write) persist the selected core (mihomo|sing-box)
  */
 'use strict';
 
@@ -52,6 +54,15 @@ function core_state() {
 function update_state() {
 	const raw = readfile('/tmp/flclash-update.state');
 	return (raw == null) ? 'idle' : replace(trim(raw), '\n', '');
+}
+
+function active_core_type() {
+	const all = get_all('flclash');
+	const main = all.main || {};
+	let type = main.core_type || 'mihomo';
+	if (type != 'mihomo' && type != 'sing-box')
+		type = 'mihomo';
+	return type;
 }
 
 const methods = {
@@ -128,27 +139,66 @@ const methods = {
 	},
 
 	core_update: {
-		call: function () {
+		call: function (request) {
+			let core = (request?.args?.core != null) ? request.args.core : 'mihomo';
+			if (core != 'mihomo' && core != 'sing-box')
+				return { code: 1, error: '未知内核类型' };
+
 			const state = update_state();
 			if (state == 'running')
 				return { code: 1, error: '已有更新任务在执行' };
 
 			system('echo running > /tmp/flclash-update.state; : > /tmp/flclash-update.log');
-			system('/usr/libexec/flclash/core-update.sh >/tmp/flclash-update.log 2>&1 &');
-			return { code: 0, state: 'running' };
-		}
+			system('/usr/libexec/flclash/core-update.sh ' + core + ' >/tmp/flclash-update.log 2>&1 &');
+			return { code: 0, state: 'running', core: core };
+		},
+		args: { core: 'mihomo | sing-box' }
 	},
 
 	core_update_status: {
 		call: function () {
 			const state = update_state();
 			const log = readfile('/tmp/flclash-update.log');
+			const type = active_core_type();
+			const ver = (type == 'sing-box')
+				? trim(run('/usr/bin/sing-box -v 2>/dev/null | head -n1'))
+				: trim(run('/usr/bin/mihomo -v 2>/dev/null | head -n1'));
 			return {
 				state: state,
 				log: (log == null) ? '' : log,
-				core_version: trim(run('/usr/bin/mihomo -v 2>/dev/null | head -n1'))
+				core_version: ver,
+				core_type: type
 			};
 		}
+	},
+
+	core_type: {
+		call: function () {
+			return {
+				active: active_core_type(),
+				mihomo_installed: (system('[ -x /usr/bin/mihomo ]') == 0),
+				singbox_installed: (system('[ -x /usr/bin/sing-box ]') == 0),
+				mihomo_version: trim(run('/usr/bin/mihomo -v 2>/dev/null | head -n1')),
+				singbox_version: trim(run('/usr/bin/sing-box -v 2>/dev/null | head -n1'))
+			};
+		}
+	},
+
+	core_switch: {
+		call: function (request) {
+			const core = (request?.args?.core != null) ? request.args.core : null;
+			if (core != 'mihomo' && core != 'sing-box')
+				return { code: 1, error: '未知内核类型' };
+			const bin = (core == 'sing-box') ? '/usr/bin/sing-box' : '/usr/bin/mihomo';
+			if (system('[ -x ' + bin + ' ]') != 0)
+				return { code: 1, error: '内核未安装,请先在线更新' };
+
+			system('uci -q set flclash.main.core_type=' + core);
+			system('uci -q commit flclash');
+			system('/etc/init.d/flclash-core restart >/dev/null 2>&1');
+			return { code: 0, core: core, running: core_state().running };
+		},
+		args: { core: 'mihomo | sing-box' }
 	}
 };
 

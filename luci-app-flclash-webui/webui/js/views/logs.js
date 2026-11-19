@@ -6,6 +6,7 @@
   const icon = window.FlClashIcons.svg;
 
   function logs(ctx) {
+    const api = ctx.api;
     const root = document.createElement('div');
     root.className = 'view page';
     let level = '';

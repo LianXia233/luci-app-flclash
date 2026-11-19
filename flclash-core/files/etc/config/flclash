@@ -10,6 +10,7 @@ config flclash 'main'
 	option mode 'rule'
 	option log_level 'info'
 	option tun_enabled '0'
+	option core_type 'mihomo'
 
 config flclash 'api'
 	option enabled '1'
