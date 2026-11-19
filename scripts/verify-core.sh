@@ -3,7 +3,7 @@
 # Usage: ./verify-core.sh [binary-dir]
 set -eu
 
-DIR="${1:-./flclash-core/files/usr/bin}"
+DIR="${1:-./luci-app-flclash/files/usr/bin}"
 FAIL=0
 
 check() {

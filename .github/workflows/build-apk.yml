@@ -1,258 +1,344 @@
-name: Build FlClash OpenWrt apk (aarch64_cortex-a53)
+name: Build single-package APK (ImmortalWrt stable + snapshot)
+
+# ---------------------------------------------------------------------------
+# Layout
+#   binaries : Rust + Go are built ONCE per arch with their OWN official SDKs
+#              (rustup / go toolchain). No OpenWrt SDK is involved here.
+#   package  : the OpenWrt SDK only assembles/signs ONE apk per (channel, arch).
+#              Build/Compile is empty, so the SDK never builds Rust.
+#   release  : one release, four single-package apks.
+# ---------------------------------------------------------------------------
 
 on:
   workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Publish the release after a successful build'
+        type: boolean
+        default: true
   push:
     branches: [main]
     tags: ['v*']
+    paths:
+      - 'luci-app-flclash/**'
+      - 'flclash-api/**'
+      - 'scripts/**'
+      - '.github/workflows/build-apk.yml'
+      - 'README.md'
 
 permissions:
   contents: write
 
 env:
-  TARGET_SUBTARGET: mediatek/filogic
-  SDK_DIR: sdk
-  RELEASE_TAG: apk-aarch64-cortex-a53-v1.0.0
+  PKG_VERSION: 1.2.0
+  PKG_RELEASE: 1
 
 jobs:
-  build:
+  # -------------------------------------------------------------------------
+  # 1) Prebuilt binaries — official toolchains only
+  # -------------------------------------------------------------------------
+  binaries:
+    name: Binaries (${{ matrix.platform }})
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: arm64-a53
+            rust_target: aarch64-unknown-linux-musl
+            rust_arch: aarch64
+            goarch: arm64
+            goenv: GOARM64=v8.0
+            core_bin: mihomo-arm64
+            expect: 'ARM aarch64'
+          - platform: x86-64
+            rust_target: x86_64-unknown-linux-musl
+            rust_arch: x86-64
+            goarch: amd64
+            goenv: GOAMD64=v1
+            core_bin: mihomo-amd64
+            expect: 'x86-64'
     steps:
-      - name: Checkout
-        uses: actions/checkout@v5
+      - uses: actions/checkout@v5
 
-      - name: Install build dependencies
+      - name: Install host build deps
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential clang flex bison g++ gawk gcc-multilib \
-            g++-multilib gettext git libncurses-dev libssl-dev python3 \
-            rsync unzip zlib1g-dev file wget curl zstd xz-utils
+            build-essential clang file binutils curl ca-certificates git zstd
 
-      - name: Setup Rust (stable, aarch64-musl)
+      # Rust official SDK: rustup + rust-std for the musl target.
+      # NOT the OpenWrt SDK, NOT an OP rust package.
+      - name: Rust official toolchain (rustup)
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-unknown-linux-musl
+          targets: ${{ matrix.rust_target }}
+          components: rustfmt
 
-      - name: Build FlClash API + core-bridge (Rust/Tokio, static musl)
+      - name: Rust tests + static musl build (official SDK)
+        working-directory: flclash-api
         run: |
-          mkdir -p "$GITHUB_WORKSPACE/flclash-api/files/usr/bin"
-          cd flclash-api
-          cargo test
-          RUSTFLAGS="-C link-self-contained=yes -C linker=rust-lld" \
-            cargo build --release --target aarch64-unknown-linux-musl --bins
-          file target/aarch64-unknown-linux-musl/release/flclash-api \
-               target/aarch64-unknown-linux-musl/release/flclash-core-bridge
-          cp target/aarch64-unknown-linux-musl/release/flclash-api files/usr/bin/flclash-api
-          cp target/aarch64-unknown-linux-musl/release/flclash-core-bridge files/usr/bin/flclash-core-bridge
+          set -euo pipefail
+          cargo --version
+          rustc --version --verbose
+          cargo test --locked
+          cargo build --release --locked --target "${{ matrix.rust_target }}" --bins
+          for b in flclash-api flclash-core-bridge; do
+            f="target/${{ matrix.rust_target }}/release/$b"
+            file "$f"
+            file "$f" | grep -q 'ELF' || { echo "$b: not ELF"; exit 1; }
+            file "$f" | grep -Eq 'statically linked|static-pie linked' \
+              || { echo "$b: not static"; exit 1; }
+            file "$f" | grep -q '${{ matrix.expect }}' \
+              || { echo "$b: wrong arch"; exit 1; }
+          done
 
-      - name: Fetch FlClash source and core submodule
+      - name: Fetch FlClash core source
         run: |
           git clone --depth 1 https://github.com/chen08209/FlClash.git "$RUNNER_TEMP/FlClash"
           cd "$RUNNER_TEMP/FlClash"
           git -c url.https://github.com/.insteadOf=git@github.com: \
             submodule update --init --depth 1 core/Clash.Meta
-          # The native IPC entry point is core/cmd/core (module `core`), not the
-          # Clash.Meta CLI root. Building ./cmd/core keeps the source pristine.
           echo "FLCLASH_CORE=$RUNNER_TEMP/FlClash/core" >> "$GITHUB_ENV"
 
-      - name: Setup Go (FlClash core requires go >= 1.27)
+      - name: Go official toolchain
         uses: actions/setup-go@v6
         with:
           go-version: '1.27'
-          cache-dependency-path: "${{ env.FLCLASH_CORE }}/go.sum"
+          cache: false
 
-      - name: Build static FlClash IPC core (linux/arm64, cortex-a53)
+      - name: Build static IPC core (official Go toolchain)
         run: |
-          mkdir -p "$GITHUB_WORKSPACE/flclash-core/files/usr/bin"
+          set -euo pipefail
+          mkdir -p luci-app-flclash/files/usr/bin
           cd "$FLCLASH_CORE"
-          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 GOARM64=v8.0 GOTOOLCHAIN=local \
-            go build -tags with_gvisor -ldflags "-w -s" \
-              -o "$GITHUB_WORKSPACE/flclash-core/files/usr/bin/mihomo-arm64" ./cmd/core
-          file "$GITHUB_WORKSPACE/flclash-core/files/usr/bin/mihomo-arm64"
+          env CGO_ENABLED=0 GOOS=linux GOARCH=${{ matrix.goarch }} ${{ matrix.goenv }} \
+              GOTOOLCHAIN=local go build -tags with_gvisor -ldflags "-w -s" \
+              -o "$GITHUB_WORKSPACE/luci-app-flclash/files/usr/bin/${{ matrix.core_bin }}" ./cmd/core
+          f="$GITHUB_WORKSPACE/luci-app-flclash/files/usr/bin/${{ matrix.core_bin }}"
+          file "$f"
+          file "$f" | grep -q 'statically linked' || { echo "core not static"; exit 1; }
 
-      - name: Download OpenWrt SNAPSHOT SDK (mediatek/filogic)
+      - name: Stage Rust binaries into the single package
         run: |
-          BASE="https://downloads.openwrt.org/snapshots/targets/${TARGET_SUBTARGET}"
+          set -euo pipefail
+          cp "flclash-api/target/${{ matrix.rust_target }}/release/flclash-api" \
+             luci-app-flclash/files/usr/bin/flclash-api
+          cp "flclash-api/target/${{ matrix.rust_target }}/release/flclash-core-bridge" \
+             luci-app-flclash/files/usr/bin/flclash-core-bridge
+          # Normalize the core name: the package always ships /usr/bin/mihomo.
+          mv "luci-app-flclash/files/usr/bin/${{ matrix.core_bin }}" \
+             luci-app-flclash/files/usr/bin/mihomo
+          chmod 0755 luci-app-flclash/files/usr/bin/*
+          ls -lh luci-app-flclash/files/usr/bin/
+          sha256sum luci-app-flclash/files/usr/bin/*
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v6
+        with:
+          name: bins-${{ matrix.platform }}
+          path: luci-app-flclash/files/usr/bin/*
+          if-no-files-found: error
+
+  # -------------------------------------------------------------------------
+  # 2) Single apk per (channel, arch) — SDK only assembles, never builds Rust
+  # -------------------------------------------------------------------------
+  package:
+    name: APK ${{ matrix.channel }} / ${{ matrix.arch }}
+    needs: binaries
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - channel: immortalwrt-25.12.2
+            sdk_base: https://downloads.immortalwrt.org/releases/25.12.2/targets/mediatek/filogic
+            sdk_glob: 'immortalwrt-sdk-25.12.2-mediatek-filogic_gcc-.*\.Linux-x86_64\.tar\.zst'
+            subtarget: mediatek/filogic
+            arch: aarch64_cortex-a53
+            platform: arm64-a53
+            expect_file: 'ARM aarch64'
+          - channel: immortalwrt-25.12.2
+            sdk_base: https://downloads.immortalwrt.org/releases/25.12.2/targets/x86/64
+            sdk_glob: 'immortalwrt-sdk-25.12.2-x86-64_gcc-.*\.Linux-x86_64\.tar\.zst'
+            subtarget: x86/64
+            arch: x86_64
+            platform: x86-64
+            expect_file: 'x86-64'
+          - channel: immortalwrt-snapshot
+            sdk_base: https://downloads.immortalwrt.org/snapshots/targets/mediatek/filogic
+            sdk_glob: 'immortalwrt-sdk-mediatek-filogic_gcc-.*\.Linux-x86_64\.tar\.zst'
+            subtarget: mediatek/filogic
+            arch: aarch64_cortex-a53
+            platform: arm64-a53
+            expect_file: 'ARM aarch64'
+          - channel: immortalwrt-snapshot
+            sdk_base: https://downloads.immortalwrt.org/snapshots/targets/x86/64
+            sdk_glob: 'immortalwrt-sdk-x86-64_gcc-.*\.Linux-x86_64\.tar\.zst'
+            subtarget: x86/64
+            arch: x86_64
+            platform: x86-64
+            expect_file: 'x86-64'
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install packaging deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
+            gettext git libncurses-dev libssl-dev python3 perl rsync unzip zlib1g-dev \
+            file wget curl zstd xz-utils ca-certificates
+
+      - name: Download ${{ matrix.channel }} SDK (${{ matrix.subtarget }})
+        run: |
+          set -euo pipefail
+          BASE="${{ matrix.sdk_base }}"
           echo "SDK base: $BASE"
-          SDK_FILE=$(curl -fsSL "$BASE/" \
-            | grep -oE 'openwrt-sdk-[^"<> ]+\.tar\.zst' | sort -u | head -n1)
-          test -n "$SDK_FILE" || { echo "SDK not found at $BASE"; exit 1; }
-          echo "Using SDK: $SDK_FILE"
-          curl -fsSL "$BASE/$SDK_FILE" -o "$RUNNER_TEMP/sdk.tar.zst"
-          mkdir -p "$SDK_DIR"
-          tar --zstd -xf "$RUNNER_TEMP/sdk.tar.zst" -C "$SDK_DIR" --strip-components=1
+          file=""
+          for attempt in 1 2 3 4 5; do
+            listing=$(curl -fsSL --retry 5 --retry-all-errors --max-time 120 "$BASE/" || true)
+            file=$(printf '%s\n' "$listing" | grep -oE '[^"/]+\.tar\.zst' \
+                   | grep -E '${{ matrix.sdk_glob }}' | sort -u | head -n1 || true)
+            [ -n "$file" ] && break
+            echo "listing attempt $attempt failed, retrying..."
+            sleep 10
+          done
+          test -n "$file" || { echo "SDK not found at $BASE"; exit 1; }
+          echo "Using SDK: $file"
+          curl -fSL --retry 5 --retry-all-errors --max-time 900 "$BASE/$file" -o "$RUNNER_TEMP/sdk.tar.zst"
+          du -h "$RUNNER_TEMP/sdk.tar.zst"
+          mkdir -p sdk
+          tar --zstd -xf "$RUNNER_TEMP/sdk.tar.zst" -C sdk --strip-components=1
+          test -f sdk/rules.mk
 
-      - name: Stage packages into SDK
-        run: |
-          mkdir -p "$SDK_DIR/package/flclash-core" \
-                   "$SDK_DIR/package/flclash-api" \
-                   "$SDK_DIR/package/luci-app-flclash-webui"
-          cp -a "$GITHUB_WORKSPACE/flclash-core/." "$SDK_DIR/package/flclash-core/"
-          cp -a "$GITHUB_WORKSPACE/flclash-api/." "$SDK_DIR/package/flclash-api/"
-          cp -a "$GITHUB_WORKSPACE/luci-app-flclash-webui/." "$SDK_DIR/package/luci-app-flclash-webui/"
+      - name: Fetch prebuilt binaries (no compilation here)
+        uses: actions/download-artifact@v6
+        with:
+          name: bins-${{ matrix.platform }}
+          path: luci-app-flclash/files/usr/bin
 
-      - name: Build apk packages
+      - name: Verify binaries and arch gate
         run: |
-          cd "$SDK_DIR"
+          set -euo pipefail
+          ls -lh luci-app-flclash/files/usr/bin/
+          for b in mihomo flclash-api flclash-core-bridge; do
+            f="luci-app-flclash/files/usr/bin/$b"
+            test -f "$f" || { echo "missing $b"; exit 1; }
+            chmod 0755 "$f"
+            file "$f" | grep -q 'ELF' || { echo "$b not ELF"; exit 1; }
+            file "$f" | grep -q '${{ matrix.expect_file }}' \
+              || { echo "$b arch mismatch (expected ${{ matrix.expect_file }})"; exit 1; }
+            if readelf -l "$f" 2>/dev/null | grep -q INTERP; then
+              echo "$b has an interpreter (not static)"; exit 1
+            fi
+          done
+          echo "arch gate OK for ${{ matrix.arch }}"
+
+      - name: Stage the single package into the SDK
+        run: |
+          set -euo pipefail
+          rm -rf sdk/package/luci-app-flclash
+          mkdir -p sdk/package
+          cp -a luci-app-flclash sdk/package/luci-app-flclash
+          # Belt and braces: the OP SDK must never see Rust sources.
+          rm -rf sdk/package/luci-app-flclash/flclash-api
+          test -x sdk/package/luci-app-flclash/files/usr/bin/mihomo
+          test -x sdk/package/luci-app-flclash/files/usr/bin/flclash-api
+          test -x sdk/package/luci-app-flclash/files/usr/bin/flclash-core-bridge
+
+      - name: Build the apk (SDK assemble only)
+        run: |
+          set -euo pipefail
+          cd sdk
           make defconfig
-          make -j"$(nproc)" package/flclash-core/compile
-          make -j"$(nproc)" package/flclash-api/compile
-          make -j"$(nproc)" package/luci-app-flclash-webui/compile
-          echo "=== built flclash apk ==="
-          find bin -type f \( \
-            -name 'flclash-core-*.apk' -o \
-            -name 'flclash-api-*.apk' -o \
-            -name 'luci-app-flclash-webui-*.apk' \) -print
+          make -j"$(nproc)" package/luci-app-flclash/compile V=s
+          echo "=== apk candidates ==="
+          find bin -type f -name 'luci-app-flclash*.apk' -print
 
-      - name: Collect artifacts
+      - name: Collect + validate exactly one apk
         run: |
-          mkdir -p "$GITHUB_WORKSPACE/artifacts"
-          find "$SDK_DIR/bin" -type f \
-            \( -name 'flclash-core-*.apk' -o \
-               -name 'flclash-api-*.apk' -o \
-               -name 'luci-app-flclash-webui-*.apk' \) \
-            -exec cp -v {} "$GITHUB_WORKSPACE/artifacts/" \;
-          ls -lh "$GITHUB_WORKSPACE/artifacts"
-          test "$(find "$GITHUB_WORKSPACE/artifacts" -name '*.apk' | wc -l)" -ge 3 \
-            || { echo "Expected 3 flclash apk, got fewer"; exit 1; }
+          set -euo pipefail
+          mkdir -p dist
+          mapfile -t apks < <(find sdk/bin -type f -name 'luci-app-flclash*.apk' | sort)
+          echo "found ${#apks[@]} apk(s)"
+          [ "${#apks[@]}" -eq 1 ] || { printf '%s\n' "${apks[@]}"; echo "expected exactly ONE apk"; exit 1; }
+          src="${apks[0]}"
+          out="dist/luci-app-flclash_${PKG_VERSION}-r${PKG_RELEASE}_${{ matrix.arch }}_${{ matrix.channel }}.apk"
+          cp "$src" "$out"
+          echo "== apk metadata =="
+          ls -lh "$out"
+          file "$out"
+          echo "== control section =="
+          tar -tzvf "$out" || true
+          echo "== payload sample =="
+          tar -xzOf "$out" ./usr/bin/mihomo 2>/dev/null | head -c 4 | od -An -tx1 || true
+          sha256sum "$out" | tee "$out.sha256"
+          echo "SINGLE_APK=$out" >> "$GITHUB_ENV"
 
-      - name: Upload apk artifact
+      - name: Upload the single apk
         uses: actions/upload-artifact@v6
         with:
-          name: flclash-apk-aarch64-cortex-a53
-          path: artifacts/*.apk
+          name: apk-${{ matrix.channel }}-${{ matrix.arch }}
+          path: dist/*.apk
           if-no-files-found: error
 
-      - name: Publish Release
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: ${{ env.RELEASE_TAG }}
-          name: FlClash OpenWrt apk - aarch64_cortex-a53
-          body: |
-            FlClash WebUI + native-IPC core + Rust/Tokio bridge + core-bridge for OpenWrt master / SNAPSHOT (aarch64_cortex-a53).
-
-            Packages:
-            - flclash-core: static FlClash native-IPC core (go build ./cmd/core), installed as /usr/bin/mihomo; driven by flclash-core-bridge over IPC (core.init/setup/listener.start), no source patching
-            - flclash-api: Rust/Tokio bridge (static musl), exposes /flclash/api on port 9098; subscription conversion, graceful stop-core degradation, DNS/DoT/DoH profile
-            - flclash-core-bridge (inside flclash-api package): native IPC host with auto respawn/re-handshake
-            - luci-app-flclash-webui: LuCI launcher (service switch, core update, logs) + HTML5 WebUI, switchable mihomo/sing-box core
-          files: artifacts/*.apk
-          generate_release_notes: false
-          fail_on_unmatched_files: false
-
-  build-x86:
-    name: Build x86_64 (generic)
+  # -------------------------------------------------------------------------
+  # 3) One release with exactly four assets
+  # -------------------------------------------------------------------------
+  release:
+    name: Release v${{ env.PKG_VERSION }}
+    needs: package
+    if: |
+      startsWith(github.ref, 'refs/tags/v') ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish == true)
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
-    env:
-      TARGET_SUBTARGET: x86/64
-      SDK_DIR: sdk-x86
-      RELEASE_TAG: apk-x86-64-v1.0.0
     steps:
-      - name: Checkout
-        uses: actions/checkout@v5
+      - uses: actions/checkout@v5
 
-      - name: Install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential clang flex bison g++ gawk gcc-multilib \
-            g++-multilib gettext git libncurses-dev libssl-dev python3 \
-            rsync unzip zlib1g-dev file wget curl zstd xz-utils
-
-      - name: Setup Rust (stable, x86_64-musl)
-        uses: dtolnay/rust-toolchain@stable
+      - name: Download all apk artifacts
+        uses: actions/download-artifact@v6
         with:
-          targets: x86_64-unknown-linux-musl
+          pattern: apk-*
+          path: release
+          merge-multiple: true
 
-      - name: Build FlClash API + core-bridge (Rust/Tokio, static musl, x86_64)
+      - name: Inventory
         run: |
-          mkdir -p "$GITHUB_WORKSPACE/flclash-api/files/usr/bin"
-          cd flclash-api
-          RUSTFLAGS="-C link-self-contained=yes -C linker=rust-lld" \
-            cargo build --release --target x86_64-unknown-linux-musl --bins
-          file target/x86_64-unknown-linux-musl/release/flclash-api \
-               target/x86_64-unknown-linux-musl/release/flclash-core-bridge
-          cp target/x86_64-unknown-linux-musl/release/flclash-api files/usr/bin/flclash-api
-          cp target/x86_64-unknown-linux-musl/release/flclash-core-bridge files/usr/bin/flclash-core-bridge
+          set -euo pipefail
+          ls -lh release
+          n=$(find release -name '*.apk' | wc -l)
+          test "$n" -eq 4 || { echo "expected 4 apks, got $n"; exit 1; }
+          ( cd release && sha256sum *.apk > sha256sums.txt )
+          cat release/sha256sums.txt
 
-      - name: Fetch FlClash source and core submodule
-        run: |
-          git clone --depth 1 https://github.com/chen08209/FlClash.git "$RUNNER_TEMP/FlClash"
-          cd "$RUNNER_TEMP/FlClash"
-          git -c url.https://github.com/.insteadOf=git@github.com: \
-            submodule update --init --depth 1 core/Clash.Meta
-          echo "FLCLASH_CORE=$RUNNER_TEMP/FlClash/core" >> "$GITHUB_ENV"
-
-      - name: Setup Go (FlClash core requires go >= 1.27)
-        uses: actions/setup-go@v6
-        with:
-          go-version: '1.27'
-          cache-dependency-path: "${{ env.FLCLASH_CORE }}/go.sum"
-
-      - name: Build static FlClash IPC core (GOAMD64=v1, generic x86_64)
-        run: |
-          mkdir -p "$GITHUB_WORKSPACE/flclash-core/files/usr/bin"
-          cd "$FLCLASH_CORE"
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOAMD64=v1 GOTOOLCHAIN=local \
-            go build -tags with_gvisor -ldflags "-w -s" \
-              -o "$GITHUB_WORKSPACE/flclash-core/files/usr/bin/mihomo-amd64" ./cmd/core
-          file "$GITHUB_WORKSPACE/flclash-core/files/usr/bin/mihomo-amd64"
-
-      - name: Download OpenWrt SNAPSHOT SDK (x86/64)
-        run: |
-          BASE="https://downloads.openwrt.org/snapshots/targets/${TARGET_SUBTARGET}"
-          SDK_FILE=$(curl -fsSL "$BASE/" | grep -oE 'openwrt-sdk-[^"<> ]+\.tar\.zst' | sort -u | head -n1)
-          test -n "$SDK_FILE" || { echo "SDK not found at $BASE"; exit 1; }
-          echo "Using SDK: $SDK_FILE"
-          curl -fsSL "$BASE/$SDK_FILE" -o "$RUNNER_TEMP/sdk.tar.zst"
-          mkdir -p "$SDK_DIR"
-          tar --zstd -xf "$RUNNER_TEMP/sdk.tar.zst" -C "$SDK_DIR" --strip-components=1
-
-      - name: Stage packages into SDK
-        run: |
-          mkdir -p "$SDK_DIR/package/flclash-core" \
-                   "$SDK_DIR/package/flclash-api" \
-                   "$SDK_DIR/package/luci-app-flclash-webui"
-          cp -a "$GITHUB_WORKSPACE/flclash-core/." "$SDK_DIR/package/flclash-core/"
-          cp -a "$GITHUB_WORKSPACE/flclash-api/." "$SDK_DIR/package/flclash-api/"
-          cp -a "$GITHUB_WORKSPACE/luci-app-flclash-webui/." "$SDK_DIR/package/luci-app-flclash-webui/"
-
-      - name: Build apk packages
-        run: |
-          cd "$SDK_DIR"
-          make defconfig
-          make -j"$(nproc)" package/flclash-core/compile
-          make -j"$(nproc)" package/flclash-api/compile
-          make -j"$(nproc)" package/luci-app-flclash-webui/compile
-          find bin -type f \( -name 'flclash-core-*.apk' -o -name 'flclash-api-*.apk' -o -name 'luci-app-flclash-webui-*.apk' \) -print
-
-      - name: Collect artifacts
-        run: |
-          mkdir -p "$GITHUB_WORKSPACE/artifacts-x86"
-          find "$SDK_DIR/bin" -type f \
-            \( -name 'flclash-core-*.apk' -o -name 'flclash-api-*.apk' -o -name 'luci-app-flclash-webui-*.apk' \) \
-            -exec cp -v {} "$GITHUB_WORKSPACE/artifacts-x86/" \;
-          test "$(find "$GITHUB_WORKSPACE/artifacts-x86" -name '*.apk' | wc -l)" -ge 3 \
-            || { echo "Expected 3 flclash apk"; exit 1; }
-
-      - name: Upload apk artifact
-        uses: actions/upload-artifact@v6
-        with:
-          name: flclash-apk-x86-64
-          path: artifacts-x86/*.apk
-          if-no-files-found: error
-
-      - name: Publish Release
+      - name: Publish release
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ env.RELEASE_TAG }}
-          name: FlClash OpenWrt apk - x86_64 (generic GOAMD64=v1)
+          tag_name: v${{ env.PKG_VERSION }}
+          name: FlClash v${{ env.PKG_VERSION }} — ImmortalWrt single-package APK
           body: |
-            FlClash WebUI + native-IPC core + Rust/Tokio bridge + core-bridge for OpenWrt x86_64 (generic).
-            Core runs via IPC host (core.init/setup/listener.start); switchable mihomo/sing-box.
-          files: artifacts-x86/*.apk
-          generate_release_notes: false
-          fail_on_unmatched_files: false
+            Single-package **luci-app-flclash** (Go core + Rust bridge + LuCI + WebUI in ONE apk).
+
+            | File | Arch | Target SDK |
+            | --- | --- | --- |
+            | `luci-app-flclash_${{ env.PKG_VERSION }}-r${{ env.PKG_RELEASE }}_aarch64_cortex-a53_immortalwrt-25.12.2.apk` | ARM64-A53 | ImmortalWrt 25.12.2 (mediatek/filogic) |
+            | `luci-app-flclash_${{ env.PKG_VERSION }}-r${{ env.PKG_RELEASE }}_x86_64_immortalwrt-25.12.2.apk` | x86_64 | ImmortalWrt 25.12.2 (x86/64) |
+            | `luci-app-flclash_${{ env.PKG_VERSION }}-r${{ env.PKG_RELEASE }}_aarch64_cortex-a53_immortalwrt-snapshot.apk` | ARM64-A53 | ImmortalWrt snapshot (mediatek/filogic) |
+            | `luci-app-flclash_${{ env.PKG_VERSION }}-r${{ env.PKG_RELEASE }}_x86_64_immortalwrt-snapshot.apk` | x86_64 | ImmortalWrt snapshot (x86/64) |
+
+            Install:
+            ```sh
+            apk add --allow-untrusted ./luci-app-flclash_*.apk
+            ```
+
+            Build facts:
+            - Rust (`flclash-api`, `flclash-core-bridge`) compiled by the **official Rust SDK** (rustup + rust-std musl), static, rust-lld; the OpenWrt SDK only assembles the package.
+            - Go core (`mihomo`, FlClash native-IPC) compiled by the official Go toolchain: ARM64 `GOARM64=v8.0`, x86_64 `GOAMD64=v1`, CGO disabled, `with_gvisor`.
+            - 4 assets total; every other package stays untouched in the SDK.
+          files: |
+            release/*.apk
+            release/sha256sums.txt
+          fail_on_unmatched_files: true

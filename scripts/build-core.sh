@@ -12,7 +12,7 @@
 # Usage: ./build-core.sh [output-dir] [go-binary]
 set -eu
 
-OUT="${1:-./flclash-core/files/usr/bin}"
+OUT="${1:-./luci-app-flclash/files/usr/bin}"
 GO="${2:-go}"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"

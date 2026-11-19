@@ -48,13 +48,14 @@ OpenWrt 主线(master)与 SNAPSHOT 快照版。目标架构 `aarch64_cortex-a53`
   `GOARM64=v8.0` / `GOAMD64=v1`),procd 托管,经 flclash-core-bridge 走
   原生 IPC(core.init/setup/listener.start);可在线更新到上游最新版。
 
-## 包与端口
+## 单包与端口
+
+**单包交付**:所有组件合并为一个 `luci-app-flclash` apk,不再拆分
+`flclash-core` / `flclash-api` / `luci-app-flclash-webui`。
 
 | 包 | 作用 | 安装内容 |
 | --- | --- | --- |
-| `flclash-core` | mihomo 内核 + IPC 桥 | `/usr/bin/mihomo`、`/usr/bin/flclash-core-bridge`、`/etc/init.d/flclash-core`、`/etc/config/flclash` |
-| `flclash-api` | API 桥接 + sing-box 转换(Rust) | `/usr/bin/flclash-api`、`/etc/init.d/flclash-api` |
-| `luci-app-flclash-webui` | LuCI 入口 + WebUI | menu、ACL、launch 视图、rpcd 对象、core-update.sh、`/www/flclash/` |
+| `luci-app-flclash` | 内核 + IPC 桥 + API 桥 + LuCI + WebUI | `/usr/bin/mihomo`、`/usr/bin/flclash-core-bridge`、`/usr/bin/flclash-api`、`/etc/init.d/{flclash-core,flclash-api,flclash-proxy}`、`/etc/config/flclash`、`/usr/libexec/flclash/*.sh`、menu/ACL/rpcd 对象、`/www/flclash/` |
 
 默认监听:mihomo / sing-box controller `127.0.0.1:9097`、mixed `7892`
 (切换内核端口不变);桥接 / WebUI `0.0.0.0:9098`(LAN);可选 `api.secret`
@@ -88,15 +89,29 @@ OpenWrt 主线(master)与 SNAPSHOT 快照版。目标架构 `aarch64_cortex-a53`
 `core_log`、`core_update` / `core_update_status`(在线更新)、`core_type` /
 `core_switch`(内核查询与切换,支持 `mihomo | sing-box`)。
 
-## CI
+## CI(单包交付)
 
-`.github/workflows/build-apk.yml` 两个并行 job,均为 cargo test → rust-lld 静态
-musl 交叉编译 → 静态内核 → OpenWrt SNAPSHOT SDK 打包三个 apk → 发布 Release:
+`.github/workflows/build-apk.yml` 是「二进制 → 打包 → 发布」三段流水线,
+最终固定 4 个单包 apk:
 
-| job | 目标 | Rust target | 内核 | Release tag |
-| --- | --- | --- | --- | --- |
-| build | aarch64_cortex-a53 (mediatek/filogic) | `aarch64-unknown-linux-musl` | `GOARM64=v8.0` | `apk-aarch64-cortex-a53-v1.0.0` |
-| build-x86 | x86_64 generic (x86/64) | `x86_64-unknown-linux-musl` | `GOAMD64=v1` | `apk-x86-64-v1.0.0` |
+1. **binaries**(2 个架构并行):Rust 只用官方 SDK(rustup + `rust-std`
+   musl target)执行 `cargo test --locked` 与 `rust-lld` 静态链接;
+   Go 用官方工具链编译 FlClash 内核。**这一阶段完全不接触 OpenWrt SDK**。
+2. **package**(4 个组合并行):ImmortalWrt SDK 只负责组装与签名,
+   `Build/Compile` 为空,OP SDK 不会也不允许编译 Rust。
+3. **release**:一次发布恰好 4 个 apk + `sha256sums.txt`。
+
+| channel | SDK | arch | 内核 |
+| --- | --- | --- | --- |
+| immortalwrt-25.12.2 | `immortalwrt-sdk-25.12.2-*` | `aarch64_cortex-a53`(mediatek/filogic) / `x86_64`(x86/64) | `GOARM64=v8.0` / `GOAMD64=v1` |
+| immortalwrt-snapshot | `immortalwrt-sdk-*`(snapshot) | 同上 | 同上 |
+
+产物命名:
+
+```
+luci-app-flclash_<ver>-r<rel>_<arch>_immortalwrt-25.12.2.apk
+luci-app-flclash_<ver>-r<rel>_<arch>_immortalwrt-snapshot.apk
+```
 
 ## 本地构建桥接
 
@@ -114,12 +129,17 @@ cargo build --release --target x86_64-unknown-linux-musl --bins    # x86_64
 
 ## 兼容性
 
-- OpenWrt master / SNAPSHOT(apk);24.10(opkg)同样适用。
+- ImmortalWrt **25.12.2**(apk)与 **snapshot**(apk);两者各自产出独立单包。
 - 内核与桥接均为静态 ELF,无 glibc/musl 运行时依赖。
-- 架构:ARM64 / ARM64-A53(`aarch64`,`GOARM64=v8.0`)与 x86_64
-  (`GOAMD64=v1`,通用);按设备实际架构选择对应 Release 的三个 apk。
-- `flclash-core` 首启自动生成最小 `config.yaml`;订阅导入路径保证写入的
-  配置永远是内核可加载的 YAML。
+- 架构:ARM64-A53(`aarch64_cortex-a53`,`GOARM64=v8.0`)与 x86_64
+  (`GOAMD64=v1`,通用);按设备实际架构选择对应 Release 的**单个 apk**。
+- 首次启动自动生成最小 `config.yaml`;订阅导入路径保证写入的配置永远是
+  内核可加载的 YAML。
+- 安装(签名方为构建 SDK,设备首次安装需显式信任):
+
+```sh
+apk add --allow-untrusted ./luci-app-flclash_*.apk
+```
 
 ## 实测验证
 
