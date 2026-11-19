@@ -155,6 +155,16 @@ ipt_active() {
 	iptables -w -t nat -n -L FLCLASH >/dev/null 2>&1
 }
 
+# iptables counterpart of nft_on(): idempotent guard around ipt_chain so
+# repeated `start` calls do not duplicate rules. Without this wrapper the
+# iptables backend had no ipt_on entry point and always failed to apply.
+ipt_on() {
+	ipt_active && return 0
+	ipt_chain
+	[ $? -eq 0 ] || return 1
+	return 0
+}
+
 rules_on() {
 	if [ "$FIREWALL_BACKEND" = "iptables" ]; then ipt_on; else nft_on; fi
 }

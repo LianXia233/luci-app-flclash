@@ -2,6 +2,7 @@
 scripts/src/
 flclash-core/files/usr/bin/*
 !flclash-core/files/usr/bin/.gitkeep
+target/
 *.apk
 *.ipk
 
