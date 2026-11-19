@@ -373,11 +373,17 @@ make -j"$(nproc)" package/luci-app-flclash/compile V=s
 binaries (2) ──► package (4) ──► release (1)
 ```
 
-SDK tarball 约 570 MB，官方站对**单连接**限速很紧：早先用单流 `curl --max-time 900` 会中途超时并从 0 字节重来，x86_64 25.12.2 那一组因此长期卡死。现在 `package` job 先装 [FluxDown](https://github.com/zerx-lab/FluxDown) CLI（v0.6.8，按发布页 `SHA256SUMS-cli.txt` 校验二进制），再用 `fluxdown add --local -s 16` 做 16 分段下载（`--local` 在进程内嵌引擎，不需要常驻服务），落地后按 SDK 目录的 `sha256sums` 校验，`.sdk-cache` 交给 `actions/cache`，缓存命中的组合直接跳过下载。
+CI 里所有大文件下载统一交给 [FluxDown](https://github.com/zerx-lab/FluxDown) CLI（v0.6.8，安装时按其发布页 `SHA256SUMS-cli.txt` 校验二进制）：
+
+- **OpenWrt SDK**：约 570 MB，`fluxdown add --local -s 16` 16 分段下载，落地后按 SDK 目录的 `sha256sums` 校验，`.sdk-cache` 交给 `actions/cache`，命中即跳过下载。
+- **Go 工具链**：版本与 sha256 从 go.dev 的 JSON 索引解析（`1.27.x` 取最新补丁版），再由 FluxDown 下载并用 `--checksum sha256=…` 校验。
+- **FlClash 源码**：主仓走 codeload tarball；`core/Clash.Meta` 子模块按 gitlink 里的 commit pin 单独拉取，与 `git submodule update` 拉到的内容等价。
+
+官方站对**单连接**限速很紧：早先单流 `curl --max-time 900` 会中途超时并从 0 字节重来，x86_64 25.12.2 那一组因此卡了 45 分钟。rustup 与 apt 仍由它们各自的工具负责（包管理 / 工具链语义，不属于文件下载）。
 
 | 阶段 | 运行内容 | 关键校验 |
 | --- | --- | --- |
-| `binaries` | rustup 官方 SDK + Go 官方工具链；`ring` 的 C 编译器按目标注入（aarch64 → `aarch64-linux-gnu-gcc`，x86_64 → `musl-tools` 的 `musl-gcc`），缺编译器时早失败并给出明确提示 | `cargo test --locked`；ELF / 静态 / 目标架构 |
+| `binaries` | rustup 官方 SDK + FluxDown 下载的 Go 官方工具链；`ring` 的 C 编译器按目标注入（aarch64 → `aarch64-linux-gnu-gcc`，x86_64 → `musl-tools` 的 `musl-gcc`），缺编译器时早失败并给出明确提示 | `cargo test --locked`；ELF / 静态 / 目标架构 |
 | `package` | ImmortalWrt SDK 只组装与签名；四组合并行；SDK 由 **FluxDown CLI**（`--local`、16 分段）下载并校验 `sha256sums`，`actions/cache` 复用 | 架构闸门、无 `INTERP`、**恰好 1 个 apk** |
 | `release` | 汇总产物、生成 `sha256sums.txt` | **恰好 4 个 apk**，再发布 |
 

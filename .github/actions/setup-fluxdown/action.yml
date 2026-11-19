@@ -1,0 +1,33 @@
+name: setup-fluxdown
+description: Install the checksum-verified FluxDown CLI used for large downloads
+
+inputs:
+  version:
+    description: FluxDown release version (without the leading v)
+    required: false
+    default: '0.6.8'
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        set -euo pipefail
+        version="${{ inputs.version }}"
+        base="https://github.com/zerx-lab/FluxDown/releases/download/v${version}"
+        pkg="FluxDown-CLI-${version}-linux-x64.tar.gz"
+        cache="$RUNNER_TEMP/fluxdown"
+        if [ -x "$cache/fluxdown" ]; then
+          echo "FluxDown CLI already installed"
+        else
+          mkdir -p "$cache"
+          curl -fsSL --retry 4 --retry-all-errors -o "$RUNNER_TEMP/fd.tgz" "$base/$pkg"
+          curl -fsSL --retry 4 --retry-all-errors -o "$RUNNER_TEMP/fd.sums" "$base/SHA256SUMS-cli.txt"
+          want=$(awk -v f="$pkg" '$2==f{print $1}' "$RUNNER_TEMP/fd.sums")
+          test -n "$want" || { echo "no checksum for $pkg"; exit 1; }
+          echo "$want  $RUNNER_TEMP/fd.tgz" | sha256sum -c -
+          tar xzf "$RUNNER_TEMP/fd.tgz" -C "$cache" --strip-components=1
+        fi
+        echo "$cache" >> "$GITHUB_PATH"
+        export PATH="$cache:$PATH"
+        fluxdown --version

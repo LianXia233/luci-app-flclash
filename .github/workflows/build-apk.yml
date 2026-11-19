@@ -70,12 +70,23 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - uses: ./.github/actions/setup-fluxdown
+        with:
+          version: ${{ env.FLUXDOWN_VERSION }}
+
       - name: Install host build deps
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential clang file binutils curl ca-certificates git zstd \
-            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu musl-tools
+          set -euo pipefail
+          pkgs="build-essential clang file binutils curl ca-certificates git zstd gcc-aarch64-linux-gnu g++-aarch64-linux-gnu musl-tools"
+          # The runner image ships a working apt index; a blind `apt-get update`
+          # against a throttled mirror is what made this step sit for 10+ min.
+          if ! sudo apt-get install -y --no-install-recommends $pkgs; then
+            echo "install failed, refreshing index once"
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends $pkgs
+          fi
+          musl-gcc --version | head -1
+          aarch64-linux-gnu-gcc --version | head -1
 
       # Rust official SDK: rustup + rust-std for the musl target.
       # NOT the OpenWrt SDK, NOT an OP rust package.
@@ -122,19 +133,58 @@ jobs:
               || { echo "$b: wrong arch"; exit 1; }
           done
 
-      - name: Fetch FlClash core source
+      - name: Fetch FlClash core source (FluxDown tarballs)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          git clone --depth 1 https://github.com/chen08209/FlClash.git "$RUNNER_TEMP/FlClash"
-          cd "$RUNNER_TEMP/FlClash"
-          git -c url.https://github.com/.insteadOf=git@github.com: \
-            submodule update --init --depth 1 core/Clash.Meta
-          echo "FLCLASH_CORE=$RUNNER_TEMP/FlClash/core" >> "$GITHUB_ENV"
+          set -euo pipefail
+          src="$RUNNER_TEMP/FlClash"
+          dl="$RUNNER_TEMP/src-dl"
+          mkdir -p "$src" "$dl"
+          # Host repo: main snapshot, fetched by the same downloader as the SDKs.
+          fluxdown add --local -d "$dl" -o flclash.tar.gz -s 16 \
+            "https://codeload.github.com/chen08209/FlClash/tar.gz/refs/heads/main"
+          tar xzf "$dl/flclash.tar.gz" -C "$src" --strip-components=1
+          # Submodule: resolve the gitlink instead of trusting a branch, so the
+          # pin stays exactly what `git submodule update` would have checked out.
+          meta_sha=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/chen08209/FlClash/contents/core/Clash.Meta" | jq -r .sha)
+          test -n "$meta_sha" -a "$meta_sha" != "null" || { echo "cannot resolve core/Clash.Meta pin"; exit 1; }
+          echo "core/Clash.Meta @ $meta_sha"
+          fluxdown add --local -d "$dl" -o meta.tar.gz -s 16 \
+            "https://codeload.github.com/chen08209/Clash.Meta/tar.gz/$meta_sha"
+          mkdir -p "$src/core/Clash.Meta"
+          tar xzf "$dl/meta.tar.gz" -C "$src/core/Clash.Meta" --strip-components=1
+          test -f "$src/core/go.mod"
+          test -f "$src/core/Clash.Meta/go.mod"
+          echo "FLCLASH_CORE=$src/core" >> "$GITHUB_ENV"
 
-      - name: Go official toolchain
-        uses: actions/setup-go@v6
-        with:
-          go-version: '1.27'
-          cache: false
+      - name: Go official toolchain (FluxDown)
+        env:
+          GO_SERIES: '1.27'
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/godl"
+          # One downloader for everything: the index is small, but keeping all
+          # fetches on FluxDown means a single place decides retries/segments.
+          fluxdown add --local -d "$RUNNER_TEMP/godl" -o go-index.json -s 4 \
+            "https://go.dev/dl/?mode=json&include=all"
+          index="$RUNNER_TEMP/godl/go-index.json"
+          file=$(jq -r --arg s "$GO_SERIES" \
+            '[ .[] | select(.stable) | select(.version | startswith("go" + $s + ".")) ]
+             | sort_by(.version | ltrimstr("go") | split(".") | map(tonumber))
+             | last
+             | .files[] | select(.os == "linux" and .arch == "amd64" and .kind == "archive")
+             | .filename' "$index")
+          test -n "${file:-}" -a "$file" != "null" || { echo "no Go $GO_SERIES linux-amd64 tarball"; exit 1; }
+          sha=$(jq -r --arg f "$file" '[ .[] | .files[] | select(.filename == $f) ] | first | .sha256' "$index")
+          echo "Go: $file ($sha)"
+          fluxdown add --local -d "$RUNNER_TEMP/godl" -o "$file" -s 16 \
+            --checksum "sha256=$sha" "https://go.dev/dl/$file"
+          tar -xzf "$RUNNER_TEMP/godl/$file" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/go/bin" >> "$GITHUB_PATH"
+          echo "GOROOT=$RUNNER_TEMP/go" >> "$GITHUB_ENV"
+          "$RUNNER_TEMP/go/bin/go" version
 
       - name: Build static IPC core (official Go toolchain)
         run: |
@@ -225,22 +275,10 @@ jobs:
           gcc --version | head -1
           zstd --version
 
-      # FluxDown CLI = the multi-threaded downloader. Pinned version, checksum
-      # verified against the release's own SHA256SUMS-cli.txt.
-      - name: Install FluxDown CLI
-        run: |
-          set -euo pipefail
-          base="https://github.com/zerx-lab/FluxDown/releases/download/v${FLUXDOWN_VERSION}"
-          pkg="FluxDown-CLI-${FLUXDOWN_VERSION}-linux-x64.tar.gz"
-          mkdir -p "$RUNNER_TEMP/fluxdown"
-          curl -fsSL --retry 4 --retry-all-errors -o "$RUNNER_TEMP/fd.tgz" "$base/$pkg"
-          curl -fsSL --retry 4 --retry-all-errors -o "$RUNNER_TEMP/fd.sums" "$base/SHA256SUMS-cli.txt"
-          want=$(awk -v f="$pkg" '$2==f{print $1}' "$RUNNER_TEMP/fd.sums")
-          test -n "$want" || { echo "no checksum for $pkg"; exit 1; }
-          echo "$want  $RUNNER_TEMP/fd.tgz" | sha256sum -c -
-          tar xzf "$RUNNER_TEMP/fd.tgz" -C "$RUNNER_TEMP/fluxdown" --strip-components=1
-          echo "$RUNNER_TEMP/fluxdown" >> "$GITHUB_PATH"
-          "$RUNNER_TEMP/fluxdown/fluxdown" --version
+      - uses: ./.github/actions/setup-fluxdown
+        with:
+          version: ${{ env.FLUXDOWN_VERSION }}
+
       - name: Resolve package version from Makefile
         run: |
           set -euo pipefail
