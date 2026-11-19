@@ -38,6 +38,11 @@
         '<button class="btn" data-act="delay" type="button">' + icon('bolt', 16) + '测速</button>' +
         '<button class="btn is-ghost" data-act="sort" type="button">' + icon('swap', 16) + '按延迟</button>' +
       '</div>' +
+      '<section class="card" data-role="pp-card" hidden>' +
+        '<div class="card-head"><span class="glyph" data-icon="folder"></span><span class="card-title">代理提供者</span>' +
+        '<span class="card-end"><span class="chip" data-role="pp-count">0</span></span></div>' +
+        '<div data-role="pp-body"></div>' +
+      '</section>' +
       '<div class="seg-chips" data-role="groups" role="tablist" aria-label="策略组"></div>' +
       '<div data-role="note"></div>' +
       '<div class="node-grid" data-role="nodes"></div>';
@@ -292,6 +297,43 @@
     if (ctx.onTeardown) ctx.onTeardown(off);
 
     ctx.onProxies = function () { renderGroups(); renderNote(); renderNodes(); };
+    // Proxy providers (mihomo /providers/proxies). Hidden when the core has
+    // none or does not support the API — never a fake list.
+    const ppCard = ui.$('[data-role="pp-card"]', root);
+    const ppBody = ui.$('[data-role="pp-body"]', root);
+    const ppCount = ui.$('[data-role="pp-count"]', root);
+    function loadProxyProviders() {
+      api.proxyProviders().then(function (data) {
+        const map = (data && data.providers) || {};
+        const names = Object.keys(map);
+        if (!names.length) { ppCard.hidden = true; return; }
+        ppCard.hidden = false;
+        ppCount.textContent = String(names.length);
+        ppBody.innerHTML = names.map(function (name) {
+          const item = map[name] || {};
+          const remote = item.vehicleType === 'HTTP';
+          return '<div class="settings-row"><div class="row-copy">' +
+            '<div class="row-title is-file">' + ui.esc(name) + '</div>' +
+            '<div class="row-desc">' + (item.count != null ? item.count + ' 个节点' : ui.esc(item.type || '-')) +
+            (item.updatedAt ? ' · ' + ui.esc(String(item.updatedAt).slice(0, 10)) : '') + '</div></div>' +
+            (remote
+              ? '<button class="btn" data-ppupdate="' + ui.esc(name) + '" type="button">' + icon('refresh', 15) + '更新</button>'
+              : '<span class="chip chip-plain">本地</span>') +
+            '</div>';
+        }).join('');
+        ui.$$('[data-ppupdate]', ppBody).forEach(function (button) {
+          button.addEventListener('click', function () {
+            button.disabled = true;
+            api.updateProxyProvider(button.getAttribute('data-ppupdate'))
+              .then(function () { ui.toast('代理提供者已更新', 'ok'); loadProxyProviders(); ctx.refresh && ctx.refresh('proxies'); })
+              .catch(function (error) { ui.toast('更新失败: ' + error.message, 'error'); })
+              .then(function () { button.disabled = false; });
+          });
+        });
+      }).catch(function () { ppCard.hidden = true; });
+    }
+    loadProxyProviders();
+
     return root;
   }
 

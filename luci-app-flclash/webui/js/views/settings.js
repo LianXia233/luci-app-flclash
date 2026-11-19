@@ -100,6 +100,26 @@
       tunStack: ui.$('[data-cfg="tunStack"]', root)
     };
 
+    /* Installed cores come from the same-origin REST bridge (binary probe +
+     * UCI), so the row never shows a hard-coded version. */
+    function fillCoreInfo() {
+      const node = ui.$('[data-role="core-version"]', root);
+      if (!node) return;
+      ctx.api.coreInfo().then(function (info) {
+        const parts = [];
+        parts.push(info.mihomo_installed ? (info.mihomo_version || 'mihomo 已安装') : 'mihomo 未安装');
+        parts.push(info.singbox_installed ? (info.singbox_version || 'sing-box 已安装') : 'sing-box 未安装');
+        node.textContent = parts.join(' · ') + ' · 运行中: ' + (info.active || 'mihomo');
+        const select = controls.coreType;
+        if (select) {
+          ui.$$('option', select).forEach(function (opt) {
+            const installed = opt.value === 'sing-box' ? info.singbox_installed : info.mihomo_installed;
+            opt.textContent = (opt.value === 'sing-box' ? 'sing-box' : 'mihomo (Meta)') + (installed ? '' : '（未安装）');
+          });
+        }
+      }).catch(function () { node.textContent = '读取失败'; });
+    }
+
     function fill() {
       const cfgNow = ctx.state.config || {};
       const statusNow = ctx.state.status || {};
@@ -161,6 +181,11 @@
             ' · REDIR ' + (data.redirPort || 7893) +
             ' · TPROXY ' + (data.tproxyPort || 7894) +
             ' · DNS ' + (data.dnsPort || 1053);
+          // Inbound ports come from the read-only system-proxy contract so
+          // the row shows what clients actually dial, not a guess.
+          ctx.api.systemProxy().then(function (sp) {
+            if (sp) desc.textContent += ' · 混合 ' + (sp.mixed_port || 7892) + ' · 控制 ' + (sp.clash_api_port || 9097);
+          }).catch(function () { /* keep the firewall ports */ });
         }
       }).catch(function () { /* backend not available: leave switch untouched */ });
     }
@@ -180,6 +205,7 @@
     api.config().then(function (data) { ctx.state.config = data; fill(); }).catch(function () { fill(); });
     fill();
     fillProxy();
+    fillCoreInfo();
 
     ['allowLan', 'ipv6', 'tun', 'dnsEnable'].forEach(function (key) {
       controls[key].addEventListener('click', function () { controls[key].classList.toggle('is-on'); });
@@ -221,6 +247,7 @@
           ctx.state.config.coreType = next;
           ui.toast('已切换到 ' + (next === 'sing-box' ? 'sing-box' : 'mihomo') + ' 内核', 'ok');
           fill();
+          fillCoreInfo();
           return ctx.refreshStatus();
         })
         .catch(function (error) {

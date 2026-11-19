@@ -51,8 +51,16 @@
     });
 
     const status = ctx.state.status || {};
-    ui.$('[data-role="version"]', root).textContent = status.version || '—';
+    ui.$('[data-role="version"]', root).textContent = status.apiVersion || '—';
     ui.$('[data-role="core"]', root).textContent = status.coreVersion || '—';
+    // Live controller version wins over the sampled status; when the core is
+    // stopped say so instead of leaving a stale or empty value.
+    ctx.api.version().then(function (info) {
+      const node = ui.$('[data-role="core"]', root);
+      if (!node) return;
+      if (info && info.running === false) node.textContent = '未运行';
+      else if (info && info.version) node.textContent = info.version + (info.meta ? ' (Meta)' : '');
+    }).catch(function () { /* keep sampled value */ });
 
     ui.$('[data-act="geo"]', root).addEventListener('click', function () {
       const button = this;

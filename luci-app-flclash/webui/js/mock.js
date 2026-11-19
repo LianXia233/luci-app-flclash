@@ -292,6 +292,64 @@ window.FlClashMock = (function () {
   }
 
   return {
+    /* ---- platform features added in the alignment round ---- */
+    rules: function () {
+      return Promise.resolve({ rules: [
+        { type: 'GEOSITE', payload: 'youtube', proxy: '节点选择' },
+        { type: 'DOMAIN-SUFFIX', payload: 'example.com', proxy: 'DIRECT' },
+        { type: 'MATCH', payload: '', proxy: 'DIRECT' }
+      ] });
+    },
+    ruleProviders: function () {
+      return Promise.resolve({ running: true, providers: [
+        { name: 'cn-domain', type: 'Rule', vehicleType: 'HTTP', behavior: 'domain', ruleCount: 1200, updatedAt: '2026-11-19T08:00:00Z' },
+        { name: 'private', type: 'Rule', vehicleType: 'File', behavior: 'classical', ruleCount: 12, updatedAt: '' }
+      ] });
+    },
+    updateRuleProvider: function () { return Promise.resolve({ ok: true }); },
+    providers: function () {
+      return Promise.resolve({ providers: {
+        'airport-sub': { type: 'Proxy', vehicleType: 'HTTP', count: 42, updatedAt: '2026-11-19T08:00:00Z' }
+      } });
+    },
+    proxyProviders: function () { return this.providers(); },
+    updateProxyProvider: function () { return Promise.resolve({ ok: true }); },
+    geoUpdate: function () { return Promise.resolve({ ok: true }); },
+    mixin: function () { return Promise.resolve({ text: state.mixinText || '', enabled: !!(state.mixinText || '').trim() }); },
+    saveMixin: function (body) { state.mixinText = (body && body.text) || ''; return Promise.resolve({ ok: true }); },
+    validateConfig: function () {
+      return Promise.resolve({ base: { ok: true, errors: [], warnings: [] }, merged: { ok: true, errors: [], warnings: [] }, mixinKeys: [], preview: 'mode: rule\n' });
+    },
+    profileRaw: function (id) { return Promise.resolve({ text: '# mock raw config for ' + id + '\nmode: rule\n' }); },
+    saveProfileRaw: function () { return Promise.resolve({ ok: true }); },
+    dnsConfig: function () {
+      return Promise.resolve({ running: true, dns: {
+        enable: true, 'enhanced-mode': state.dnsMode, 'fake-ip-range': '198.18.0.1/16',
+        'fake-ip-filter': ['*.lan'], nameserver: ['https://223.5.5.5/dns-query'],
+        'default-nameserver': ['223.5.5.5'], fallback: ['https://1.1.1.1/dns-query'],
+        'proxy-server-nameserver': ['https://223.5.5.5/dns-query'], 'direct-nameserver': ['223.5.5.5'],
+        'fallback-filter': { geoip: true, 'geoip-code': 'CN', ipcidr: ['240.0.0.0/4'], domain: [] },
+        'nameserver-policy': { 'geosite:cn': ['223.5.5.5'] }, ipv6: false
+      } });
+    },
+    acl: function () {
+      return Promise.resolve({ acl: state.acl || { mode: 'all', ips: [], macs: [], bypassCidrs: [], bypassPorts: [], localTakeover: true }, takeover: 'off', applies: false, note: '' });
+    },
+    saveAcl: function (body) { state.acl = body; return Promise.resolve({ ok: true, acl: body, reapplied: false, detail: 'mock' }); },
+    backupList: function () { return Promise.resolve({ snapshots: state.backups || [] }); },
+    backupCreate: function () {
+      state.backups = state.backups || [];
+      const name = 'manual-' + Date.now() + '.tar.gz';
+      state.backups.unshift({ name: name, size: 2048, createdAt: Math.floor(Date.now() / 1000) });
+      return Promise.resolve({ ok: true, name: name });
+    },
+    backupDelete: function (name) {
+      state.backups = (state.backups || []).filter(function (b) { return b.name !== name; });
+      return Promise.resolve({ ok: true });
+    },
+    backupRestore: function () { return Promise.resolve({ ok: true }); },
+    backupUpload: function () { return Promise.resolve({ ok: true }); },
+    backupDownload: function () { return Promise.resolve(new Blob(['mock'], { type: 'application/gzip' })); },
     status: status,
     memory: function () {
       return status().then(function (value) {

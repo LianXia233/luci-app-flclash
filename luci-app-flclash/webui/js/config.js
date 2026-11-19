@@ -8,9 +8,6 @@ window.FlClashConfig = (function () {
 
   return {
     apiBase: params.get('api') || window.FLCLASH_API_BASE || (meta && meta.content) || '/flclash/api',
-    // Live read-only system proxy source (rpcd ubus). Devices without this
-    // endpoint simply leave it unset and the UI falls back to the Go API.
-    ubusBase: params.get('ubus') || window.FLCLASH_UBUS_BASE || '/ubus',
     secret: params.get('secret') || window.FLCLASH_SECRET || '',
     pollInterval: Number(window.FLCLASH_POLL_INTERVAL) || 2000,
     timeout: Number(window.FLCLASH_TIMEOUT) || 12000,

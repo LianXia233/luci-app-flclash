@@ -25,6 +25,7 @@ mod backup;
 mod config;
 mod convert;
 mod core;
+mod coremgmt;
 mod ctrl;
 mod events;
 mod ipinfo;
@@ -148,6 +149,7 @@ async fn main() {
         .route("/memory", get(api::memory))
         .route("/rules", get(api::rules))
         .route("/providers/proxies", get(api::providers))
+        .route("/providers/proxies/{name}/update", post(api::proxy_provider_update))
         .route("/dns/resolve", get(api::dns_resolve))
         .route("/dns/queries", get(api::dns_queries))
         .route("/dns/flush", post(api::dns_flush))
@@ -190,6 +192,10 @@ async fn main() {
         .route("/providers/rules", get(api::rule_providers))
         .route("/providers/rules/{name}/update", post(api::rule_provider_update))
         .route("/system/geo", post(api::geo_update))
+        .route("/core", get(api::core_info))
+        .route("/core/switch", post(api::core_switch))
+        .route("/core/update", post(api::core_update))
+        .route("/core/update/status", get(api::core_update_status))
         .route_layer(middleware::from_fn_with_state(st.clone(), auth));
 
     // The WebSocket route authenticates itself: browsers cannot set headers on

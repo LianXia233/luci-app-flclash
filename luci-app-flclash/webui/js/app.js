@@ -472,6 +472,41 @@
   }
 
   function bindDashboard(node) {
+    // The memory card advertises a chevron: open a live detail sheet instead
+    // of leaving a dead affordance. Core inuse comes from the controller;
+    // RSS split comes from the backend status sampler.
+    const memCard = ui.$('[data-role="memory"]', node);
+    if (memCard) memCard.addEventListener('click', function () {
+      const mem = (state.status && state.status.memory) || { app: 0, core: 0 };
+      ui.openSheet('内存信息',
+        '<div class="settings-card">' +
+        '<div class="settings-row"><div class="row-copy"><div class="row-title">应用 RSS</div>' +
+        '<div class="row-desc">flclash-api 进程常驻内存</div></div><span class="chip chip-plain">' + ui.bytes(mem.app || 0) + '</span></div>' +
+        '<div class="settings-row"><div class="row-copy"><div class="row-title">内核 RSS</div>' +
+        '<div class="row-desc">代理内核进程常驻内存</div></div><span class="chip chip-plain">' + ui.bytes(mem.core || 0) + '</span></div>' +
+        '<div class="settings-row"><div class="row-copy"><div class="row-title">合计 RSS</div>' +
+        '<div class="row-desc" data-role="mem-live">读取中…</div></div><span class="chip" data-role="mem-live-chip">—</span></div>' +
+        '</div><p class="sheet-note">打开时实时读取 /memory 接口（应用 + 内核常驻内存）；内核停止时内核项为 0。</p>',
+        function (body) {
+          api.memory().then(function (data) {
+            const total = data && data.rss;
+            const desc = ui.$('[data-role="mem-live"]', body);
+            const chip = ui.$('[data-role="mem-live-chip"]', body);
+            if (total == null) {
+              desc.textContent = '接口不可用';
+              chip.textContent = '不可用';
+              return;
+            }
+            desc.textContent = '应用 ' + ui.bytes(data.app || 0) + ' + 内核 ' + ui.bytes(data.core || 0);
+            chip.textContent = ui.bytes(total);
+            chip.className = 'chip is-ok';
+          }).catch(function () {
+            ui.$('[data-role="mem-live"]', body).textContent = '内核未运行或接口不可用';
+            ui.$('[data-role="mem-live-chip"]', body).textContent = '不可用';
+          });
+        });
+    });
+
     ui.$$('[data-mode]', node).forEach(function (button) {
       button.addEventListener('click', function () {
         const mode = button.getAttribute('data-mode');

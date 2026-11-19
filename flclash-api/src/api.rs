@@ -525,6 +525,7 @@ pub async fn status_payload(st: &AppState) -> Value {
         "running": running,
         "version": version,
         "coreVersion": version,
+        "apiVersion": env!("CARGO_PKG_VERSION"),
         "uptime": if pid != 0 { core_uptime(pid) } else { 0.0 },
         "mode": cfg.mode,
         "outboundIp": hist.outbound_ip,
@@ -1177,6 +1178,40 @@ pub async fn proxy_toggle(
     }
 }
 
+// ------------------------------------------------------------ core management
+
+pub async fn core_info(State(_st): State<Arc<AppState>>) -> Response {
+    ok_json(crate::coremgmt::info())
+}
+
+pub async fn core_switch(State(st): State<Arc<AppState>>, body: Bytes) -> Response {
+    let data = match body_json(&body).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let core = data.get("core").and_then(|v| v.as_str()).unwrap_or("");
+    match crate::coremgmt::switch(&st, core).await {
+        Ok(value) => ok_json(value),
+        Err(err) => fail_json(StatusCode::BAD_REQUEST, &err),
+    }
+}
+
+pub async fn core_update(State(_st): State<Arc<AppState>>, body: Bytes) -> Response {
+    let data = match body_json(&body).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let core = data.get("core").and_then(|v| v.as_str()).unwrap_or("");
+    match crate::coremgmt::update_start(core) {
+        Ok(value) => ok_json(value),
+        Err(err) => fail_json(StatusCode::BAD_REQUEST, &err),
+    }
+}
+
+pub async fn core_update_status(State(_st): State<Arc<AppState>>) -> Response {
+    ok_json(crate::coremgmt::update_status())
+}
+
 // ------------------------------------------------- providers & geo updates
 
 /// Rule providers from the live core (mihomo /providers/rules).
@@ -1209,6 +1244,25 @@ pub async fn rule_providers(State(st): State<Arc<AppState>>) -> Response {
         }
         // sing-box has no rule-provider controller API: report honestly.
         Err(_) => ok_json(json!({"running": true, "providers": [], "unsupported": true})),
+    }
+}
+
+/// Update one proxy provider (mihomo PUT /providers/proxies/{name}).
+pub async fn proxy_provider_update(State(st): State<Arc<AppState>>, Path(name): Path<String>) -> Response {
+    if name.is_empty() || name.len() > 256 {
+        return fail_json(StatusCode::BAD_REQUEST, "invalid provider name");
+    }
+    if !core_reachable(&st).await {
+        return core_down();
+    }
+    let path = format!("/providers/proxies/{}", urlencode(&name));
+    match req_body(&st, "PUT", &path, "").await {
+        Ok(reply) if reply.status < 400 => {
+            st.bus.publish("proxies", "provider.updated", json!({"provider": name}));
+            ok_json(json!({"ok": true, "name": name}))
+        }
+        Ok(reply) => bad_gateway(&format!("controller: {}", String::from_utf8_lossy(&reply.body).trim())),
+        Err(err) => bad_gateway(&err),
     }
 }
 

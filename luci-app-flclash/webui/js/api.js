@@ -96,48 +96,27 @@ window.FlClashAPI = (function () {
       if (cfg.mock && mock && typeof mock.systemProxy === 'function') {
         return mock.systemProxy();
       }
-      return request('/system/proxy').catch(function () {
-        return request(cfg.ubusBase + '?auth=' + encodeURIComponent(cfg.secret || ''), {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            method: 'call',
-            params: ['flclash', 'system_proxy', {}]
-          })
-        });
-      });
+      return live('systemProxy', '/system/proxy');
     },
 
-    /* ---- core management (rpcd ubus `flclash`, mock-backed in demo mode) ---- */
-    ubus: function (method, params) {
-      return request(cfg.ubusBase + '?auth=' + encodeURIComponent(cfg.secret || ''), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ method: 'call', params: ['flclash', method, params || {}] })
-      }).then(function (reply) {
-        if (reply && reply.code) {
-          const err = new Error(reply.error || '操作失败');
-          err.code = reply.code;
-          throw err;
-        }
-        return reply;
-      });
-    },
+    /* Core management lives on the same origin as the WebUI (flclash-api).
+     * The rpcd ubus object remains for LuCI-side callers, but the WebUI must
+     * not depend on a cross-origin /ubus that this origin does not serve. */
     coreInfo: function () {
       if (cfg.mock && mock && typeof mock.coreInfo === 'function') return mock.coreInfo();
-      return this.ubus('core_type', {});
+      return live('coreInfo', '/core');
     },
     coreUpdate: function (core) {
       if (cfg.mock && mock && typeof mock.coreUpdate === 'function') return mock.coreUpdate(core);
-      return this.ubus('core_update', { core: core });
+      return live('coreUpdate', { path: '/core/update', method: 'POST' }, { core: core });
     },
     coreUpdateStatus: function () {
       if (cfg.mock && mock && typeof mock.coreUpdateStatus === 'function') return mock.coreUpdateStatus();
-      return this.ubus('core_update_status', {});
+      return live('coreUpdateStatus', '/core/update/status');
     },
     coreSwitch: function (core) {
       if (cfg.mock && mock && typeof mock.coreSwitch === 'function') return mock.coreSwitch(core);
-      return this.ubus('core_switch', { core: core });
+      return live('coreSwitch', { path: '/core/switch', method: 'POST' }, { core: core });
     },
 
     importProfile: function (profileUrl) {
@@ -192,6 +171,10 @@ window.FlClashAPI = (function () {
 
     /* ---- rule providers & geo data ---- */
     ruleProviders: function () { return live('ruleProviders', '/providers/rules'); },
+    proxyProviders: function () { return live('providers', '/providers/proxies'); },
+    updateProxyProvider: function (name) {
+      return live('updateProxyProvider', { path: '/providers/proxies/' + encodeURIComponent(name) + '/update', method: 'POST' }, {});
+    },
     updateRuleProvider: function (name) {
       return live('updateRuleProvider', { path: '/providers/rules/' + encodeURIComponent(name) + '/update', method: 'POST' }, {});
     },
