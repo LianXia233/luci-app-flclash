@@ -13,7 +13,11 @@
       ['logs', '运行日志', '内核事件与排障信息', 'logs'],
       ['rules', '规则', '当前生效的分流规则', 'split'],
       ['requests', '实时连接', '当前活动连接与流量', 'requests'],
-      ['settings', '设置', '网络、内核与外观参数', 'settings']
+      ['settings', '设置', '网络、内核与外观参数', 'settings'],
+      ['backup', '备份与恢复', '快照、下载与一键恢复配置', 'backup'],
+      ['mixin', '配置混入', '规则/DNS 覆写与合并预览', 'tune'],
+      ['acl', '访问控制', '局域网黑白名单与端口/网段排除', 'acl'],
+      ['dnsAdvanced', 'DNS 进阶', 'Fallback、分组解析与分域名策略', 'dns']
     ];
     root.innerHTML = '<div class="tool-grid">' + items.map(function (item) {
       return '<button class="tool-card" data-go="' + item[0] + '" type="button">' +
@@ -29,6 +33,8 @@
           '<button class="btn" data-act="refresh" type="button">更新</button></div>' +
         '<div class="settings-row"><div class="row-copy"><div class="row-title">清空 DNS 缓存</div><div class="row-desc">清除 fake-ip 与解析缓存</div></div>' +
           '<button class="btn" data-act="flush" type="button">清空</button></div>' +
+        '<div class="settings-row"><div class="row-copy"><div class="row-title">更新 Geo 数据</div><div class="row-desc">由内核下载最新 GeoIP / GeoSite 数据库</div></div>' +
+          '<button class="btn" data-act="geo" type="button">更新</button></div>' +
       '</section>' +
       '<section class="card"><div class="card-head"><span class="glyph" data-icon="info"></span><span class="card-title">关于</span></div>' +
         '<div class="kv"><span class="k">应用版本</span><span class="v" data-role="version">—</span></div>' +
@@ -47,6 +53,26 @@
     const status = ctx.state.status || {};
     ui.$('[data-role="version"]', root).textContent = status.version || '—';
     ui.$('[data-role="core"]', root).textContent = status.coreVersion || '—';
+
+    ui.$('[data-act="geo"]', root).addEventListener('click', function () {
+      const button = this;
+      button.disabled = true;
+      button.textContent = '更新中…';
+      const done = function (ok, message) {
+        button.disabled = false;
+        button.textContent = '更新';
+        ui.toast(message, ok ? 'ok' : 'error');
+      };
+      ctx.api.geoUpdate().then(function (reply) {
+        if (reply && reply.taskId && ctx.comm) {
+          return ctx.comm.waitTask(reply.taskId, 120000).then(function (task) {
+            if (task && task.state === 'failed') throw new Error(task.error || '更新失败');
+            done(true, 'Geo 数据已更新');
+          });
+        }
+        done(true, 'Geo 数据更新已提交');
+      }).catch(function (error) { done(false, '更新失败: ' + error.message); });
+    });
 
     ui.$('[data-act="restart"]', root).addEventListener('click', function () {
       const button = this;

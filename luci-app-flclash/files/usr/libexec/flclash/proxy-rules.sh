@@ -20,7 +20,7 @@ TPROXY_PORT=7894
 FWMARK=0x162
 CORE_MARK=0x14d
 STATE_FILE=/tmp/flclash-proxy.state
-LOCAL_TAKEOVER=${LOCAL_TAKEOVER:-1}
+LOCAL_TAKEOVER=${LOCAL_TAKEOVER:-$(uci -q get flclash.proxy.local_takeover 2>/dev/null || echo 1)}
 PRIVATE="10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.168.0.0/16, 224.0.0.0/4, 240.0.0.0/4"
 
 uci_enabled() {
@@ -33,6 +33,35 @@ uci_set() {
 	uci set flclash.proxy.backend="$FIREWALL_BACKEND"
 	uci commit flclash
 }
+
+# --- LAN ACL (Nikki-style) ---------------------------------------------------
+# Values are validated here so nothing user-supplied reaches nft/iptables
+# unquoted or unchecked. acl_mode: all | allow | block.
+acl_mode() {
+	local mode
+	mode=$(uci -q get flclash.proxy.acl_mode 2>/dev/null || echo all)
+	case "$mode" in allow|block) echo "$mode" ;; *) echo all ;; esac
+}
+
+valid_ip_or_cidr() {
+	echo "$1" | grep -Eq '^[0-9]{1,3}(\.[0-9]{1,3}){3}(/[0-9]{1,2})?$' || return 1
+	local IFS='/' octets oct mask
+	set -- $1
+	octets=$1
+	mask=$2
+	if [ -n "$mask" ] && [ "$mask" -gt 32 ] 2>/dev/null; then return 1; fi
+	IFS='.'
+	for oct in $octets; do [ "$oct" -le 255 ] 2>/dev/null || return 1; done
+	return 0
+}
+
+valid_mac() { echo "$1" | grep -Eq '^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$'; }
+valid_port() { echo "$1" | grep -Eq '^[0-9]{1,5}$' && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
+
+acl_ips() { uci -q get flclash.proxy.acl_ip 2>/dev/null | while read -r v; do valid_ip_or_cidr "$v" && echo "$v"; done; }
+acl_macs() { uci -q get flclash.proxy.acl_mac 2>/dev/null | while read -r v; do valid_mac "$v" && echo "$v"; done; }
+bypass_cidrs() { uci -q get flclash.proxy.bypass_cidr 2>/dev/null | while read -r v; do valid_ip_or_cidr "$v" && echo "$v"; done; }
+bypass_ports() { uci -q get flclash.proxy.bypass_port 2>/dev/null | while read -r v; do valid_port "$v" && echo "$v"; done; }
 
 set_state() {
 	echo "$1" > "$STATE_FILE" 2>/dev/null
@@ -454,6 +483,46 @@ EOF
 	nft add rule inet "$TABLE" output_tcp "meta l4proto tcp redirect to :$REDIR_PORT" 2>/dev/null
 }
 
+# Emits nft bypass rules for the prerouting chains.
+#   block mode: listed clients / CIDRs / ports accept (never intercepted);
+#   allow mode: the chain's catch-all redirect is gated on the client list,
+#               so unlisted clients fall through to the default accept.
+# `nft_acl_rules <tcp|udp>` prints the bypass lines for that chain.
+nft_acl_rules() {
+	local proto="$1" mode ip mac cidr port
+	mode=$(acl_mode)
+	if [ "$mode" = "block" ]; then
+		for ip in $(acl_ips); do echo "ip saddr $ip accept"; done
+		for mac in $(acl_macs); do echo "ether saddr $mac accept"; done
+	fi
+	for cidr in $(bypass_cidrs); do echo "ip daddr $cidr accept"; done
+	for port in $(bypass_ports); do echo "$proto dport $port accept"; done
+}
+
+# Emits the catch-all interception rules, one per allowed client in allow
+# mode (nft cannot OR ip saddr with ether saddr in a single match).
+# `nft_intercept_rules <tcp|udp>` prints full rule lines.
+nft_intercept_rules() {
+	local proto="$1" mode ip mac tail
+	if [ "$proto" = "tcp" ]; then
+		tail="ip daddr != @private_v4 tcp dport 1-65535 redirect to :$REDIR_PORT"
+	else
+		tail="ip daddr != @private_v4 meta l4proto udp udp dport 1-65535 meta mark set $FWMARK tproxy ip to 127.0.0.1:$TPROXY_PORT accept"
+	fi
+	mode=$(acl_mode)
+	if [ "$mode" != "allow" ]; then
+		echo "iifname \"$LAN_IF\" $tail"
+		return
+	fi
+	local listed=0
+	for ip in $(acl_ips); do echo "iifname \"$LAN_IF\" ip saddr $ip $tail"; listed=1; done
+	for mac in $(acl_macs); do echo "iifname \"$LAN_IF\" ether saddr $mac $tail"; listed=1; done
+	if [ "$listed" = "0" ]; then
+		logger -t flclash-proxy "acl_mode=allow but client list is empty; falling back to all"
+		echo "iifname \"$LAN_IF\" $tail"
+	fi
+}
+
 nft_on() {
 	if ! nft_lan_ready; then
 		nft delete table inet "$TABLE" 2>/dev/null
@@ -471,11 +540,13 @@ table inet $TABLE {
 	}
 	chain prerouting_tcp {
 		type nat hook prerouting priority dstnat + 10; policy accept;
-		iifname "$LAN_IF" ip daddr != @private_v4 tcp dport 1-65535 redirect to :$REDIR_PORT
+		$(nft_acl_rules tcp)
+		$(nft_intercept_rules tcp)
 	}
 	chain prerouting_udp {
 		type filter hook prerouting priority mangle - 10; policy accept;
-		iifname "$LAN_IF" ip daddr != @private_v4 meta l4proto udp udp dport 1-65535 meta mark set $FWMARK tproxy ip to 127.0.0.1:$TPROXY_PORT accept
+		$(nft_acl_rules udp)
+		$(nft_intercept_rules udp)
 	}
 }
 EOF
@@ -513,6 +584,59 @@ ipt_output_local() {
 	iptables -w -t nat -A FLCLASH_OUTPUT -p tcp -j REDIRECT --to-ports "$REDIR_PORT"
 }
 
+# iptables bypass rules for both FLCLASH (nat) and FLCLASH_MANGLE (udp).
+ipt_acl_bypass() {
+	local mode ip mac cidr port chain
+	mode=$(acl_mode)
+	for chain in FLCLASH FLCLASH_MANGLE; do
+		if [ "$mode" = "block" ]; then
+			for ip in $(acl_ips); do
+				local tbl=nat; [ "$chain" = FLCLASH_MANGLE ] && tbl=mangle
+				iptables -w -t "$tbl" -A "$chain" -s "$ip" -j RETURN
+			done
+			for mac in $(acl_macs); do
+				local tbl=nat; [ "$chain" = FLCLASH_MANGLE ] && tbl=mangle
+				iptables -w -t "$tbl" -A "$chain" -m mac --mac-source "$mac" -j RETURN
+			done
+		fi
+	done
+	local tbl
+	for cidr in $(bypass_cidrs); do
+		iptables -w -t nat -A FLCLASH -d "$cidr" -j RETURN
+		iptables -w -t mangle -A FLCLASH_MANGLE -d "$cidr" -j RETURN
+	done
+	for port in $(bypass_ports); do
+		iptables -w -t nat -A FLCLASH -p tcp --dport "$port" -j RETURN
+		iptables -w -t mangle -A FLCLASH_MANGLE -p udp --dport "$port" -j RETURN
+	done
+}
+
+# Final catch-all rules; in allow mode they are per-client instead of global.
+ipt_intercept() {
+	local mode ip mac listed=0
+	mode=$(acl_mode)
+	if [ "$mode" != "allow" ]; then
+		iptables -w -t nat -A FLCLASH -p tcp -j REDIRECT --to-ports "$REDIR_PORT"
+		iptables -w -t mangle -A FLCLASH_MANGLE -p udp -j TPROXY --on-port "$TPROXY_PORT" --tproxy-mark "$FWMARK"
+		return
+	fi
+	for ip in $(acl_ips); do
+		iptables -w -t nat -A FLCLASH -s "$ip" -p tcp -j REDIRECT --to-ports "$REDIR_PORT"
+		iptables -w -t mangle -A FLCLASH_MANGLE -s "$ip" -p udp -j TPROXY --on-port "$TPROXY_PORT" --tproxy-mark "$FWMARK"
+		listed=1
+	done
+	for mac in $(acl_macs); do
+		iptables -w -t nat -A FLCLASH -m mac --mac-source "$mac" -p tcp -j REDIRECT --to-ports "$REDIR_PORT"
+		iptables -w -t mangle -A FLCLASH_MANGLE -m mac --mac-source "$mac" -p udp -j TPROXY --on-port "$TPROXY_PORT" --tproxy-mark "$FWMARK"
+		listed=1
+	done
+	if [ "$listed" = "0" ]; then
+		logger -t flclash-proxy "acl_mode=allow but client list is empty; falling back to all"
+		iptables -w -t nat -A FLCLASH -p tcp -j REDIRECT --to-ports "$REDIR_PORT"
+		iptables -w -t mangle -A FLCLASH_MANGLE -p udp -j TPROXY --on-port "$TPROXY_PORT" --tproxy-mark "$FWMARK"
+	fi
+}
+
 ipt_chain() {
 	ipt_off
 	iptables -w -t nat -N FLCLASH
@@ -527,10 +651,10 @@ ipt_chain() {
 		iptables -w -t nat -A FLCLASH -d "$net" -j RETURN
 		iptables -w -t mangle -A FLCLASH_MANGLE -d "$net" -j RETURN
 	done
-	iptables -w -t nat -A FLCLASH -p tcp -j REDIRECT --to-ports "$REDIR_PORT"
+	ipt_acl_bypass
 	ip rule add fwmark "$FWMARK" table 100 2>/dev/null
 	ip route add local default dev lo table 100 2>/dev/null
-	iptables -w -t mangle -A FLCLASH_MANGLE -p udp -j TPROXY --on-port "$TPROXY_PORT" --tproxy-mark "$FWMARK"
+	ipt_intercept
 	iptables -w -t filter -C INPUT -m mark --mark "$FWMARK" -j ACCEPT 2>/dev/null || \
 		iptables -w -t filter -I INPUT 1 -m mark --mark "$FWMARK" -j ACCEPT
 	[ "$LOCAL_TAKEOVER" = "1" ] && [ "$(core_type)" != "sing-box" ] && ipt_output_local
@@ -671,7 +795,7 @@ LAN_IF=$(detect_lan_if)
 # API maintenance, core hooks and user actions may run concurrently. Serialize
 # state-changing operations so one sync cannot delete a table another is adding.
 case "$1" in
-	start|stop|teardown|sync|boot)
+	start|stop|teardown|sync|boot|reapply)
 		LOCKDIR=/tmp/flclash-proxy.lock
 		if ! mkdir "$LOCKDIR" 2>/dev/null; then
 			oldpid=$(cat "$LOCKDIR/pid" 2>/dev/null)
@@ -719,6 +843,29 @@ case "$1" in
 	purge)
 		purge_core_artifacts
 		;;
+	reapply)
+		# Rebuild interception rules after an ACL change. Only meaningful
+		# while REDIRECT/TPROXY is live; TUN intercepts at L3 (no LAN ACL)
+		# and "off" has nothing to rebuild.
+		state=$(cat "$STATE_FILE" 2>/dev/null || echo off)
+		case "$state" in
+			on)
+				rules_off
+				redirect_on
+				rc=$?
+				echo "transparent proxy: $(cat "$STATE_FILE" 2>/dev/null) (rules rebuilt)"
+				exit "$rc"
+				;;
+			tun)
+				echo "transparent proxy: tun (LAN ACL not applicable in TUN mode)"
+				exit 0
+				;;
+			*)
+				echo "transparent proxy: off (nothing to rebuild)"
+				exit 0
+				;;
+		esac
+		;;
 	sync)
 		wait_core_if_starting || true
 		sync
@@ -745,7 +892,7 @@ case "$1" in
 		sync
 		;;
 	*)
-		echo "usage: $0 start|stop|status|backend|prepare|sync|teardown|purge|boot"
+		echo "usage: $0 start|stop|status|backend|prepare|sync|teardown|purge|boot|reapply"
 		exit 2
 		;;
 esac

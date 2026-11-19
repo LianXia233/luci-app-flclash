@@ -19,6 +19,17 @@ config flclash 'proxy'
 	option lan_if ''
 	# Avoid silent IPv6 bypass on IPv4-only REDIRECT/TPROXY deployments.
 	option filter_aaaa '1'
+	# LAN ACL (Nikki-style). mode: all | allow | block
+	# allow: only listed clients are proxied; block: listed clients bypass.
+	option acl_mode 'all'
+	# list acl_ip '192.168.1.50'
+	# list acl_mac 'aa:bb:cc:dd:ee:ff'
+	# Destination CIDRs that always bypass interception.
+	# list bypass_cidr '10.10.0.0/16'
+	# Destination ports that always bypass (e.g. 25 for SMTP).
+	# list bypass_port '25'
+	# Take over the router's own outbound traffic (mihomo only).
+	option local_takeover '1'
 
 config flclash 'api'
 	option enabled '1'

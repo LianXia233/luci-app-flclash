@@ -215,9 +215,24 @@ pub async fn apply_profile(st: &AppState, id: &str) -> Result<(), String> {
     let path = profile_file(st, id);
     let data = std::fs::read_to_string(&path)
         .map_err(|_| format!("配置不存在: {}", id))?;
-    let final_yaml = crate::convert::convert_subscription(&st.config_path(), &data)
+    let converted = crate::convert::convert_subscription(&st.config_path(), &data)
         .map_err(|e| format!("应用失败: {}", e))?;
+    // User mixin (Nikki-style) is applied after conversion, before validation
+    // and the atomic write, so the running config always includes it.
+    let (final_yaml, touched) = crate::mixin::apply_mixin(&st.data_dir, &converted)
+        .map_err(|e| format!("应用失败: {}", e))?;
+    let (errors, _warnings) = crate::mixin::validate(&final_yaml);
+    if !errors.is_empty() {
+        return Err(format!("配置校验失败: {}", errors.join("；")));
+    }
     write_atomic(&st.config_path(), final_yaml.as_bytes())?;
+    if !touched.is_empty() {
+        st.bus.publish(
+            "system",
+            "config.mixin",
+            serde_json::json!({"profile": id, "keys": touched}),
+        );
+    }
 
     let mut list = load_profiles(st);
     for item in list.iter_mut() {

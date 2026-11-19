@@ -1177,6 +1177,127 @@ pub async fn proxy_toggle(
     }
 }
 
+// ------------------------------------------------- providers & geo updates
+
+/// Rule providers from the live core (mihomo /providers/rules).
+pub async fn rule_providers(State(st): State<Arc<AppState>>) -> Response {
+    if !core_reachable(&st).await {
+        return ok_json(json!({"running": false, "providers": []}));
+    }
+    match ctrl_json(&st, "GET", "/providers/rules", None, Duration::from_secs(8)).await {
+        Ok(data) => {
+            let mut providers: Vec<Value> = data
+                .get("providers")
+                .and_then(|v| v.as_object())
+                .map(|map| {
+                    map.iter()
+                        .map(|(name, p)| {
+                            json!({
+                                "name": name,
+                                "type": p.get("type").and_then(|v| v.as_str()).unwrap_or("rule"),
+                                "vehicleType": p.get("vehicleType").and_then(|v| v.as_str()).unwrap_or(""),
+                                "behavior": p.get("behavior").and_then(|v| v.as_str()).unwrap_or(""),
+                                "ruleCount": p.get("ruleCount").and_then(|v| v.as_i64()).unwrap_or(0),
+                                "updatedAt": p.get("updatedAt").and_then(|v| v.as_str()).unwrap_or(""),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            providers.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+            ok_json(json!({"running": true, "providers": providers}))
+        }
+        // sing-box has no rule-provider controller API: report honestly.
+        Err(_) => ok_json(json!({"running": true, "providers": [], "unsupported": true})),
+    }
+}
+
+/// Update one rule provider (mihomo PUT /providers/rules/{name}).
+pub async fn rule_provider_update(State(st): State<Arc<AppState>>, Path(name): Path<String>) -> Response {
+    if name.is_empty() || name.len() > 256 {
+        return fail_json(StatusCode::BAD_REQUEST, "invalid provider name");
+    }
+    if !core_reachable(&st).await {
+        return core_down();
+    }
+    let path = format!("/providers/rules/{}", urlencode(&name));
+    match req_body(&st, "PUT", &path, "").await {
+        Ok(reply) if reply.status < 400 => {
+            st.bus.publish("rules", "rules.changed", json!({"provider": name}));
+            ok_json(json!({"ok": true, "name": name}))
+        }
+        Ok(reply) => bad_gateway(&format!("controller: {}", String::from_utf8_lossy(&reply.body).trim())),
+        Err(err) => bad_gateway(&err),
+    }
+}
+
+/// GeoIP/GeoSite database update via the core's own updater
+/// (mihomo POST /upgrade/geo). Long-running: reported as a task.
+pub async fn geo_update(State(st): State<Arc<AppState>>) -> Response {
+    if !core_reachable(&st).await {
+        return core_down();
+    }
+    let handle = st.tasks.begin("system.geo", "更新 Geo 数据", None);
+    let task_id = handle.id().to_string();
+    handle.progress(5.0, "请求内核更新");
+    tokio::spawn(async move {
+        match req_body(&st, "POST", "/upgrade/geo", "").await {
+            Ok(reply) if reply.status < 400 => {
+                handle.succeed(json!({"ok": true, "detail": String::from_utf8_lossy(&reply.body).trim().to_string()}));
+            }
+            Ok(reply) => handle.fail(&format!("controller: {}", String::from_utf8_lossy(&reply.body).trim())),
+            Err(err) => handle.fail(&err),
+        }
+    });
+    accepted(task_id)
+}
+
+/// Full dns: view for the advanced DNS page (file-backed, works core-down).
+pub async fn dns_config(State(st): State<Arc<AppState>>) -> Response {
+    let cfg = file_config(&st.config_path());
+    ok_json(json!({"dns": cfg.dns_json(), "running": core_reachable(&st).await}))
+}
+
+// ------------------------------------------------------------------ LAN ACL
+
+pub async fn acl_get(State(_st): State<Arc<AppState>>) -> Response {
+    let acl = crate::acl::load();
+    let state = proxy_state();
+    ok_json(json!({
+        "acl": acl.to_json(),
+        "takeover": state,
+        // LAN ACL applies to REDIRECT/TPROXY only; TUN intercepts at L3.
+        "applies": state == "on",
+        "note": if state == "tun" { "TUN 模式下局域网 ACL 不生效（三层接管）" } else { "" },
+    }))
+}
+
+pub async fn acl_put(State(st): State<Arc<AppState>>, body: Bytes) -> Response {
+    let data = match body_json(&body).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let acl = match crate::acl::parse_payload(&data) {
+        Ok(a) => a,
+        Err(err) => return fail_json(StatusCode::BAD_REQUEST, &err),
+    };
+    if let Err(err) = crate::acl::save(&acl) {
+        return bad_gateway(&err);
+    }
+    st.bus.publish("system", "acl.changed", acl.to_json());
+    // Rebuild live rules so the change takes effect immediately. reapply is
+    // a no-op when the proxy is off or in TUN mode.
+    let out = tokio::process::Command::new("/usr/libexec/flclash/proxy-rules.sh")
+        .arg("reapply")
+        .output()
+        .await;
+    let reapplied = matches!(&out, Ok(o) if o.status.success());
+    let detail = out
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|_| "proxy-rules.sh 不可用（开发环境）".into());
+    ok_json(json!({"ok": true, "acl": acl.to_json(), "reapplied": reapplied, "detail": detail}))
+}
+
 // ------------------------------------------------------------- static assets
 
 pub async fn static_index() -> Redirect {
@@ -1238,6 +1359,242 @@ fn urlencode(s: &str) -> String {
         }
     }
     out
+}
+
+// ------------------------------------------------------------- mixin / editor
+
+pub async fn mixin_get(State(st): State<Arc<AppState>>) -> Response {
+    let text = std::fs::read_to_string(crate::mixin::mixin_path(&st.data_dir)).unwrap_or_default();
+    ok_json(json!({"text": text, "enabled": !text.trim().is_empty()}))
+}
+
+pub async fn mixin_put(State(st): State<Arc<AppState>>, body: Bytes) -> Response {
+    let data = match body_json(&body).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let text = data.get("text").and_then(|v| v.as_str()).unwrap_or("");
+    if text.len() > 1 << 20 {
+        return fail_json(StatusCode::BAD_REQUEST, "mixin 内容过大");
+    }
+    match crate::mixin::save_mixin(&st.data_dir, text) {
+        Ok(()) => {
+            st.bus.publish("system", "mixin.changed", json!({"enabled": !text.trim().is_empty()}));
+            ok_json(json!({"ok": true}))
+        }
+        Err(err) => fail_json(StatusCode::BAD_REQUEST, &err),
+    }
+}
+
+/// POST /config/validate {text?, profileId?} → structural check + mixin preview.
+pub async fn config_validate(State(st): State<Arc<AppState>>, body: Bytes) -> Response {
+    let data = match body_json(&body).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let text = if let Some(text) = data.get("text").and_then(|v| v.as_str()) {
+        text.to_string()
+    } else if let Some(id) = data.get("profileId").and_then(|v| v.as_str()) {
+        match std::fs::read_to_string(st.profiles_dir().join(format!("{}.yaml", id))) {
+            Ok(text) => text,
+            Err(_) => return fail_json(StatusCode::NOT_FOUND, "配置不存在"),
+        }
+    } else {
+        match std::fs::read_to_string(st.config_path()) {
+            Ok(text) => text,
+            Err(_) => return fail_json(StatusCode::NOT_FOUND, "没有可校验的配置"),
+        }
+    };
+    let base_check = crate::mixin::validate_payload(&text);
+    match crate::mixin::apply_mixin(&st.data_dir, &text) {
+        Ok((merged, touched)) => {
+            let merged_check = crate::mixin::validate_payload(&merged);
+            ok_json(json!({
+                "base": base_check,
+                "merged": merged_check,
+                "mixinKeys": touched,
+                "preview": merged,
+            }))
+        }
+        Err(err) => fail_json(StatusCode::BAD_REQUEST, &err),
+    }
+}
+
+/// GET /profiles/{id}/raw → the stored (converted) profile YAML for editing.
+pub async fn profile_raw(State(st): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    let path = st.profiles_dir().join(format!("{}.yaml", id));
+    match std::fs::read_to_string(&path) {
+        Ok(text) => ok_json(json!({"id": id, "text": text})),
+        Err(_) => fail_json(StatusCode::NOT_FOUND, "配置不存在"),
+    }
+}
+
+/// PUT /profiles/{id}/raw {text} → validate, back up, atomic write, re-apply
+/// when this profile is the active one.
+pub async fn profile_raw_put(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> Response {
+    let data = match body_json(&body).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let text = data.get("text").and_then(|v| v.as_str()).unwrap_or("");
+    if text.trim().is_empty() {
+        return fail_json(StatusCode::BAD_REQUEST, "配置内容为空");
+    }
+    if text.len() > 4 << 20 {
+        return fail_json(StatusCode::BAD_REQUEST, "配置内容过大");
+    }
+    let path = st.profiles_dir().join(format!("{}.yaml", id));
+    if !path.is_file() {
+        return fail_json(StatusCode::NOT_FOUND, "配置不存在");
+    }
+    let check = crate::mixin::validate_payload(text);
+    if !check["ok"].as_bool().unwrap_or(false) {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({"error": "配置校验失败", "detail": check})),
+        )
+            .into_response();
+    }
+    // Keep the previous body recoverable before overwriting.
+    if let Ok(previous) = std::fs::read(&path) {
+        let backup = st.profiles_dir().join(format!("{}.yaml.bak", id));
+        let _ = crate::config::write_atomic(&backup, &previous);
+    }
+    if let Err(err) = crate::config::write_atomic(&path, text.as_bytes()) {
+        return fail_json(StatusCode::INTERNAL_SERVER_ERROR, &err);
+    }
+    let active = crate::profiles::load_profiles(&st)
+        .iter()
+        .any(|item| item.id == id && item.active);
+    if active {
+        let st_bg = st.clone();
+        let id_bg = id.clone();
+        let handle = st.tasks.begin("profile.apply", "应用编辑后的配置", None);
+        let task_id = handle.id().to_string();
+        tokio::spawn(async move {
+            match crate::profiles::apply_profile(&st_bg, &id_bg).await {
+                Ok(()) => {
+                    st_bg.bus.publish(
+                        "profiles",
+                        "profiles.changed",
+                        crate::profiles::list_payload(&st_bg),
+                    );
+                    crate::loops::refresh_snapshot(&st_bg).await;
+                    handle.succeed(json!({"id": id_bg}));
+                }
+                Err(err) => handle.fail(&err),
+            }
+        });
+        return accepted(task_id);
+    }
+    st.bus
+        .publish("profiles", "profiles.changed", crate::profiles::list_payload(&st));
+    ok_json(json!({"ok": true, "id": id, "applied": false}))
+}
+
+// ------------------------------------------------------------- backup / restore
+
+pub async fn backup_list(State(st): State<Arc<AppState>>) -> Response {
+    ok_json(crate::backup::list(&st))
+}
+
+/// POST /backup {label?} → creates a snapshot of the whitelisted data files.
+pub async fn backup_create(State(st): State<Arc<AppState>>, body: Bytes) -> Response {
+    let data = if body.is_empty() {
+        json!({})
+    } else {
+        match body_json(&body).await {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        }
+    };
+    let label = data.get("label").and_then(|v| v.as_str()).unwrap_or("manual");
+    match crate::backup::snapshot(&st, label, "") {
+        Ok(meta) => {
+            st.bus.publish("system", "backup.created", meta.clone());
+            ok_json(json!({"ok": true, "snapshot": meta}))
+        }
+        Err(err) => fail_json(StatusCode::BAD_REQUEST, &err),
+    }
+}
+
+/// GET /backup/download/{name} → the stored snapshot as a gzip tarball.
+pub async fn backup_download(State(st): State<Arc<AppState>>, Path(name): Path<String>) -> Response {
+    match crate::backup::read_snapshot(&st, &name) {
+        Ok(bytes) => (
+            [
+                (axum::http::header::CACHE_CONTROL, "no-store"),
+                (axum::http::header::CONTENT_TYPE, "application/gzip"),
+                (
+                    axum::http::header::CONTENT_DISPOSITION,
+                    &format!("attachment; filename=\"{}\"", name),
+                ),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Err(err) => fail_json(StatusCode::NOT_FOUND, &err),
+    }
+}
+
+/// POST /backup/restore {name} → restore a stored snapshot (background task).
+pub async fn backup_restore_snapshot(State(st): State<Arc<AppState>>, body: Bytes) -> Response {
+    let data = match body_json(&body).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let name = data.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    let bytes = match crate::backup::read_snapshot(&st, name) {
+        Ok(bytes) => bytes,
+        Err(err) => return fail_json(StatusCode::NOT_FOUND, &err),
+    };
+    restore_task(st, bytes)
+}
+
+/// POST /backup/upload → raw gzip tarball body; validated then restored.
+pub async fn backup_upload(State(st): State<Arc<AppState>>, body: Bytes) -> Response {
+    if body.is_empty() || body.len() > crate::backup::MAX_TOTAL_BYTES {
+        return fail_json(StatusCode::BAD_REQUEST, "备份内容为空或过大");
+    }
+    restore_task(st, body.to_vec())
+}
+
+fn restore_task(st: Arc<AppState>, bytes: Vec<u8>) -> Response {
+    // Validate synchronously so a bad archive fails fast with a useful error.
+    if let Err(err) = crate::backup::unpack(&bytes) {
+        return fail_json(StatusCode::BAD_REQUEST, &err);
+    }
+    let handle = st.tasks.begin("backup.restore", "恢复配置", None);
+    let task_id = handle.id().to_string();
+    handle.progress(10.0, "校验备份");
+    tokio::spawn(async move {
+        match crate::backup::restore(&st, &bytes) {
+            Ok(result) => {
+                handle.progress(60.0, "重载内核");
+                crate::profiles::reload_core(&st).await;
+                st.bus
+                    .publish("profiles", "profiles.changed", crate::profiles::list_payload(&st));
+                crate::loops::refresh_snapshot(&st).await;
+                handle.succeed(result);
+            }
+            Err(err) => handle.fail(&err),
+        }
+    });
+    accepted(task_id)
+}
+
+pub async fn backup_delete(State(st): State<Arc<AppState>>, Path(name): Path<String>) -> Response {
+    match crate::backup::delete(&st, &name) {
+        Ok(()) => {
+            st.bus.publish("system", "backup.deleted", json!({"name": name}));
+            ok_json(json!({"ok": true}))
+        }
+        Err(err) => fail_json(StatusCode::NOT_FOUND, &err),
+    }
 }
 
 #[cfg(test)]

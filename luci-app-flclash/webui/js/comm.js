@@ -91,7 +91,10 @@ window.FlClashComm = (function () {
       load: function () {
         return api.request('/tasks').then(function (reply) { return (reply && reply.tasks) || []; });
       },
-      apply: function (data) { state.tasks = Array.isArray(data) ? data : []; }
+      apply: function (data) {
+        state.tasks = Array.isArray(data) ? data : [];
+        resolveTaskWaiters();
+      }
     }
   };
 
@@ -440,7 +443,7 @@ window.FlClashComm = (function () {
     if (data.status) applyStatus(data.status);
     if (data.proxies) state.proxies = data.proxies;
     if (Array.isArray(data.profiles)) state.profiles = data.profiles;
-    if (Array.isArray(data.tasks)) state.tasks = data.tasks;
+    if (Array.isArray(data.tasks)) { state.tasks = data.tasks; resolveTaskWaiters(); }
     if (data.capabilities) state.capabilities = data.capabilities;
     if (data.bootId) meta.bootId = data.bootId;
     if (typeof data.sequence === 'number') meta.lastSequence = Math.max(meta.lastSequence, data.sequence);
@@ -466,6 +469,21 @@ window.FlClashComm = (function () {
   function appendLogs(lines) {
     if (!lines.length) return;
     state.logs = state.logs.concat(lines).slice(-300);
+  }
+
+  /* A task can finish before its waiter registers, or its completion can
+   * arrive via a bulk payload (snapshot / REST poll) instead of a `task`
+   * event. Every path that replaces state.tasks must settle pending waits. */
+  function resolveTaskWaiters() {
+    if (!taskWaiters.size) return;
+    state.tasks.forEach(function (task) {
+      const waiter = task && taskWaiters.get(task.id);
+      if (waiter && (task.state === 'done' || task.state === 'failed')) {
+        taskWaiters.delete(task.id);
+        if (task.state === 'done') waiter.resolve(task);
+        else waiter.reject(new Error(task.error || '任务失败'));
+      }
+    });
   }
 
   function upsertTask(task) {
@@ -579,16 +597,22 @@ window.FlClashComm = (function () {
       return existing.state === 'done' ? existing : Promise.reject(new Error(existing.error || '任务失败'));
     }
     return new Promise(function (resolve, reject) {
+      // Subscribe to the tasks topic for the duration of the wait: the
+      // calling view may not watch tasks itself, and a one-shot fetch can
+      // land while the task is still running (fast tasks then never resolve).
+      const unwatch = watch('tasks', function () {});
+      const cleanup = function () { window.clearTimeout(timer); unwatch(); };
       const timer = window.setTimeout(function () {
         taskWaiters.delete(id);
+        cleanup();
         reject(new Error('任务超时'));
       }, timeoutMs || 300000);
       taskWaiters.set(id, {
-        resolve: function (task) { window.clearTimeout(timer); resolve(task); },
-        reject: function (error) { window.clearTimeout(timer); reject(error); }
+        resolve: function (task) { cleanup(); resolve(task); },
+        reject: function (error) { cleanup(); reject(error); }
       });
-      // Fallback for transports without the tasks topic.
-      if (!meta.connected) refresh('tasks').catch(function () {});
+      // Also fetch once in case the task finished before this waiter existed.
+      refresh('tasks', { force: true }).catch(function () {});
     });
   }
 

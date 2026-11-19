@@ -1130,19 +1130,6 @@ pub async fn fetch_profile(config_path: &Path, url: &str) -> Result<(String, Pro
 mod tests {
     use super::*;
 
-    fn header() -> Vec<(&'static str, String)> {
-        vec![
-            ("mixed-port", "7892".into()),
-            ("socks-port", "7891".into()),
-            ("port", "7892".into()),
-            ("external-controller", "127.0.0.1:9097".into()),
-            ("mode", "rule".into()),
-            ("log-level", "info".into()),
-            ("allow-lan", "false".into()),
-            ("ipv6", "true".into()),
-        ]
-    }
-
     #[test]
     fn test_b64_variants() {
         assert_eq!(b64_decode("aGVsbG8=").unwrap(), b"hello");

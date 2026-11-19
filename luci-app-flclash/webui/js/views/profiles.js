@@ -57,6 +57,7 @@
           '<div class="profile-actions">' +
             '<button class="icon-button" data-update="' + ui.esc(item.id) + '" type="button" title="更新订阅">' + icon('sync', 16) + '</button>' +
             '<button class="icon-button" data-edit="' + ui.esc(item.id) + '" type="button" title="编辑">' + icon('edit', 16) + '</button>' +
+            '<button class="icon-button" data-yaml="' + ui.esc(item.id) + '" type="button" title="编辑 YAML">' + icon('file', 16) + '</button>' +
             (item.active ? '' : '<button class="btn" data-apply="' + ui.esc(item.id) + '" type="button">启用</button>') +
             '<button class="icon-button is-danger" data-delete="' + ui.esc(item.id) + '" type="button" title="删除">' + icon('trash', 16) + '</button>' +
           '</div>' +
@@ -97,6 +98,51 @@
                   .catch(function (error) { ui.toast('保存失败: ' + error.message, 'error'); });
               });
             });
+        });
+      });
+
+      ui.$$('[data-yaml]', list).forEach(function (button) {
+        button.addEventListener('click', function () {
+          const id = button.getAttribute('data-yaml');
+          const item = (ctx.state.profiles || []).find(function (p) { return p.id === id; }) || {};
+          api.profileRaw(id).then(function (data) {
+            ui.openSheet('编辑 YAML · ' + (item.name || id),
+              '<textarea id="yaml-text" class="input dns-area editor-area" spellcheck="false" style="min-height:320px">' + ui.esc(data.text || '') + '</textarea>' +
+              '<div data-role="yaml-report"></div>' +
+              '<p class="sheet-note">保存前会做结构校验；启用中的配置保存后自动重新应用（含混入），旧内容保留为 .bak。</p>' +
+              '<div class="sheet-actions"><button class="btn" data-cancel type="button">取消</button>' +
+              '<button class="btn" data-check type="button">校验</button>' +
+              '<button class="btn is-primary" data-confirm type="button">保存</button></div>',
+              function (body, close, helpers) {
+                const area = ui.$('#yaml-text', body);
+                const report = ui.$('[data-role="yaml-report"]', body);
+                ui.$('[data-cancel]', body).addEventListener('click', close);
+                ui.$('[data-check]', body).addEventListener('click', function () {
+                  api.validateConfig({ text: area.value }).then(function (result) {
+                    const check = result.base || {};
+                    report.innerHTML = (check.ok
+                      ? '<p class="sheet-note" style="color:var(--ok)">校验通过</p>'
+                      : '<p class="sheet-note" style="color:var(--bad)">' + ui.esc((check.errors || []).join('；')) + '</p>');
+                  }).catch(function (error) { ui.toast('校验失败: ' + error.message, 'error'); });
+                });
+                ui.$('[data-confirm]', body).addEventListener('click', function () {
+                  const confirm = ui.$('[data-confirm]', body);
+                  confirm.disabled = true;
+                  api.saveProfileRaw(id, area.value)
+                    .then(settle)
+                    .then(function () {
+                      helpers.markSaved();
+                      close();
+                      ui.toast(item.active ? '已保存并重新应用' : '已保存', 'ok');
+                      return ctx.reloadProfiles();
+                    })
+                    .catch(function (error) {
+                      ui.toast('保存失败: ' + error.message, 'error');
+                      confirm.disabled = false;
+                    });
+                });
+              });
+          }).catch(function (error) { ui.toast('读取失败: ' + error.message, 'error'); });
         });
       });
 

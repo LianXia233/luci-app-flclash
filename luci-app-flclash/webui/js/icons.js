@@ -55,7 +55,16 @@ window.FlClashIcons = (function () {
     wifi: 'wifi',
     language: 'translate',
     palette: 'palette',
-    update: 'system_update_alt'
+    update: 'system_update_alt',
+    backup: 'archive',
+    restore: 'restore',
+    upload: 'upload',
+    folder: 'folder_open',
+    clock: 'schedule',
+    warning: 'warning',
+    tune: 'tune',
+    acl: 'shield',
+    dashboardPanel: 'web'
   };
 
   function svg(name, size) {

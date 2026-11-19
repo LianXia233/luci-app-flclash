@@ -19,7 +19,9 @@
 //!   ipinfo.rs   — outbound IP profile lookup (CF-first multi-source chain)
 //!   api.rs      — HTTP handlers
 
+mod acl;
 mod api;
+mod backup;
 mod config;
 mod convert;
 mod core;
@@ -27,6 +29,7 @@ mod ctrl;
 mod events;
 mod ipinfo;
 mod loops;
+mod mixin;
 mod profiles;
 mod singbox;
 mod state;
@@ -160,6 +163,14 @@ async fn main() {
         .route("/tasks/{id}", get(api::task_get))
         .route("/core/capabilities", get(api::core_capabilities))
         .route("/ws/stats", get(api::ws_stats))
+        .route("/mixin", get(api::mixin_get).put(api::mixin_put).patch(api::mixin_put))
+        .route("/config/validate", post(api::config_validate))
+        .route("/profiles/{id}/raw", get(api::profile_raw).put(api::profile_raw_put))
+        .route("/backup", get(api::backup_list).post(api::backup_create))
+        .route("/backup/download/{name}", get(api::backup_download))
+        .route("/backup/restore", post(api::backup_restore_snapshot))
+        .route("/backup/upload", post(api::backup_upload))
+        .route("/backup/{name}", delete(api::backup_delete))
         .route("/system/proxy", get(api::system_proxy))
         .route("/profiles", get(api::profiles_get))
         .route("/profiles/import", post(api::profiles_import))
@@ -174,6 +185,11 @@ async fn main() {
         .route("/service/{action}", post(api::service_action))
         .route("/proxy", get(api::proxy_status))
         .route("/proxy/{action}", post(api::proxy_toggle))
+        .route("/proxy/acl", get(api::acl_get).put(api::acl_put))
+        .route("/dns/config", get(api::dns_config))
+        .route("/providers/rules", get(api::rule_providers))
+        .route("/providers/rules/{name}/update", post(api::rule_provider_update))
+        .route("/system/geo", post(api::geo_update))
         .route_layer(middleware::from_fn_with_state(st.clone(), auth));
 
     // The WebSocket route authenticates itself: browsers cannot set headers on

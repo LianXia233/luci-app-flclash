@@ -173,6 +173,72 @@ window.FlClashAPI = (function () {
     saveConfig: function (patch) { return live('saveConfig', { path: '/config', method: 'PUT' }, patch); },
     service: function (action) {
       return live('service', { path: '/service/' + encodeURIComponent(action), method: 'POST' });
+    },
+
+    /* ---- mixin & config editor ---- */
+    mixin: function () { return live('mixin', '/mixin'); },
+    saveMixin: function (text) {
+      return live('saveMixin', { path: '/mixin', method: 'PUT' }, { text: text });
+    },
+    validateConfig: function (payload) {
+      return live('validateConfig', { path: '/config/validate', method: 'POST' }, payload || {});
+    },
+    profileRaw: function (id) {
+      return live('profileRaw', { path: '/profiles/' + encodeURIComponent(id) + '/raw' });
+    },
+    saveProfileRaw: function (id, text) {
+      return live('saveProfileRaw', { path: '/profiles/' + encodeURIComponent(id) + '/raw', method: 'PUT' }, { text: text });
+    },
+
+    /* ---- rule providers & geo data ---- */
+    ruleProviders: function () { return live('ruleProviders', '/providers/rules'); },
+    updateRuleProvider: function (name) {
+      return live('updateRuleProvider', { path: '/providers/rules/' + encodeURIComponent(name) + '/update', method: 'POST' }, {});
+    },
+    geoUpdate: function () { return live('geoUpdate', { path: '/system/geo', method: 'POST' }, {}); },
+
+    /* ---- advanced DNS ---- */
+    dnsConfig: function () { return live('dnsConfig', '/dns/config'); },
+
+    /* ---- LAN ACL ---- */
+    acl: function () { return live('acl', '/proxy/acl'); },
+    saveAcl: function (payload) {
+      return live('saveAcl', { path: '/proxy/acl', method: 'PUT' }, payload);
+    },
+
+    /* ---- backup & restore ---- */
+    backupList: function () { return live('backupList', '/backup'); },
+    backupCreate: function (label) {
+      return live('backupCreate', { path: '/backup', method: 'POST' }, { label: label || 'manual' });
+    },
+    backupRestore: function (name) {
+      return live('backupRestore', { path: '/backup/restore', method: 'POST' }, { name: name });
+    },
+    backupDelete: function (name) {
+      return live('backupDelete', { path: '/backup/' + encodeURIComponent(name), method: 'DELETE' });
+    },
+    /* Raw gzip body — bypasses the JSON wrapper on purpose. */
+    backupUpload: async function (bytes) {
+      if (cfg.mock && mock && typeof mock.backupUpload === 'function') return mock.backupUpload(bytes);
+      const headers = { 'Content-Type': 'application/gzip', Accept: 'application/json' };
+      if (cfg.secret) headers['X-FlClash-Secret'] = cfg.secret;
+      const response = await fetch(url('/backup/upload'), {
+        method: 'POST', body: bytes, headers: headers, credentials: 'same-origin'
+      });
+      const payload = await response.json().catch(function () { return {}; });
+      if (!response.ok) throw new Error(payload.error || '恢复失败');
+      return payload;
+    },
+    // Authenticated blob download: REST auth accepts headers only, so the
+    // secret never travels in a URL (no logs / history leakage).
+    backupDownload: async function (name) {
+      const headers = { Accept: 'application/gzip' };
+      if (cfg.secret) headers['X-FlClash-Secret'] = cfg.secret;
+      const response = await fetch(url('/backup/download/' + encodeURIComponent(name)), {
+        headers: headers, credentials: 'same-origin', cache: 'no-store'
+      });
+      if (!response.ok) throw new Error('下载失败 (' + response.status + ')');
+      return response.blob();
     }
   };
 })();

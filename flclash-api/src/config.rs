@@ -22,6 +22,77 @@ pub struct CoreConfigView {
     pub dns_default_nameservers: Vec<String>,
     pub dns_fake_ip_range: String,
     pub dns_fake_ip_filter: Vec<String>,
+    // Advanced DNS (mihomo): fallback chain, per-role nameservers, policy map.
+    pub dns_fallback: Vec<String>,
+    pub dns_proxy_server_ns: Vec<String>,
+    pub dns_direct_ns: Vec<String>,
+    pub dns_fb_geoip: Option<bool>,
+    pub dns_fb_geoip_code: String,
+    pub dns_fb_ipcidr: Vec<String>,
+    pub dns_fb_domain: Vec<String>,
+    pub dns_ns_policy: Vec<(String, Vec<String>)>,
+    pub dns_ipv6: Option<bool>,
+}
+
+impl CoreConfigView {
+    /// The full dns: view the advanced DNS page edits. Keys are the canonical
+    /// mihomo names so what the UI shows is exactly what lands in the file.
+    pub fn dns_json(&self) -> Value {
+        let mut policy = serde_json::Map::new();
+        for (k, v) in &self.dns_ns_policy {
+            policy.insert(k.clone(), Value::Array(v.iter().map(|s| Value::String(s.clone())).collect()));
+        }
+        let mut fb_filter = serde_json::Map::new();
+        if let Some(g) = self.dns_fb_geoip { fb_filter.insert("geoip".into(), Value::Bool(g)); }
+        if !self.dns_fb_geoip_code.is_empty() { fb_filter.insert("geoip-code".into(), Value::String(self.dns_fb_geoip_code.clone())); }
+        if !self.dns_fb_ipcidr.is_empty() { fb_filter.insert("ipcidr".into(), json_arr(&self.dns_fb_ipcidr)); }
+        if !self.dns_fb_domain.is_empty() { fb_filter.insert("domain".into(), json_arr(&self.dns_fb_domain)); }
+        serde_json::json!({
+            "enable": self.dns_enable,
+            "enhanced-mode": if self.dns_mode.is_empty() { "redir-host" } else { &self.dns_mode },
+            "fake-ip-range": if self.dns_fake_ip_range.is_empty() { "198.18.0.1/16" } else { &self.dns_fake_ip_range },
+            "fake-ip-filter": self.dns_fake_ip_filter,
+            "nameserver": self.dns_nameservers,
+            "default-nameserver": self.dns_default_nameservers,
+            "fallback": self.dns_fallback,
+            "proxy-server-nameserver": self.dns_proxy_server_ns,
+            "direct-nameserver": self.dns_direct_ns,
+            "fallback-filter": Value::Object(fb_filter),
+            "nameserver-policy": Value::Object(policy),
+            "ipv6": self.dns_ipv6,
+        })
+    }
+}
+
+fn json_arr(items: &[String]) -> Value {
+    Value::Array(items.iter().map(|s| Value::String(s.clone())).collect())
+}
+
+/// Split `key: value` where the key may be quoted and contain ':' itself
+/// (e.g. `'geosite:cn':`). Falls back to the first colon otherwise.
+fn split_yaml_kv(line: &str) -> Option<(String, &str)> {
+    let t = line.trim();
+    let first = t.chars().next()?;
+    if first == '\'' || first == '"' {
+        let end = t[1..].find(first)? + 1;
+        let key = t[1..end].to_string();
+        let rest = t[end + 1..].trim_start();
+        let value = rest.strip_prefix(':')?.trim();
+        return Some((key, value));
+    }
+    let (k, v) = t.split_once(':')?;
+    Some((k.trim().to_string(), v.trim()))
+}
+
+fn unquote(s: &str) -> String {
+    let t = s.trim();
+    if (t.starts_with('\'') && t.ends_with('\'') && t.len() >= 2)
+        || (t.starts_with('"') && t.ends_with('"') && t.len() >= 2)
+    {
+        t[1..t.len() - 1].to_string()
+    } else {
+        t.to_string()
+    }
 }
 
 fn yaml_bool(v: bool) -> &'static str {
@@ -90,26 +161,56 @@ pub fn file_config(path: &Path) -> CoreConfigView {
             continue;
         }
         if in_dns {
+            let indent = line.len() - line.trim_start().len();
             if trimmed.starts_with("- ") {
-                let item = trimmed[2..].trim().to_string();
-                if dns_key == "nameserver" {
-                    cfg.dns_nameservers.push(item);
-                } else if dns_key == "default-nameserver" {
-                    cfg.dns_default_nameservers.push(item);
-                } else if dns_key == "fake-ip-filter" {
-                    cfg.dns_fake_ip_filter.push(item);
+                let item = unquote(&trimmed[2..]);
+                match dns_key.as_str() {
+                    "nameserver" => cfg.dns_nameservers.push(item),
+                    "default-nameserver" => cfg.dns_default_nameservers.push(item),
+                    "fake-ip-filter" => cfg.dns_fake_ip_filter.push(item),
+                    "fallback" => cfg.dns_fallback.push(item),
+                    "proxy-server-nameserver" => cfg.dns_proxy_server_ns.push(item),
+                    "direct-nameserver" => cfg.dns_direct_ns.push(item),
+                    "ipcidr" => cfg.dns_fb_ipcidr.push(item),
+                    "domain" => cfg.dns_fb_domain.push(item),
+                    _ => {
+                        // list items under a nameserver-policy domain key
+                        if dns_key == "nameserver-policy" {
+                            if let Some(last) = cfg.dns_ns_policy.last_mut() {
+                                last.1.push(item);
+                            }
+                        }
+                    }
                 }
                 continue;
             }
-            if let Some((key, value)) = trimmed.split_once(':') {
-                let value = value.trim();
-                match key {
+            if let Some((key, value)) = split_yaml_kv(trimmed) {
+                if dns_key == "fallback-filter" && indent >= 4 {
+                    match key.as_str() {
+                        "geoip" => cfg.dns_fb_geoip = Some(value == "true"),
+                        "geoip-code" => cfg.dns_fb_geoip_code = value.to_string(),
+                        "ipcidr" | "domain" => dns_key = key,
+                        _ => {}
+                    }
+                    continue;
+                }
+                if dns_key == "nameserver-policy" && indent >= 4 {
+                    let servers = if value.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![unquote(value)]
+                    };
+                    cfg.dns_ns_policy.push((key, servers));
+                    continue;
+                }
+                match key.as_str() {
                     "enable" => cfg.dns_enable = value == "true",
                     "enhanced-mode" => cfg.dns_mode = value.to_string(),
                     "fake-ip-range" => cfg.dns_fake_ip_range = value.to_string(),
+                    "ipv6" => cfg.dns_ipv6 = Some(value == "true"),
                     _ => {}
                 }
-                dns_key = key.to_string();
+                dns_key = key;
             }
         }
     }
@@ -187,7 +288,8 @@ pub async fn save_config(
         && (patch.get("dns").is_some()
             || patch.get("tun").is_some()
             || patch.get("tunStack").is_some()
-            || patch.get("mode").is_some())
+            || patch.get("mode").is_some()
+            || patch.get("externalUi").is_some())
     {
         if tun_runtime || patch.get("tun").is_some() || patch.get("tunStack").is_some() {
             // FlClash's native IPC hub deliberately skips updateTun during a
@@ -215,7 +317,9 @@ pub async fn save_config(
 }
 
 /// Renders the dns: block from a patch object (UI field names accepted).
-fn render_dns_block(patch: &Value) -> Option<String> {
+/// Keys absent from the patch keep their current file values (`current`),
+/// so the basic settings page never wipes advanced DNS fields.
+fn render_dns_block(patch: &Value, current: &CoreConfigView) -> Option<String> {
     let dns = patch.get("dns")?.as_object()?;
     let mut out = String::from("dns:\n");
     let enable = dns.get("enable").and_then(|v| v.as_bool()).unwrap_or(true);
@@ -241,7 +345,7 @@ fn render_dns_block(patch: &Value) -> Option<String> {
         .unwrap_or("198.18.0.1/16");
     out.push_str(&format!("  fake-ip-range: {}\n", range));
     let list = |key: &str, fallback: &[&str]| -> Vec<String> {
-        match dns.get(key) {
+        let items: Vec<String> = match dns.get(key) {
             Some(Value::Array(items)) => items
                 .iter()
                 .filter_map(|v| v.as_str().map(|s| s.trim().to_string()))
@@ -252,16 +356,23 @@ fn render_dns_block(patch: &Value) -> Option<String> {
                 .map(|l| l.trim().to_string())
                 .filter(|l| !l.is_empty())
                 .collect(),
-            _ if !fallback.is_empty() => fallback.iter().map(|s| s.to_string()).collect(),
             _ => Vec::new(),
+        };
+        // An empty nameserver/default list would break resolution; fall back
+        // to the built-in defaults instead of emitting a null YAML list.
+        if items.is_empty() && !fallback.is_empty() {
+            return fallback.iter().map(|s| s.to_string()).collect();
         }
+        items
     };
     let filters = list("fake-ip-filter", &["*.lan", "*.local", "+.msftconnecttest.com", "+.msftncsi.com"]);
     let defaults = list("default-nameserver", &["223.5.5.5", "119.29.29.29"]);
     let nameservers = list("nameserver", &["https://223.5.5.5/dns-query", "https://doh.pub/dns-query", "tls://120.53.53.53"]);
-    out.push_str("  fake-ip-filter:\n");
-    for item in &filters {
-        out.push_str(&format!("    - '{}'\n", item));
+    if !filters.is_empty() {
+        out.push_str("  fake-ip-filter:\n");
+        for item in &filters {
+            out.push_str(&format!("    - '{}'\n", item));
+        }
     }
     out.push_str("  default-nameserver:\n");
     for item in &defaults {
@@ -270,6 +381,104 @@ fn render_dns_block(patch: &Value) -> Option<String> {
     out.push_str("  nameserver:\n");
     for item in &nameservers {
         out.push_str(&format!("    - {}\n", item));
+    }
+    // ---- advanced fields: patch value wins, otherwise keep the file value
+    let adv_list = |key: &str, keep: &[String]| -> Vec<String> {
+        match dns.get(key) {
+            Some(Value::Array(items)) => items
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| s.trim().to_string()))
+                .filter(|s| !s.is_empty())
+                .collect(),
+            Some(Value::String(text)) => text
+                .lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect(),
+            Some(Value::Null) => Vec::new(),
+            _ => keep.to_vec(),
+        }
+    };
+    let emit_list = |out: &mut String, key: &str, items: &[String]| {
+        if items.is_empty() {
+            return;
+        }
+        out.push_str(&format!("  {}:\n", key));
+        for item in items {
+            out.push_str(&format!("    - '{}'\n", item.replace('\'', "")));
+        }
+    };
+    emit_list(&mut out, "fallback", &adv_list("fallback", &current.dns_fallback));
+    emit_list(&mut out, "proxy-server-nameserver", &adv_list("proxy-server-nameserver", &current.dns_proxy_server_ns));
+    emit_list(&mut out, "direct-nameserver", &adv_list("direct-nameserver", &current.dns_direct_ns));
+    if let Some(v) = dns.get("ipv6").and_then(|v| v.as_bool()).or(current.dns_ipv6) {
+        out.push_str(&format!("  ipv6: {}\n", yaml_bool(v)));
+    }
+    // fallback-filter: merge per key
+    let fb = dns.get("fallback-filter").and_then(|v| v.as_object());
+    let fb_geoip = fb.and_then(|m| m.get("geoip")).and_then(|v| v.as_bool()).or(current.dns_fb_geoip);
+    let fb_code = fb.and_then(|m| m.get("geoip-code")).and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| current.dns_fb_geoip_code.clone());
+    let fb_ipcidr = match fb.and_then(|m| m.get("ipcidr")) {
+        Some(Value::Array(items)) => items.iter().filter_map(|v| v.as_str().map(|s| s.trim().to_string())).filter(|s| !s.is_empty()).collect(),
+        _ => current.dns_fb_ipcidr.clone(),
+    };
+    let fb_domain = match fb.and_then(|m| m.get("domain")) {
+        Some(Value::Array(items)) => items.iter().filter_map(|v| v.as_str().map(|s| s.trim().to_string())).filter(|s| !s.is_empty()).collect(),
+        Some(Value::String(text)) => text.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect(),
+        _ => current.dns_fb_domain.clone(),
+    };
+    if fb_geoip.is_some() || !fb_code.is_empty() || !fb_ipcidr.is_empty() || !fb_domain.is_empty() {
+        out.push_str("  fallback-filter:\n");
+        if let Some(g) = fb_geoip {
+            out.push_str(&format!("    geoip: {}\n", yaml_bool(g)));
+        }
+        if !fb_code.is_empty() {
+            out.push_str(&format!("    geoip-code: {}\n", fb_code));
+        }
+        if !fb_ipcidr.is_empty() {
+            out.push_str("    ipcidr:\n");
+            for item in &fb_ipcidr {
+                out.push_str(&format!("      - '{}'\n", item.replace('\'', "")));
+            }
+        }
+        if !fb_domain.is_empty() {
+            out.push_str("    domain:\n");
+            for item in &fb_domain {
+                out.push_str(&format!("      - '{}'\n", item.replace('\'', "")));
+            }
+        }
+    }
+    // nameserver-policy: patch map replaces, absent keeps file map
+    let policy: Vec<(String, Vec<String>)> = match dns.get("nameserver-policy") {
+        Some(Value::Object(map)) => map
+            .iter()
+            .map(|(k, v)| {
+                let servers = match v {
+                    Value::Array(items) => items.iter().filter_map(|x| x.as_str().map(|s| s.trim().to_string())).filter(|s| !s.is_empty()).collect(),
+                    Value::String(text) => text.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
+                    _ => Vec::new(),
+                };
+                (k.clone(), servers)
+            })
+            .filter(|(k, v)| !k.trim().is_empty() && !v.is_empty())
+            .collect(),
+        _ => current.dns_ns_policy.clone(),
+    };
+    if !policy.is_empty() {
+        out.push_str("  nameserver-policy:\n");
+        for (domain, servers) in &policy {
+            let key = domain.replace('\'', "");
+            if servers.len() == 1 {
+                out.push_str(&format!("    '{}': '{}'\n", key, servers[0].replace('\'', "")));
+            } else {
+                out.push_str(&format!("    '{}':\n", key));
+                for server in servers {
+                    out.push_str(&format!("      - '{}'\n", server.replace('\'', "")));
+                }
+            }
+        }
     }
     Some(out)
 }
@@ -357,7 +566,8 @@ fn render_sniffer_block(patch: &Value) -> Option<String> {
 /// line-edited in place; tun, dns and sniffer are block-edited.
 pub fn persist_config(path: &Path, patch: &Value) -> Result<(), String> {
     let data = std::fs::read_to_string(path).map_err(|e| format!("read config: {}", e))?;
-    let dns_block = render_dns_block(patch);
+    let current = file_config(path);
+    let dns_block = render_dns_block(patch, &current);
     let tun_block = render_tun_block(patch);
     let sniffer_block = render_sniffer_block(patch);
     // Whenever the UI explicitly sets a DNS mode, reconcile the sniffer:
@@ -405,6 +615,9 @@ pub fn persist_config(path: &Path, patch: &Value) -> Result<(), String> {
     }
     if let Some(v) = parse_bool(patch, "ipv6") {
         scalars.push(("ipv6", yaml_bool(v).to_string()));
+    }
+    if let Some(v) = parse_str(patch, "externalUi") {
+        scalars.push(("external-ui", v.to_string()));
     }
     let tun = parse_bool(patch, "tun");
 
@@ -510,7 +723,7 @@ pub fn persist_config(path: &Path, patch: &Value) -> Result<(), String> {
         }
         out.push(line.to_string());
     }
-    let order = ["mixed-port", "socks-port", "port", "redir-port", "tproxy-port", "mode", "log-level", "allow-lan", "ipv6"];
+    let order = ["mixed-port", "socks-port", "port", "redir-port", "tproxy-port", "mode", "log-level", "allow-lan", "ipv6", "external-ui"];
     for key in order {
         if let Some((_, value)) = scalars.iter().find(|(k, _)| *k == key) {
             if !appended.contains(key) {
@@ -561,6 +774,47 @@ pub fn write_atomic(path: &Path, data: &[u8]) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn advanced_dns_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("flclash-dns-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.yaml");
+        std::fs::write(&path, "mixed-port: 7892\nmode: rule\ndns:\n  enable: true\n  enhanced-mode: fake-ip\n  nameserver:\n    - https://223.5.5.5/dns-query\n").unwrap();
+        let patch = serde_json::json!({"dns": {
+            "enable": true,
+            "enhanced-mode": "fake-ip",
+            "nameserver": ["https://223.5.5.5/dns-query"],
+            "fallback": ["https://1.1.1.1/dns-query", "tls://8.8.4.4"],
+            "proxy-server-nameserver": ["https://223.5.5.5/dns-query"],
+            "direct-nameserver": ["223.5.5.5"],
+            "fallback-filter": {"geoip": true, "geoip-code": "CN", "ipcidr": ["240.0.0.0/4"], "domain": ["+.google.com"]},
+            "nameserver-policy": {"+.internal.example.com": ["10.0.0.1"], "geosite:cn": ["223.5.5.5", "119.29.29.29"]},
+            "ipv6": false
+        }});
+        persist_config(&path, &patch).unwrap();
+        let cfg = file_config(&path);
+        assert_eq!(cfg.dns_fallback, vec!["https://1.1.1.1/dns-query", "tls://8.8.4.4"]);
+        assert_eq!(cfg.dns_proxy_server_ns, vec!["https://223.5.5.5/dns-query"]);
+        assert_eq!(cfg.dns_direct_ns, vec!["223.5.5.5"]);
+        assert_eq!(cfg.dns_fb_geoip, Some(true));
+        assert_eq!(cfg.dns_fb_geoip_code, "CN");
+        assert_eq!(cfg.dns_fb_ipcidr, vec!["240.0.0.0/4"]);
+        assert_eq!(cfg.dns_fb_domain, vec!["+.google.com"]);
+        assert_eq!(cfg.dns_ns_policy.len(), 2);
+        assert!(cfg.dns_ns_policy.iter().any(|(k, v)| k == "+.internal.example.com" && v == &vec!["10.0.0.1".to_string()]));
+        assert!(cfg.dns_ns_policy.iter().any(|(k, v)| k == "geosite:cn" && v.len() == 2));
+        assert_eq!(cfg.dns_ipv6, Some(false));
+        // A later basic-settings patch must NOT wipe the advanced fields.
+        let basic = serde_json::json!({"dns": {"enable": true, "enhanced-mode": "fake-ip", "nameserver": ["https://doh.pub/dns-query"]}});
+        persist_config(&path, &basic).unwrap();
+        let cfg2 = file_config(&path);
+        assert_eq!(cfg2.dns_fallback.len(), 2);
+        assert_eq!(cfg2.dns_ns_policy.len(), 2);
+        assert_eq!(cfg2.dns_fb_geoip, Some(true));
+        assert_eq!(cfg2.dns_nameservers, vec!["https://doh.pub/dns-query"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     use super::*;
 
     #[test]

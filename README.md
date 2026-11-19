@@ -24,7 +24,11 @@ FlClash 的 OpenWrt 移植：把 **mihomo 内核**、**Rust IPC host**、**Rust/
 - **订阅导入**：Clash YAML、base64 节点列表，以及分享链接 `ss / ssr / vmess / vless / trojan / hysteria (v1) / hysteria2 / hy2 / tuic / anytls`。
 - **配置管理**：订阅更新、编辑（名称 / URL / 自动更新间隔）、流量与到期展示、一键应用。
 - **代理与连接**：代理组 / 节点测速与切换、连接列表与关闭、规则查看、日志采样。
-- **DNS 进阶**：fake-ip / redir-host / mixed、DoH / DoT / bootstrap、DNS 查询与缓存刷新。
+- **DNS 进阶**：fake-ip / redir-host / mixed、DoH / DoT / bootstrap、fallback 链、代理节点/直连专用 nameserver、fallback-filter（geoip / ipcidr / domain）、分域名 `nameserver-policy`、DNS 查询与缓存刷新。基础设置页改动不会清空进阶字段。
+- **访问控制**：局域网客户端全部 / 白名单 / 黑名单（IP·CIDR·MAC），目标网段与端口排除，路由器自身出站接管开关；保存即重建 nft / iptables 规则。
+- **配置混入与校验**：`mixin.yaml` 深合并（映射递归、规则前置、`null` 删键），应用前结构校验（端口/枚举/引用完整性），订阅原始 YAML 可直接编辑并按需重应用。
+- **备份与恢复**：内置快照（配置 + 订阅 + 混入），保留最近 12 份，恢复前自动留底、校验后原子替换；支持下载与上传恢复。
+- **规则提供者与 Geo 数据**：查看规则提供者条数与更新时间、单条更新；GeoIP / GeoSite 由内核在线升级。
 - **透明代理状态机**：REDIRECT / TPROXY / TUN 三种接管路径由 `proxy-rules.sh sync` 统一收敛（见[透明代理状态机](#透明代理状态机)）；硬件流量卸载自动关闭；核心异常退出自动清理残留规则。
 - **双栈 IP 状态卡**：出口 IPv4 / IPv6 同屏显示，多源查询（Cloudflare 优先）+ 中文归属地 + 启停状态感知（见[状态卡与 IP 资料](#状态卡与-ip-资料)）。
 - **双内核**：内置 mihomo（FlClash native-IPC core，由 `flclash-core-bridge` 驱动）；sing-box 通过在线更新安装，以 `clash_api` 模式接入。WebUI 可查看版本、在线更新、一键切换。

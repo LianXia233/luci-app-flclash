@@ -33,7 +33,8 @@
 
   const META = {
     dashboard: '仪表盘', proxies: '代理', profiles: '配置', requests: '连接',
-    tools: '工具', dns: 'DNS 测试', logs: '日志', rules: '规则', settings: '设置'
+    tools: '工具', dns: 'DNS 测试', logs: '日志', rules: '规则', settings: '设置',
+    backup: '备份与恢复', mixin: '配置混入', acl: '访问控制', dnsAdvanced: 'DNS 进阶'
   };
 
   let current = 'dashboard';
@@ -71,7 +72,7 @@
   }
 
   function paintNav(name) {
-    const root = ['dns', 'logs', 'rules', 'settings'].indexOf(name) >= 0 ? 'tools' : name;
+    const root = ['dns', 'logs', 'rules', 'settings', 'backup', 'mixin', 'acl', 'dnsAdvanced'].indexOf(name) >= 0 ? 'tools' : name;
     ui.$$('.rail-item,.bottom-item').forEach(function (button) {
       button.classList.toggle('is-active', button.getAttribute('data-view') === root);
     });
