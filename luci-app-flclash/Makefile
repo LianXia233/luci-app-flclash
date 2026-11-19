@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-flclash
 PKG_VERSION:=1.2.0
-PKG_RELEASE:=1
+PKG_RELEASE:=2
 
 PKG_MAINTAINER:=FlClash WebUI
 PKG_LICENSE:=GPL-3.0-only
@@ -115,6 +115,7 @@ define Package/luci-app-flclash/postinst
 [ -n "$${IPKG_INSTROOT}" ] || {
 	/etc/init.d/flclash-core enable
 	/etc/init.d/flclash-api enable
+	/etc/init.d/flclash-proxy enable
 }
 exit 0
 endef

@@ -137,7 +137,7 @@ async fn main() {
     tokio::spawn(loops::sample_traffic(st.clone()));
     tokio::spawn(loops::sample_logs(st.clone()));
     tokio::spawn(loops::sample_totals(st.clone()));
-    tokio::spawn(loops::apply_ports(st.clone()));
+    tokio::spawn(loops::sync_proxy(st.clone()));
     tokio::spawn(loops::auto_update(st.clone()));
     tokio::spawn(loops::refresh_outbound(st.clone()));
 

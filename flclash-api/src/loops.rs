@@ -1,12 +1,12 @@
-//! Background loops: traffic/log samplers, totals polling, port re-apply on
-//! core restarts, subscription auto-update and the outbound IP cache. Long
+//! Background loops: traffic/log samplers, totals polling, transparent-proxy
+//! reconciliation, subscription auto-update and the outbound IP cache. Long
 //! streams use `curl -N` (newline-delimited JSON from the controller); the
 //! rest uses the hand-rolled loopback client.
 
 use std::time::Duration;
 use tokio::io::AsyncBufReadExt;
 
-use crate::ctrl::{ctrl_json, ctrl_req, curl_json};
+use crate::ctrl::{ctrl_json, curl_json};
 use crate::state::{now_secs, AppState, LogEntry, MAX_HISTORY, MAX_LOGS};
 
 fn controller_url(controller: &str, path: &str) -> String {
@@ -134,52 +134,14 @@ pub async fn sample_totals(st: std::sync::Arc<AppState>) {
     }
 }
 
-/// The bundled core ignores mixed-port/socks-port in its YAML until the
-/// controller is patched, so re-apply whenever the core PID changes.
-pub async fn apply_ports(st: std::sync::Arc<AppState>) {
-    let mut last_pid = 0u32;
+/// Reconcile transparent proxy after firewall restarts, core crashes and IPC
+/// reloads. The shell state machine is idempotent and repairs partial chains.
+pub async fn sync_proxy(_st: std::sync::Arc<AppState>) {
     loop {
-        let pid = crate::state::core_pid();
-        if pid != 0 && pid != last_pid {
-            if let Ok(raw) = std::fs::read_to_string(st.config_path()) {
-                let mut patch = serde_json::Map::new();
-                for line in raw.lines() {
-                    let line = line.trim();
-                    if let Some(rest) = line.strip_prefix("mixed-port:") {
-                        if let Ok(v) = rest.trim().parse::<i64>() {
-                            if v > 0 {
-                                patch.insert("mixed-port".into(), serde_json::json!(v));
-                            }
-                        }
-                    }
-                    if let Some(rest) = line.strip_prefix("socks-port:") {
-                        if let Ok(v) = rest.trim().parse::<i64>() {
-                            if v > 0 {
-                                patch.insert("socks-port".into(), serde_json::json!(v));
-                            }
-                        }
-                    }
-                }
-                if !patch.is_empty() {
-                    let body = serde_json::to_string(&patch).unwrap_or_default();
-                    if let Ok(reply) = ctrl_req(
-                        &st.controller,
-                        st.secret.as_deref(),
-                        "PATCH",
-                        "/configs",
-                        Some(&body),
-                        Duration::from_secs(5),
-                    )
-                    .await
-                    {
-                        if reply.status < 400 {
-                            eprintln!("applied configured ports: {}", body);
-                        }
-                    }
-                }
-            }
-        }
-        last_pid = pid;
+        let _ = tokio::process::Command::new("/usr/libexec/flclash/proxy-rules.sh")
+            .arg("sync")
+            .output()
+            .await;
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
 }

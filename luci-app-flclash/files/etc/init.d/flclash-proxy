@@ -10,7 +10,8 @@ start() {
 }
 
 stop() {
-	/usr/libexec/flclash/proxy-rules.sh stop >/dev/null 2>&1
+	# Keep the UCI wish so boot can restore takeover; only remove live rules.
+	/usr/libexec/flclash/proxy-rules.sh teardown >/dev/null 2>&1
 }
 
 restart() {

@@ -289,6 +289,24 @@ fn groups_summary_from(data: &Value) -> Value {
 
 // ------------------------------------------------------------------ handlers
 
+fn proxy_state() -> String {
+    std::fs::read_to_string("/tmp/flclash-proxy.state")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| "off".into())
+}
+
+fn proxy_wish() -> bool {
+    std::process::Command::new("uci")
+        .args(["-q", "get", "flclash.proxy.enabled"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "1")
+        .unwrap_or(false)
+}
+
+fn proxy_enabled() -> bool {
+    matches!(proxy_state().as_str(), "on" | "tun")
+}
+
 pub async fn status(State(st): State<Arc<AppState>>) -> Response {
     let reachable = core_reachable(&st).await;
     let mut running = false;
@@ -402,7 +420,9 @@ pub async fn status(State(st): State<Arc<AppState>>) -> Response {
         "mixedPort": cfg.mixed_port,
         "socksPort": cfg.socks_port,
         "httpPort": cfg.port,
-        "systemProxy": false,
+        "systemProxy": proxy_enabled(),
+        "proxyLan": proxy_wish(),
+        "takeoverState": proxy_state(),
         "tun": cfg.tun,
         "tunStack": cfg.tun_stack,
         "dnsMode": cfg.dns_mode,
@@ -527,7 +547,7 @@ pub async fn config_get(State(st): State<Arc<AppState>>) -> Response {
         "tunStack": live.tun_stack,
         "dnsMode": live.dns_mode,
         "logLevel": live.log_level,
-        "systemProxy": false,
+        "systemProxy": proxy_enabled(),
     }))
 }
 
@@ -740,9 +760,10 @@ pub async fn service_action(
 /// DNS hijack handled by /usr/libexec/flclash/proxy-rules.sh. Never touches
 /// the router's own outbound path, so the management plane stays alive.
 pub async fn proxy_status(State(st): State<Arc<AppState>>) -> Response {
-    let enabled = std::fs::read_to_string("/tmp/flclash-proxy.state")
-        .map(|s| s.trim() == "on")
-        .unwrap_or(false);
+    let enabled = proxy_wish();
+    let state = proxy_state();
+    let cfg = file_config(&st.config_path());
+    let core_running = core_reachable(&st).await;
     let backend = std::process::Command::new("/usr/libexec/flclash/proxy-rules.sh")
         .arg("backend")
         .output()
@@ -762,33 +783,31 @@ pub async fn proxy_status(State(st): State<Arc<AppState>>) -> Response {
                 "iptables".to_string()
             }
         });
-    let rules = if backend == "iptables" {
-        std::process::Command::new("iptables")
-            .args(["-t", "nat", "-n", "-L", "FLCLASH"])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    } else {
-        std::process::Command::new("nft")
-            .args(["list", "table", "inet", "flclash"])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    };
-    let lan_if = std::fs::read_to_string("/proc/net/route")
+    let rules = std::process::Command::new("/usr/libexec/flclash/proxy-rules.sh")
+        .arg("status")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    let lan_if = std::process::Command::new("/usr/libexec/flclash/proxy-rules.sh")
+        .arg("lan")
+        .output()
         .ok()
-        .and_then(|data| {
-            data.lines()
-                .skip(1)
-                .find(|l| {
-                    let f: Vec<&str> = l.split('\t').collect();
-                    f.len() > 3 && f[1] == "00000000" && f[3] != "FFFFFFFF"
-                })
-                .map(|l| l.split('\t').next().unwrap_or("").to_string())
+        .and_then(|o| {
+            if !o.status.success() {
+                return None;
+            }
+            let value = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            (!value.is_empty()).then_some(value)
         })
         .unwrap_or_else(|| "br-lan".into());
     ok_json(json!({
         "enabled": enabled,
+        "proxyWish": enabled,
+        "takeover": state.clone(),
+        "coreRunning": core_running,
+        "mode": cfg.mode,
+        "tunConfigured": cfg.tun,
+        "tunActive": core_running && state == "tun",
         "rulesActive": rules,
         "firewallBackend": backend,
         "lanInterface": lan_if,
@@ -799,7 +818,7 @@ pub async fn proxy_status(State(st): State<Arc<AppState>>) -> Response {
 }
 
 pub async fn proxy_toggle(
-    State(st): State<Arc<AppState>>,
+    State(_st): State<Arc<AppState>>,
     Path(action): Path<String>,
 ) -> Response {
     if !matches!(action.as_str(), "start" | "stop") {
@@ -812,11 +831,8 @@ pub async fn proxy_toggle(
         .await;
     match output {
         Ok(out) if out.status.success() => {
-            let _ = tokio::fs::write(
-                "/tmp/flclash-proxy.state",
-                if action == "start" { "on" } else { "off" },
-            )
-            .await;
+            // The helper owns the live state ("on"/"tun"/"off"). Do not
+            // overwrite a successful TUN convergence with a generic "on".
             ok_json(json!({"ok": true, "action": action}))
         }
         Ok(out) => bad_gateway(&format!(

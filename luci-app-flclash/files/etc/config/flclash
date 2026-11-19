@@ -13,6 +13,13 @@ config flclash 'main'
 	option core_type 'mihomo'
 	option core_mode 'ipc'
 
+config flclash 'proxy'
+	option enabled '0'
+	option backend ''
+	option lan_if ''
+	# Avoid silent IPv6 bypass on IPv4-only REDIRECT/TPROXY deployments.
+	option filter_aaaa '1'
+
 config flclash 'api'
 	option enabled '1'
 	option listen '0.0.0.0:9098'

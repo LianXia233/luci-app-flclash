@@ -253,6 +253,13 @@ pub async fn reload_core(st: &AppState) {
         }
     }
 
+    if crate::config::file_config(&cfg_path).tun {
+        // The native IPC core can drop TUN on controller PATCH/PUT updates.
+        // Re-run listener.start with the complete config instead.
+        let _ = service(st, "restart").await;
+        return;
+    }
+
     let reachable = crate::ctrl::ctrl_req(
         &st.controller,
         st.secret.as_deref(),
@@ -294,6 +301,14 @@ pub async fn service(st: &AppState, action: &str) -> Result<(), String> {
         .output()
         .await
         .map_err(|e| format!("{}: {}", action, e))?;
+    // Keep interception, DNS and core liveness in the same state. stop uses
+    // teardown so it works even while the old process is still exiting;
+    // start/restart waits briefly and then rebuilds the requested mode.
+    let proxy_action = if action == "stop" { "teardown" } else { "sync" };
+    let _ = tokio::process::Command::new("/usr/libexec/flclash/proxy-rules.sh")
+        .arg(proxy_action)
+        .output()
+        .await;
     if !output.status.success() {
         let text = format!(
             "{} {}",

@@ -139,6 +139,7 @@ pub async fn save_config(
     patch: &Value,
 ) -> Result<(), String> {
     let mut runtime = serde_json::Map::new();
+    let tun_runtime = file_config(&st.config_path()).tun || parse_bool(patch, "tun") == Some(true);
     if let Some(v) = parse_str(patch, "mode") {
         runtime.insert("mode".into(), Value::String(v.to_string()));
     }
@@ -162,7 +163,7 @@ pub async fn save_config(
     }
     // tun is NOT runtime-patched: taking over the router needs the full
     // auto-route/auto-redirect block, which only a config reload applies.
-    if !runtime.is_empty() {
+    if !runtime.is_empty() && !tun_runtime {
         // Failure is deliberately non-fatal: a stopped core must not turn
         // "save settings" into an error (connection refused must not leak).
         let body = serde_json::to_string(&Value::Object(runtime)).unwrap_or_default();
@@ -188,7 +189,27 @@ pub async fn save_config(
             || patch.get("tunStack").is_some()
             || patch.get("mode").is_some())
     {
-        crate::profiles::reload_core(st).await;
+        if tun_runtime || patch.get("tun").is_some() || patch.get("tunStack").is_some() {
+            // FlClash's native IPC hub deliberately skips updateTun during a
+            // controller ApplyConfig. A real process restart is required for
+            // listener.start to create/remove Meta and its policy routes.
+            let _ = crate::profiles::service(st, "restart").await;
+        } else {
+            crate::profiles::reload_core(st).await;
+        }
+    }
+    if result.is_ok() {
+        if let Some(enabled) = parse_bool(patch, "proxyLan") {
+            let action = if enabled { "start" } else { "stop" };
+            let output = tokio::process::Command::new("/usr/libexec/flclash/proxy-rules.sh")
+                .arg(action)
+                .output()
+                .await
+                .map_err(|e| format!("proxy-rules.sh {}: {}", action, e))?;
+            if !output.status.success() {
+                return Err(format!("透明代理{}失败", if enabled { "启用" } else { "关闭" }));
+            }
+        }
     }
     result
 }
@@ -293,6 +314,17 @@ fn render_tun_block(patch: &Value) -> Option<String> {
     out.push_str("  auto-route: true\n");
     out.push_str("  auto-redirect: true\n");
     out.push_str("  auto-detect-interface: true\n");
+    // Keep management and directly connected networks out of the tunnel.
+    // Without these exclusions LAN/WAN SSH and LuCI replies may be routed back
+    // into Meta, especially when the router has a public WAN address.
+    out.push_str("  route-exclude-address:\n");
+    for cidr in [
+        "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16",
+        "172.16.0.0/12", "192.0.0.0/24", "192.168.0.0/16", "224.0.0.0/4",
+        "240.0.0.0/4", "::1/128", "fc00::/7", "fe80::/10", "ff00::/8",
+    ] {
+        out.push_str(&format!("    - {}\n", cidr));
+    }
     out.push_str("  dns-hijack:\n");
     out.push_str("    - any:53\n");
     out.push_str("  mtu: 1500\n");
@@ -554,6 +586,9 @@ mod tests {
         assert!(text.contains("stack: mixed"));
         assert!(text.contains("auto-route: true"));
         assert!(text.contains("auto-redirect: true"));
+        assert!(text.contains("route-exclude-address:"));
+        assert!(text.contains("    - 192.168.0.0/16"));
+        assert!(text.contains("    - fc00::/7"));
         assert!(text.contains("dns-hijack:"));
         assert!(text.contains("proxies:"));
         std::fs::remove_dir_all(&dir).ok();

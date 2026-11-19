@@ -750,6 +750,11 @@ fn tun_inbound(y: &Y) -> Option<J> {
         "stack": stack,
         "strict_route": false,
         "route_address": ["0.0.0.0/0"],
+        "route_exclude_address": [
+            "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16",
+            "172.16.0.0/12", "192.0.0.0/24", "192.168.0.0/16", "224.0.0.0/4",
+            "240.0.0.0/4", "::1/128", "fc00::/7", "fe80::/10", "ff00::/8"
+        ],
     }))
 }
 
@@ -1032,6 +1037,18 @@ rules:
         assert!(!rules.iter().any(|r| r["rule_set"] == json!("geoip-cn")));
         assert!(v["route"].get("rule_set").is_none());
         assert!(v["dns"]["servers"].as_array().unwrap().iter().any(|s| s["type"] == "fakeip"));
+    }
+
+    #[test]
+    fn tun_excludes_management_networks() {
+        let yaml = format!("{}\ntun:\n  enable: true\n  stack: gvisor\n", YAML);
+        let json = convert(&yaml).unwrap();
+        let v: J = serde_json::from_str(&json).unwrap();
+        let tun = v["inbounds"].as_array().unwrap().iter().find(|i| i["type"] == "tun").unwrap();
+        assert_eq!(tun["auto_route"], true);
+        let excluded = tun["route_exclude_address"].as_array().unwrap();
+        assert!(excluded.contains(&json!("192.168.0.0/16")));
+        assert!(excluded.contains(&json!("fc00::/7")));
     }
 
     #[test]

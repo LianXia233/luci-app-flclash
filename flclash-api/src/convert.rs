@@ -835,7 +835,7 @@ pub fn header_map(config_path: &Path) -> Vec<(&'static str, String)> {
     let mut map: Vec<(&'static str, String)> = vec![
         ("mixed-port", "7892".into()),
         ("socks-port", "7891".into()),
-        ("port", "7892".into()),
+        ("port", "0".into()),
         ("redir-port", "7893".into()),
         ("tproxy-port", "7894".into()),
         ("external-controller", "127.0.0.1:9097".into()),

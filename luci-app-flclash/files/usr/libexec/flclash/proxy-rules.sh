@@ -1,37 +1,26 @@
 #!/bin/sh
-# /usr/libexec/flclash/proxy-rules.sh — LAN transparent proxy takeover.
+# FlClash transparent-proxy state machine for OpenWrt/ImmortalWrt.
 #
-# ShellClash-style rules (nft REDIRECT/TPROXY or iptables REDIRECT/TPROXY)
-# combined with HomeProxy's DNS hand-off (a dnsmasq conf snippet pointing at
-# the core's DNS listener). The router's own outbound traffic and the
-# management plane (SSH/LuCI) are never touched: only prerouting on the LAN
-# bridge is hooked.
+# The UCI flag is the user's redirect-mode wish. The live state is converged
+# from core liveness, tun.enable and that wish. TUN and REDIRECT never run
+# together, a core failure always removes interception, and inbound management
+# connections (SSH/LuCI) are exempted by connection direction, not just by IP.
 #
-# Firewall backend follows OpenClash's detection: `fw4` present -> nftables,
-# otherwise iptables. Override with FIREWALL_BACKEND=nftables|iptables.
-#
-# Usage: proxy-rules.sh start | stop | status | backend
-# State: /etc/config/flclash named section proxy (option enabled), so the
-# takeover survives reboots via /etc/init.d/flclash-proxy.
+# Usage: proxy-rules.sh start|stop|status|backend|prepare|sync|teardown|purge|boot
 
 NFT=/usr/sbin/nft
 DNSCONF=/tmp/dnsmasq.d/flclash-dns.conf
+CFG=${CFG:-/etc/flclash/config.yaml}
 TABLE=flclash
-LAN_IF=${LAN_IF:-br-lan}
+CORE_TABLE=mihomo
+LAN_IF=${LAN_IF:-}
 DNS_PORT=1053
 REDIR_PORT=7893
 TPROXY_PORT=7894
 FWMARK=0x162
-# Core outbound mark (routing-mark in config.yaml). The core's own sockets
-# carry this mark and are excluded from OUTPUT redirect to avoid a loop.
 CORE_MARK=0x14d
-# Take over the router's own outbound TCP in addition to LAN clients.
-# Requires routing-mark in config.yaml; set LOCAL_TAKEOVER=0 to disable.
+STATE_FILE=/tmp/flclash-proxy.state
 LOCAL_TAKEOVER=${LOCAL_TAKEOVER:-1}
-
-# RFC1918 + loopback + CGN + link-local + multicast + reserved. fake-ip
-# (198.18.0.0/15) is deliberately NOT excluded: traffic to those addresses is
-# exactly what must enter the core.
 PRIVATE="10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.168.0.0/16, 224.0.0.0/4, 240.0.0.0/4"
 
 uci_enabled() {
@@ -45,7 +34,10 @@ uci_set() {
 	uci commit flclash
 }
 
-# --- backend detection (OpenClash style: command -v fw4) -------------------
+set_state() {
+	echo "$1" > "$STATE_FILE" 2>/dev/null
+}
+
 detect_backend() {
 	if [ -n "$FIREWALL_BACKEND" ]; then
 		case "$FIREWALL_BACKEND" in
@@ -61,153 +53,422 @@ detect_backend() {
 	fi
 }
 
-# --- DNS hand-off (shared by both backends) --------------------------------
-dns_on() {
-	# Self-heal: the core needs a DNS listener on $DNS_PORT for the LAN
-	# DNS hijack to work. The WebUI's DNS save path rewrites the dns: block
-	# without a listen key, so ensure it is present on every takeover.
-	CFG=/etc/flclash/config.yaml
-	NEED_RELOAD=0
-	if [ -f "$CFG" ]; then
-		if ! grep -qE '^[[:space:]]*listen:[[:space:]]*0\.0\.0\.0:'"$DNS_PORT" "$CFG" && grep -q '^dns:' "$CFG"; then
-			awk -v p="$DNS_PORT" '{print; if ($0 ~ /^dns:/) print "  listen: 0.0.0.0:" p}' "$CFG" > "$CFG.tmp" && \
-				cp "$CFG.tmp" "$CFG" && rm -f "$CFG.tmp"
-			NEED_RELOAD=1
-		fi
-		# OUTPUT takeover needs the core's routing-mark as a loop guard.
-		if [ "$LOCAL_TAKEOVER" = "1" ] && ! grep -qE '^routing-mark:' "$CFG"; then
-			awk '{print; if ($0 ~ /^external-controller:/) print "routing-mark: 333"}' "$CFG" > "$CFG.tmp" && \
-				cp "$CFG.tmp" "$CFG" && rm -f "$CFG.tmp"
-			NEED_RELOAD=1
-		fi
-		if [ "$NEED_RELOAD" = "1" ]; then
-			/etc/init.d/flclash-core restart >/dev/null 2>&1
-			sleep 2
-		fi
+detect_lan_if() {
+	local dev
+	dev=$(uci -q get flclash.proxy.lan_if 2>/dev/null)
+	if [ -z "$dev" ] && command -v ubus >/dev/null 2>&1 && command -v jsonfilter >/dev/null 2>&1; then
+		dev=$(ubus -t 2 call network.interface.lan status 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null)
 	fi
-	mkdir -p /tmp/dnsmasq.d
-	# Only mihomo exposes a DNS listener on $DNS_PORT. sing-box's Rust
-	# converter has no port listener, so pointing dnsmasq at 1053 would break
-	# resolution; leave the system resolver alone in that mode.
-	CORE_TYPE=$(uci -q get flclash.main.core_type 2>/dev/null)
-	# UCI server is authoritative: on ujail-enabled builds the conf-dir file
-	# can be hidden from the dnsmasq sandbox, so set the upstream via UCI too.
-	uci -q delete dhcp.@dnsmasq[0].server 2>/dev/null
-	if [ "$CORE_TYPE" = "sing-box" ]; then
-		rm -f "$DNSCONF"
-		uci -q set dhcp.@dnsmasq[0].noresolv=0 2>/dev/null
+	[ -n "$dev" ] || dev=$(uci -q get network.lan.device 2>/dev/null)
+	[ -n "$dev" ] || dev=br-lan
+	case "$dev" in
+		*[!A-Za-z0-9_.-]*) dev=br-lan ;;
+	esac
+	echo "$dev"
+}
+
+core_type() {
+	[ "$(uci -q get flclash.main.core_type 2>/dev/null)" = "sing-box" ] && echo sing-box || echo mihomo
+}
+
+core_alive() {
+	local port
+	port=$(uci -q get flclash.main.external_controller 2>/dev/null | sed 's/.*://')
+	[ -n "$port" ] || port=9097
+	netstat -lnt 2>/dev/null | grep -q "127.0.0.1:$port "
+}
+
+core_proc() {
+	ps w 2>/dev/null | grep -v grep | grep -qE "mihomo|sing-box"
+}
+
+wait_core() {
+	local i=0
+	while [ $i -lt 20 ]; do
+		core_alive && return 0
+		sleep 1
+		i=$((i+1))
+	done
+	return 1
+}
+
+wait_core_if_starting() {
+	core_alive && return 0
+	core_proc || return 1
+	wait_core
+}
+
+tun_enabled() {
+	[ -f "$CFG" ] || return 1
+	awk '/^tun:/{t=1; next} t && /^[^ \t#]/{t=0} t && /^[ \t]*enable:[[:space:]]*true/{found=1; exit} END{exit !found}' "$CFG"
+}
+
+tun_active() {
+	nft list table inet "$CORE_TABLE" >/dev/null 2>&1 && return 0
+	ip link show Meta >/dev/null 2>&1 && return 0
+	ip link show tun0 >/dev/null 2>&1
+}
+
+wait_tun() {
+	local i=0
+	while [ $i -lt 15 ]; do
+		tun_active && return 0
+		sleep 1
+		i=$((i+1))
+	done
+	return 1
+}
+
+# Prepare device-critical config before the core starts. The native FlClash IPC
+# core only applies TUN during listener.start, so adding these keys after a
+# controller reload is too late. Existing custom keys/lists are left intact.
+prepare_config() {
+	PREPARE_CHANGED=0
+	[ -f "$CFG" ] || return 0
+	local tmp="$CFG.flclash.tmp"
+
+	if ! grep -q '^dns:' "$CFG"; then
+		cat >> "$CFG" <<EOF
+
+dns:
+  enable: true
+  listen: 0.0.0.0:$DNS_PORT
+  enhanced-mode: redir-host
+  default-nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
+  nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
+EOF
+		PREPARE_CHANGED=1
+	elif ! grep -qE '^[[:space:]]*listen:[[:space:]]*0\.0\.0\.0:'"$DNS_PORT" "$CFG"; then
+		if awk '/^dns:/{d=1;next} d && /^[^ \t#]/{d=0} d && /^[ \t]*listen:/{found=1;exit} END{exit !found}' "$CFG"; then
+			awk -v p="$DNS_PORT" '
+				/^dns:/ {d=1; print; next}
+				d && /^[^ \t#]/ {d=0}
+				d && /^[ \t]*listen:/ {if (!seen) print "  listen: 0.0.0.0:" p; seen=1; next}
+				{print}
+			' "$CFG" > "$tmp"
+		else
+			awk -v p="$DNS_PORT" '{print; if ($0 ~ /^dns:/) print "  listen: 0.0.0.0:" p}' "$CFG" > "$tmp"
+		fi
+		cp "$tmp" "$CFG" && rm -f "$tmp" && PREPARE_CHANGED=1
+	fi
+
+	if grep -qE '^routing-mark:' "$CFG"; then
+		if ! grep -qE '^routing-mark:[[:space:]]*333([[:space:]]|$)' "$CFG"; then
+			awk '{if ($0 ~ /^routing-mark:/) print "routing-mark: 333"; else print}' "$CFG" > "$tmp" && \
+				cp "$tmp" "$CFG" && rm -f "$tmp" && PREPARE_CHANGED=1
+		fi
 	else
-		printf 'no-poll\nno-resolv\nserver=127.0.0.1#%s\n' "$DNS_PORT" > "$DNSCONF"
-		uci -q add_list "dhcp.@dnsmasq[0].server=127.0.0.1#$DNS_PORT" 2>/dev/null
-		uci -q set dhcp.@dnsmasq[0].noresolv=1 2>/dev/null
+		if grep -q '^external-controller:' "$CFG"; then
+			awk '{print; if ($0 ~ /^external-controller:/) print "routing-mark: 333"}' "$CFG" > "$tmp"
+		else
+			printf 'routing-mark: 333\n' > "$tmp"
+			cat "$CFG" >> "$tmp"
+		fi
+		cp "$tmp" "$CFG" && rm -f "$tmp" && PREPARE_CHANGED=1
 	fi
-	uci -q commit dhcp 2>/dev/null
+
+	# A dedicated HTTP listener cannot share the mixed listener's port. The
+	# mixed listener already provides HTTP and SOCKS, so disable the duplicate.
+	local mixed_port http_port
+	mixed_port=$(sed -n 's/^mixed-port:[[:space:]]*//p' "$CFG" | head -1)
+	http_port=$(sed -n 's/^port:[[:space:]]*//p' "$CFG" | head -1)
+	if [ -n "$mixed_port" ] && [ "$http_port" = "$mixed_port" ]; then
+		awk '{if ($0 ~ /^port:/) print "port: 0"; else print}' "$CFG" > "$tmp" && \
+			cp "$tmp" "$CFG" && rm -f "$tmp" && PREPARE_CHANGED=1
+	fi
+
+	if tun_enabled && ! awk '/^tun:/{t=1;next} t && /^[^ \t#]/{t=0} t && /^[ \t]*route-exclude-address:/{found=1;exit} END{exit !found}' "$CFG"; then
+		awk '
+			function exclusions() {
+				print "  route-exclude-address:"
+				print "    - 10.0.0.0/8"
+				print "    - 100.64.0.0/10"
+				print "    - 127.0.0.0/8"
+				print "    - 169.254.0.0/16"
+				print "    - 172.16.0.0/12"
+				print "    - 192.0.0.0/24"
+				print "    - 192.168.0.0/16"
+				print "    - 224.0.0.0/4"
+				print "    - 240.0.0.0/4"
+				print "    - ::1/128"
+				print "    - fc00::/7"
+				print "    - fe80::/10"
+				print "    - ff00::/8"
+			}
+			/^tun:/ {t=1; print; next}
+			t && /^[^ \t#]/ {exclusions(); t=0}
+			{print}
+			END {if (t) exclusions()}
+		' "$CFG" > "$tmp" && cp "$tmp" "$CFG" && rm -f "$tmp" && PREPARE_CHANGED=1
+	fi
+	rm -f "$tmp"
+	return 0
+}
+
+# --- DNS hand-off -----------------------------------------------------------
+
+dnsmasq_restart_robust() {
+	local i=0
 	/etc/init.d/dnsmasq restart >/dev/null 2>&1
+	while [ $i -lt 3 ]; do
+		sleep 1
+		netstat -lnu 2>/dev/null | grep -q ":53 " && return 0
+		/etc/init.d/dnsmasq stop >/dev/null 2>&1
+		sleep 1
+		/etc/init.d/dnsmasq start >/dev/null 2>&1
+		i=$((i+1))
+	done
+	netstat -lnu 2>/dev/null | grep -q ":53 "
+}
+
+dns_save() {
+	[ "$(uci -q get flclash.proxy.dns_saved 2>/dev/null)" = "1" ] && return 0
+	local cur noresolv filter
+	cur=$(uci -q get dhcp.@dnsmasq[0].server 2>/dev/null)
+	case " $cur " in *"127.0.0.1#$DNS_PORT"*) return 0 ;; esac
+	noresolv=$(uci -q get dhcp.@dnsmasq[0].noresolv 2>/dev/null)
+	filter=$(uci -q get dhcp.@dnsmasq[0].filter_aaaa 2>/dev/null)
+	uci -q set flclash.proxy=proxy
+	uci -q set flclash.proxy.dns_saved=1
+	uci -q set flclash.proxy.saved_noresolv="${noresolv:-0}"
+	uci -q set flclash.proxy.saved_filter_aaaa="${filter:-0}"
+	uci -q delete flclash.proxy.saved_server 2>/dev/null
+	for cur in $cur; do uci -q add_list "flclash.proxy.saved_server=$cur"; done
+	uci -q commit flclash
+}
+
+dns_on() {
+	[ "$(core_type)" = "sing-box" ] && { dns_off; return $?; }
+	prepare_config
+	if [ "$PREPARE_CHANGED" = "1" ]; then
+		/etc/init.d/flclash-core restart >/dev/null 2>&1
+		wait_core || return 1
+	fi
+	dns_save
+	mkdir -p /tmp/dnsmasq.d
+	local change=0 cur filter
+	printf 'no-poll\nno-resolv\nserver=127.0.0.1#%s\n' "$DNS_PORT" > "$DNSCONF.new"
+	if ! cmp -s "$DNSCONF.new" "$DNSCONF"; then
+		mv "$DNSCONF.new" "$DNSCONF"
+		change=1
+	else
+		rm -f "$DNSCONF.new"
+	fi
+	cur=$(uci -q get dhcp.@dnsmasq[0].server 2>/dev/null)
+	if [ "$cur" != "127.0.0.1#$DNS_PORT" ]; then
+		uci -q delete dhcp.@dnsmasq[0].server 2>/dev/null
+		uci -q add_list "dhcp.@dnsmasq[0].server=127.0.0.1#$DNS_PORT"
+		change=1
+	fi
+	if [ "$(uci -q get dhcp.@dnsmasq[0].noresolv)" != "1" ]; then
+		uci -q set dhcp.@dnsmasq[0].noresolv=1 && change=1
+	fi
+	filter=$(uci -q get flclash.proxy.filter_aaaa 2>/dev/null)
+	if [ "$filter" = "1" ] && [ "$(uci -q get dhcp.@dnsmasq[0].filter_aaaa)" != "1" ]; then
+		uci -q set dhcp.@dnsmasq[0].filter_aaaa=1 && change=1
+		uci -q set flclash.proxy.dns_filter_managed=1
+		uci -q commit flclash
+	elif [ "$filter" != "1" ] && [ "$(uci -q get flclash.proxy.dns_filter_managed)" = "1" ]; then
+		uci -q delete dhcp.@dnsmasq[0].filter_aaaa 2>/dev/null && change=1
+		uci -q delete flclash.proxy.dns_filter_managed 2>/dev/null
+		uci -q commit flclash
+	fi
+	if [ "$change" = "1" ]; then
+		uci -q commit dhcp 2>/dev/null
+		dnsmasq_restart_robust
+	fi
 }
 
 dns_off() {
+	local change=0 cur saved saved_servers noresolv filter managed
 	rm -f "$DNSCONF"
-	uci -q delete dhcp.@dnsmasq[0].server 2>/dev/null
-	uci -q set dhcp.@dnsmasq[0].noresolv=0 2>/dev/null
-	uci -q commit dhcp 2>/dev/null
-	/etc/init.d/dnsmasq restart >/dev/null 2>&1
+	cur=$(uci -q get dhcp.@dnsmasq[0].server 2>/dev/null)
+	saved=$(uci -q get flclash.proxy.dns_saved 2>/dev/null)
+	managed=$(uci -q get flclash.proxy.dns_filter_managed 2>/dev/null)
+	if [ "$saved" = "1" ]; then
+		[ -n "$cur" ] && { uci -q delete dhcp.@dnsmasq[0].server && change=1; }
+		saved_servers=$(uci -q get flclash.proxy.saved_server 2>/dev/null)
+		for cur in $saved_servers; do uci -q add_list "dhcp.@dnsmasq[0].server=$cur" && change=1; done
+		noresolv=$(uci -q get flclash.proxy.saved_noresolv 2>/dev/null)
+		[ "$(uci -q get dhcp.@dnsmasq[0].noresolv)" != "${noresolv:-0}" ] && {
+			uci -q set dhcp.@dnsmasq[0].noresolv="${noresolv:-0}" && change=1
+		}
+		filter=$(uci -q get flclash.proxy.saved_filter_aaaa 2>/dev/null)
+		uci -q delete dhcp.@dnsmasq[0].filter_aaaa 2>/dev/null && change=1
+		[ "$filter" = "1" ] && { uci -q set dhcp.@dnsmasq[0].filter_aaaa=1 && change=1; }
+		for key in dns_saved saved_noresolv saved_filter_aaaa saved_server dns_filter_managed; do
+			uci -q delete "flclash.proxy.$key" 2>/dev/null
+		done
+		uci -q commit flclash
+	else
+		case " $cur " in
+			*"127.0.0.1#$DNS_PORT"*)
+				uci -q del_list "dhcp.@dnsmasq[0].server=127.0.0.1#$DNS_PORT" 2>/dev/null && change=1
+				[ -n "$(uci -q get dhcp.@dnsmasq[0].server 2>/dev/null)" ] || uci -q delete dhcp.@dnsmasq[0].server 2>/dev/null
+				[ "$(uci -q get dhcp.@dnsmasq[0].noresolv)" != "0" ] && {
+					uci -q set dhcp.@dnsmasq[0].noresolv=0 && change=1
+				}
+				;;
+		esac
+		if [ "$managed" = "1" ]; then
+			uci -q delete dhcp.@dnsmasq[0].filter_aaaa 2>/dev/null && change=1
+			uci -q delete flclash.proxy.dns_filter_managed 2>/dev/null
+			uci -q commit flclash
+		fi
+	fi
+	if [ "$change" = "1" ]; then
+		uci -q commit dhcp 2>/dev/null
+		dnsmasq_restart_robust
+	fi
+	return 0
 }
 
-# --- nftables backend ------------------------------------------------------
-nft_on() {
-	nft list table inet "$TABLE" >/dev/null 2>&1 && return 0
+# --- leftovers --------------------------------------------------------------
 
-	ip rule add fwmark "$FWMARK" table 100 2>/dev/null
-	ip route add local default dev lo table 100 2>/dev/null
+purge_core_artifacts() {
+	nft delete table inet "$CORE_TABLE" 2>/dev/null
+	local n=0 prio
+	while [ $n -lt 16 ]; do
+		prio=$(ip rule 2>/dev/null | awk '$1 ~ /^90(0[0-9]|10)$/ {print $1; exit}')
+		[ -n "$prio" ] || break
+		ip rule del priority "$prio" 2>/dev/null || break
+		n=$((n+1))
+	done
+	ip route flush table 2022 2>/dev/null
+	ip link del Meta 2>/dev/null
+	return 0
+}
 
-	# mihomo exposes a DNS listener on $DNS_PORT; sing-box does not. Skip the
-	# port-53 hijack for sing-box so LAN DNS keeps using the system resolver.
-	CORE_TYPE=$(uci -q get flclash.main.core_type 2>/dev/null)
-	if [ "$CORE_TYPE" = "sing-box" ]; then
-		DNS_HIJACK=""
-	else
-		DNS_HIJACK="iifname \"$LAN_IF\" udp dport 53 redirect to :$DNS_PORT
-		iifname \"$LAN_IF\" tcp dport 53 redirect to :$DNS_PORT"
-	fi
+# --- nftables ---------------------------------------------------------------
 
-	"$NFT" -f - <<EOF
+fw4_input_on() {
+	nft list chain inet fw4 input >/dev/null 2>&1 || return 0
+	nft list chain inet fw4 input 2>/dev/null | grep -q 'FlClash Redirect Accept' || \
+		nft insert rule inet fw4 input position 0 ct status dnat accept comment '"FlClash Redirect Accept"' 2>/dev/null
+	nft list chain inet fw4 input 2>/dev/null | grep -q 'FlClash TPROXY Accept' || \
+		nft insert rule inet fw4 input position 0 meta mark "$FWMARK" accept comment '"FlClash TPROXY Accept"' 2>/dev/null
+}
+
+fw4_input_off() {
+	local handles h
+	handles=$(nft -a list chain inet fw4 input 2>/dev/null | awk '/FlClash (Redirect|TPROXY) Accept/ {print $NF}')
+	for h in $handles; do nft delete rule inet fw4 input handle "$h" 2>/dev/null; done
+}
+
+nft_lan_ready() {
+	nft list chain inet "$TABLE" prerouting_tcp 2>/dev/null | grep -q 'iifname "'"$LAN_IF"'"' || return 1
+	nft list chain inet "$TABLE" prerouting_tcp 2>/dev/null | grep -q 'redirect to :'"$REDIR_PORT" || return 1
+	nft list chain inet "$TABLE" prerouting_udp 2>/dev/null | grep -q 'iifname "'"$LAN_IF"'"' || return 1
+	nft list chain inet "$TABLE" prerouting_udp 2>/dev/null | grep -q 'tproxy ip to 127.0.0.1:'"$TPROXY_PORT" || return 1
+	[ "$(core_type)" = "sing-box" ] && return 0
+	nft list chain inet "$TABLE" prerouting_dns 2>/dev/null | grep -q 'redirect to :'"$DNS_PORT"
+}
+
+nft_output_local() {
+	nft list table inet "$TABLE" >/dev/null 2>&1 || "$NFT" -f - <<EOF
 table inet $TABLE {
-	set private_v4 {
-		type ipv4_addr
-		flags interval
-		elements = { $PRIVATE }
-	}
+	set private_v4 { type ipv4_addr; flags interval; elements = { $PRIVATE } }
+	chain output_tcp { type nat hook output priority dstnat - 10; policy accept; }
+}
+EOF
+	nft add chain inet "$TABLE" output_tcp '{ type nat hook output priority dstnat - 10; policy accept; }' 2>/dev/null
+	nft flush chain inet "$TABLE" output_tcp 2>/dev/null
+	nft add rule inet "$TABLE" output_tcp "meta mark $CORE_MARK accept" 2>/dev/null
+	# Every reply to an inbound connection bypasses REDIRECT, including SSH/LuCI
+	# sessions to a public WAN address. This is stronger than an IP-only guard.
+	nft add rule inet "$TABLE" output_tcp 'ct direction reply accept' 2>/dev/null
+	nft add rule inet "$TABLE" output_tcp 'ip daddr @private_v4 accept' 2>/dev/null
+	nft add rule inet "$TABLE" output_tcp 'ct original ip daddr @private_v4 accept' 2>/dev/null
+	nft add rule inet "$TABLE" output_tcp 'tcp dport 53 accept' 2>/dev/null
+	nft add rule inet "$TABLE" output_tcp "tcp dport $REDIR_PORT accept" 2>/dev/null
+	nft add rule inet "$TABLE" output_tcp "tcp dport $TPROXY_PORT accept" 2>/dev/null
+	nft add rule inet "$TABLE" output_tcp "meta l4proto tcp redirect to :$REDIR_PORT" 2>/dev/null
+}
 
+nft_on() {
+	if ! nft_lan_ready; then
+		nft delete table inet "$TABLE" 2>/dev/null
+		ip rule add fwmark "$FWMARK" table 100 2>/dev/null
+		ip route add local default dev lo table 100 2>/dev/null
+		local dns_hijack=""
+		[ "$(core_type)" = "sing-box" ] || dns_hijack="iifname \"$LAN_IF\" udp dport 53 redirect to :$DNS_PORT
+		iifname \"$LAN_IF\" tcp dport 53 redirect to :$DNS_PORT"
+		"$NFT" -f - <<EOF
+table inet $TABLE {
+	set private_v4 { type ipv4_addr; flags interval; elements = { $PRIVATE } }
 	chain prerouting_dns {
 		type nat hook prerouting priority dstnat - 10; policy accept;
-		$DNS_HIJACK
+		$dns_hijack
 	}
-
 	chain prerouting_tcp {
 		type nat hook prerouting priority dstnat + 10; policy accept;
 		iifname "$LAN_IF" ip daddr != @private_v4 tcp dport 1-65535 redirect to :$REDIR_PORT
 	}
-
 	chain prerouting_udp {
 		type filter hook prerouting priority mangle - 10; policy accept;
 		iifname "$LAN_IF" ip daddr != @private_v4 meta l4proto udp udp dport 1-65535 meta mark set $FWMARK tproxy ip to 127.0.0.1:$TPROXY_PORT accept
 	}
 }
 EOF
-	[ $? -eq 0 ] || return 1
-
-	# Local-machine outbound takeover: redirect the router's own TCP to the
-	# core. Only safe with mihomo, whose outbound sockets carry $CORE_MARK
-	# (routing-mark) and can be exempted from the redirect. sing-box has no
-	# such mark; enabling OUTPUT redirect there would loop the core back into
-	# itself, so skip it (LAN takeover still works via redir/tproxy inbounds).
-	CORE_TYPE=$(uci -q get flclash.main.core_type 2>/dev/null)
-	if [ "$LOCAL_TAKEOVER" = "1" ] && [ "$CORE_TYPE" != "sing-box" ]; then
-		nft add chain inet "$TABLE" output_tcp '{ type nat hook output priority dstnat - 10; policy accept; }' 2>/dev/null
-		nft add rule inet "$TABLE" output_tcp "meta mark $CORE_MARK accept" 2>/dev/null
-		nft add rule inet "$TABLE" output_tcp 'ip daddr @private_v4 accept' 2>/dev/null
-		nft add rule inet "$TABLE" output_tcp 'tcp dport 53 accept' 2>/dev/null
-		nft add rule inet "$TABLE" output_tcp 'tcp dport 9097 accept' 2>/dev/null
-		nft add rule inet "$TABLE" output_tcp 'tcp dport 1053 accept' 2>/dev/null
-		nft add rule inet "$TABLE" output_tcp "meta l4proto tcp redirect to :$REDIR_PORT" 2>/dev/null
+		[ $? -eq 0 ] || return 1
 	fi
-	return 0
+	fw4_input_on
+	[ "$LOCAL_TAKEOVER" = "1" ] && [ "$(core_type)" != "sing-box" ] && nft_output_local
+	nft_lan_ready
 }
 
 nft_off() {
 	nft delete table inet "$TABLE" 2>/dev/null
 	ip rule del fwmark "$FWMARK" table 100 2>/dev/null
 	ip route del local default dev lo table 100 2>/dev/null
+	fw4_input_off
 	return 0
 }
 
-nft_active() {
-	nft list table inet "$TABLE" >/dev/null 2>&1
+nft_active() { nft_lan_ready; }
+
+# --- iptables ---------------------------------------------------------------
+
+ipt_output_local() {
+	iptables -w -t nat -N FLCLASH_OUTPUT 2>/dev/null
+	iptables -w -t nat -C OUTPUT -j FLCLASH_OUTPUT 2>/dev/null || iptables -w -t nat -A OUTPUT -j FLCLASH_OUTPUT
+	iptables -w -t nat -F FLCLASH_OUTPUT
+	iptables -w -t nat -A FLCLASH_OUTPUT -m mark --mark "$CORE_MARK" -j RETURN
+	iptables -w -t nat -A FLCLASH_OUTPUT -m conntrack --ctdir REPLY -j RETURN
+	for net in 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.0.0.0/24 192.168.0.0/16 224.0.0.0/4 240.0.0.0/4; do
+		iptables -w -t nat -A FLCLASH_OUTPUT -d "$net" -j RETURN
+	done
+	iptables -w -t nat -A FLCLASH_OUTPUT -p tcp --dport 53 -j RETURN
+	iptables -w -t nat -A FLCLASH_OUTPUT -p tcp --dport "$REDIR_PORT" -j RETURN
+	iptables -w -t nat -A FLCLASH_OUTPUT -p tcp --dport "$TPROXY_PORT" -j RETURN
+	iptables -w -t nat -A FLCLASH_OUTPUT -p tcp -j REDIRECT --to-ports "$REDIR_PORT"
 }
 
-# --- iptables backend ------------------------------------------------------
 ipt_chain() {
-	iptables -w -t nat -N FLCLASH 2>/dev/null
-	iptables -w -t nat -A PREROUTING -i "$LAN_IF" -j FLCLASH 2>/dev/null
-	iptables -w -t mangle -N FLCLASH_MANGLE 2>/dev/null
-	iptables -w -t mangle -A PREROUTING -i "$LAN_IF" -j FLCLASH_MANGLE 2>/dev/null
-	# DNS hijack (TCP/UDP 53) -> core DNS listener
-	iptables -w -t nat -A FLCLASH -p udp --dport 53 -j REDIRECT --to-ports "$DNS_PORT" 2>/dev/null
-	iptables -w -t nat -A FLCLASH -p tcp --dport 53 -j REDIRECT --to-ports "$DNS_PORT" 2>/dev/null
-	# TCP non-LAN -> REDIR port; anti-loop via owner/cgroup is handled by the core
+	ipt_off
+	iptables -w -t nat -N FLCLASH
+	iptables -w -t nat -A PREROUTING -i "$LAN_IF" -j FLCLASH
+	iptables -w -t mangle -N FLCLASH_MANGLE
+	iptables -w -t mangle -A PREROUTING -i "$LAN_IF" -j FLCLASH_MANGLE
+	[ "$(core_type)" = "sing-box" ] || {
+		iptables -w -t nat -A FLCLASH -p udp --dport 53 -j REDIRECT --to-ports "$DNS_PORT"
+		iptables -w -t nat -A FLCLASH -p tcp --dport 53 -j REDIRECT --to-ports "$DNS_PORT"
+	}
 	for net in 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.0.0.0/24 192.168.0.0/16 224.0.0.0/4 240.0.0.0/4; do
-		iptables -w -t nat -A FLCLASH -d "$net" -j RETURN 2>/dev/null
+		iptables -w -t nat -A FLCLASH -d "$net" -j RETURN
+		iptables -w -t mangle -A FLCLASH_MANGLE -d "$net" -j RETURN
 	done
-	iptables -w -t nat -A FLCLASH -p tcp -j REDIRECT --to-ports "$REDIR_PORT" 2>/dev/null
-	# UDP -> TPROXY with fwmark; TPROXY needs a local route table
+	iptables -w -t nat -A FLCLASH -p tcp -j REDIRECT --to-ports "$REDIR_PORT"
 	ip rule add fwmark "$FWMARK" table 100 2>/dev/null
 	ip route add local default dev lo table 100 2>/dev/null
-	for net in 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.0.0.0/24 192.168.0.0/16 224.0.0.0/4 240.0.0.0/4; do
-		iptables -w -t mangle -A FLCLASH_MANGLE -d "$net" -j RETURN 2>/dev/null
-	done
-	iptables -w -t mangle -A FLCLASH_MANGLE -p udp -j TPROXY --on-port "$TPROXY_PORT" --tproxy-mark "$FWMARK" 2>/dev/null
-	iptables -w -t mangle -A FLCLASH_MANGLE -p udp -j MARK --set-mark "$FWMARK" 2>/dev/null
-	return 0
+	iptables -w -t mangle -A FLCLASH_MANGLE -p udp -j TPROXY --on-port "$TPROXY_PORT" --tproxy-mark "$FWMARK"
+	iptables -w -t filter -C INPUT -m mark --mark "$FWMARK" -j ACCEPT 2>/dev/null || \
+		iptables -w -t filter -I INPUT 1 -m mark --mark "$FWMARK" -j ACCEPT
+	[ "$LOCAL_TAKEOVER" = "1" ] && [ "$(core_type)" != "sing-box" ] && ipt_output_local
 }
 
 ipt_off() {
@@ -217,62 +478,196 @@ ipt_off() {
 	iptables -w -t mangle -D PREROUTING -i "$LAN_IF" -j FLCLASH_MANGLE 2>/dev/null
 	iptables -w -t mangle -F FLCLASH_MANGLE 2>/dev/null
 	iptables -w -t mangle -X FLCLASH_MANGLE 2>/dev/null
+	iptables -w -t nat -D OUTPUT -j FLCLASH_OUTPUT 2>/dev/null
+	iptables -w -t nat -F FLCLASH_OUTPUT 2>/dev/null
+	iptables -w -t nat -X FLCLASH_OUTPUT 2>/dev/null
+	iptables -w -t filter -D INPUT -m mark --mark "$FWMARK" -j ACCEPT 2>/dev/null
 	ip rule del fwmark "$FWMARK" table 100 2>/dev/null
 	ip route del local default dev lo table 100 2>/dev/null
 	return 0
 }
 
 ipt_active() {
-	iptables -w -t nat -n -L FLCLASH >/dev/null 2>&1
+	iptables -w -t nat -C FLCLASH -p tcp -j REDIRECT --to-ports "$REDIR_PORT" 2>/dev/null && \
+		iptables -w -t mangle -C FLCLASH_MANGLE -p udp -j TPROXY --on-port "$TPROXY_PORT" --tproxy-mark "$FWMARK" 2>/dev/null
 }
 
-# iptables counterpart of nft_on(): idempotent guard around ipt_chain so
-# repeated `start` calls do not duplicate rules. Without this wrapper the
-# iptables backend had no ipt_on entry point and always failed to apply.
 ipt_on() {
-	ipt_active && return 0
-	ipt_chain
-	[ $? -eq 0 ] || return 1
+	ipt_active || ipt_chain || return 1
+	ipt_active
+}
+
+# --- backend dispatch -------------------------------------------------------
+
+rules_on() { if [ "$FIREWALL_BACKEND" = "iptables" ]; then ipt_on; else nft_on; fi; }
+rules_off() { if [ "$FIREWALL_BACKEND" = "iptables" ]; then ipt_off; else nft_off; fi; }
+rules_active() { if [ "$FIREWALL_BACKEND" = "iptables" ]; then ipt_active; else nft_active; fi; }
+output_local_on() {
+	[ "$LOCAL_TAKEOVER" = "1" ] && [ "$(core_type)" != "sing-box" ] || return 0
+	if [ "$FIREWALL_BACKEND" = "iptables" ]; then ipt_output_local; else nft_output_local; fi
+}
+
+offload_guard() {
+	local changed=0 opt
+	OFFLOAD_CHANGED=0
+	for opt in flow_offloading flow_offloading_hw; do
+		if [ "$(uci -q get firewall.@defaults[0].$opt)" != "0" ]; then
+			uci -q set firewall.@defaults[0].$opt='0' && changed=1
+		fi
+	done
+	if [ "$changed" = "1" ]; then
+		OFFLOAD_CHANGED=1
+		uci -q commit firewall
+		/etc/init.d/firewall restart >/dev/null 2>&1
+		command -v conntrack >/dev/null && conntrack -F >/dev/null 2>&1
+		logger -t flclash-proxy "flow offloading disabled while transparent proxy is active"
+	fi
+	if [ -x /etc/init.d/bridger ] && /etc/init.d/bridger enabled 2>/dev/null; then
+		/etc/init.d/bridger stop 2>/dev/null
+		/etc/init.d/bridger disable 2>/dev/null
+	fi
 	return 0
 }
 
-rules_on() {
-	if [ "$FIREWALL_BACKEND" = "iptables" ]; then ipt_on; else nft_on; fi
+# --- convergence ------------------------------------------------------------
+
+teardown() {
+	rules_off
+	dns_off
+	set_state off
+	return 0
 }
-rules_off() {
-	if [ "$FIREWALL_BACKEND" = "iptables" ]; then ipt_off; else nft_off; fi
+
+redirect_on() {
+	offload_guard
+	dns_on || { set_state off; return 1; }
+	if rules_on; then
+		set_state on
+		return 0
+	fi
+	dns_off
+	set_state off
+	return 1
 }
-rules_active() {
-	if [ "$FIREWALL_BACKEND" = "iptables" ]; then ipt_active; else nft_active; fi
+
+sync() {
+	local tun=0 core=0 wish state
+	tun_enabled && tun=1
+	core_alive && core=1
+	wish=$(uci_enabled)
+
+	if [ "$core" = "0" ]; then
+		# Do not purge while the IPC process is still initializing its controller.
+		core_proc && return 0
+		rules_off
+		dns_off
+		purge_core_artifacts
+		set_state off
+		return 0
+	fi
+
+	if [ "$tun" = "1" ]; then
+		if ! tun_active && ! wait_tun; then
+			# A controller reload in the native IPC core does not start TUN. Keep
+			# REDIRECT as a working fallback until the next core restart/sync.
+			logger -t flclash-proxy "tun.enable is true but no TUN device is active; keeping REDIRECT fallback"
+			if [ "$wish" = "1" ]; then redirect_on; else teardown; fi
+			return 1
+		fi
+		offload_guard
+		if [ "$OFFLOAD_CHANGED" = "1" ]; then
+			# fw4 restart also removes mihomo's input accepts. Restart the core
+			# once so listener.start recreates them before enabling TUN traffic.
+			/etc/init.d/flclash-core restart >/dev/null 2>&1
+			wait_core || { set_state off; return 1; }
+			wait_tun || { set_state off; return 1; }
+		fi
+		rules_off
+		# Keep dnsmasq -> core DNS in TUN mode too. This preserves fake-ip and
+		# domain rules; TUN's any:53 hijack and this loopback hand-off do not loop.
+		dns_on || { set_state off; return 1; }
+		output_local_on
+		set_state tun
+		return 0
+	fi
+
+	purge_core_artifacts
+	if [ "$wish" = "1" ]; then
+		wait_core_if_starting || true
+		redirect_on && uci_set 1
+		return $?
+	fi
+	teardown
 }
 
 FIREWALL_BACKEND=$(detect_backend)
+LAN_IF=$(detect_lan_if)
+
+# API maintenance, core hooks and user actions may run concurrently. Serialize
+# state-changing operations so one sync cannot delete a table another is adding.
+case "$1" in
+	start|stop|teardown|sync|boot)
+		LOCKDIR=/tmp/flclash-proxy.lock
+		if ! mkdir "$LOCKDIR" 2>/dev/null; then
+			oldpid=$(cat "$LOCKDIR/pid" 2>/dev/null)
+			if [ -n "$oldpid" ] && ! kill -0 "$oldpid" 2>/dev/null; then
+				rm -rf "$LOCKDIR"
+				mkdir "$LOCKDIR" 2>/dev/null || exit 0
+			else
+				exit 0
+			fi
+		fi
+		echo $$ > "$LOCKDIR/pid"
+		trap 'rm -rf "$LOCKDIR"' EXIT INT TERM
+		;;
+esac
 
 case "$1" in
 	backend)
 		echo "$FIREWALL_BACKEND"
 		;;
+	lan)
+		echo "$LAN_IF"
+		;;
+	prepare)
+		prepare_config
+		;;
 	start)
-		[ "$(uci_enabled)" = "1" ] && rules_active && { echo "already active ($FIREWALL_BACKEND)"; exit 0; }
-		# The core must be up first: the rules send LAN traffic to it.
+		uci_set 1
 		/etc/init.d/flclash-core start >/dev/null 2>&1
-		sleep 2
-		dns_on || { echo "dnsmasq hand-off failed"; exit 1; }
-		if rules_on; then
-			uci_set 1
-			echo "transparent proxy: ON (backend=$FIREWALL_BACKEND tcp->$REDIR_PORT udp->TPROXY:$TPROXY_PORT dns->$DNS_PORT)"
-			exit 0
-		fi
-		dns_off
-		echo "firewall rules failed ($FIREWALL_BACKEND)"
-		exit 1
+		wait_core_if_starting || true
+		sync
+		rc=$?
+		state=$(cat "$STATE_FILE" 2>/dev/null || echo off)
+		echo "transparent proxy: $state ($FIREWALL_BACKEND, lan=$LAN_IF)"
+		[ "$rc" = "0" ] && [ "$state" != "off" ]
 		;;
 	stop)
-		rules_off
 		uci_set 0
-		echo "transparent proxy: OFF"
+		teardown
+		echo "transparent proxy: off ($FIREWALL_BACKEND)"
+		;;
+	teardown)
+		teardown
+		echo "transparent proxy: torn down (uci wish preserved)"
+		;;
+	purge)
+		purge_core_artifacts
+		;;
+	sync)
+		wait_core_if_starting || true
+		sync
+		rc=$?
+		state=$(cat "$STATE_FILE" 2>/dev/null || echo off)
+		echo "transparent proxy: $state ($FIREWALL_BACKEND, lan=$LAN_IF)"
+		exit "$rc"
 		;;
 	status)
+		state=$(cat "$STATE_FILE" 2>/dev/null || echo off)
+		if tun_enabled && core_alive && tun_active; then
+			echo "ACTIVE-TUN ($state)"
+			exit 0
+		fi
 		if rules_active; then
 			echo "ACTIVE ($FIREWALL_BACKEND)"
 			exit 0
@@ -281,15 +676,11 @@ case "$1" in
 		exit 1
 		;;
 	boot)
-		# Called by /etc/init.d/flclash-proxy at boot: restore the takeover
-		# only when the UCI flag says it was enabled before the reboot.
-		[ "$(uci_enabled)" = "1" ] || exit 0
-		sleep 5
-		dns_on
-		rules_on
+		wait_core_if_starting || true
+		sync
 		;;
 	*)
-		echo "usage: $0 start|stop|status|backend"
+		echo "usage: $0 start|stop|status|backend|prepare|sync|teardown|purge|boot"
 		exit 2
 		;;
 esac
