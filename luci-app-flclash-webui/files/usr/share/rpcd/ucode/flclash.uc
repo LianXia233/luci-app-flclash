@@ -200,8 +200,17 @@ const methods = {
 			if (core == 'mihomo')
 				system('uci -q set flclash.main.core_mode=ipc');
 			system('uci -q commit flclash');
+
+			# Lossless subscription conversion: before starting sing-box,
+			# regenerate its native JSON from the current mihomo config.yaml.
+			# The init script does this too, but doing it here guarantees the
+			# switch sees freshly-converted proxies/groups/rules/DNS/TUN.
+			let converted = false;
+			if (core == 'sing-box') {
+				converted = (system('/usr/libexec/flclash/singbox-convert.sh /etc/flclash/config.yaml /tmp/flclash-singbox.json >/dev/null 2>&1') == 0);
+			}
 			system('/etc/init.d/flclash-core restart >/dev/null 2>&1');
-			return { code: 0, core: core, running: core_state().running };
+			return { code: 0, core: core, converted: converted, running: core_state().running };
 		},
 		args: { core: 'mihomo | sing-box' }
 	}

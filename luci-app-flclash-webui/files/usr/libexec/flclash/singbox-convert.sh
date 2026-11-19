@@ -14,12 +14,22 @@
 # Full proxy-node translation (ss/trojan/vmess/...) is intentionally left to
 # the sing-box native config: if a file named <yaml>.singbox.json exists it is
 # used verbatim as the base and only the managed scalars are patched in.
+# Full "lossless" conversion lives in the flclash-api Rust binary: it parses
+# proxies/groups/rules/DNS/TUN into a native sing-box 1.14 config. Prefer it;
+# fall back to the pragmatic awk converter below on older installs where the
+# binary predates the --singbox-convert flag.
 set -eu
 
 IN="${1:-/etc/flclash/config.yaml}"
 OUT="${2:-/tmp/flclash-singbox.json}"
 
 [ -f "$IN" ] || exit 1
+
+if [ -x /usr/bin/flclash-api ] \
+	&& /usr/bin/flclash-api --singbox-convert "$IN" "$OUT" >/dev/null 2>&1 \
+	&& [ -s "$OUT" ]; then
+	exit 0
+fi
 
 # Scalar extraction (top-level keys only). Defaults match the project UCI.
 scalar() {

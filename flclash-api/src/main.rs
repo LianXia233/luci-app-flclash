@@ -20,6 +20,7 @@ mod convert;
 mod ctrl;
 mod loops;
 mod profiles;
+mod singbox;
 mod state;
 
 use std::sync::Arc;
@@ -85,6 +86,28 @@ async fn not_found() -> Response {
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
+
+    // Offline conversion helper: `flclash-api --singbox-convert <in.yaml> <out.json>`.
+    // Used by init.d and core_switch so a subscription is translated to
+    // sing-box losslessly (proxies/groups/rules/DNS/TUN) at startup and on
+    // every core switch, without requiring a running API process.
+    if args.len() >= 4 && (args[1] == "--singbox-convert" || args[1] == "-singbox-convert") {
+        match std::fs::read_to_string(&args[2])
+            .map_err(|e| format!("读取失败: {}", e))
+            .and_then(|yaml| singbox::convert(&yaml))
+            .and_then(|json| std::fs::write(&args[3], json).map_err(|e| format!("写入失败: {}", e)))
+        {
+            Ok(()) => {
+                eprintln!("singbox convert ok: {} -> {}", args[2], args[3]);
+                return;
+            }
+            Err(e) => {
+                eprintln!("singbox convert failed: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+
     let listen = flag_value(&args, "-listen", "0.0.0.0:9098");
     let controller = flag_value(&args, "-controller", "127.0.0.1:9097")
         .trim_start_matches("http://")

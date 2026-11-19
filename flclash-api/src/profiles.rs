@@ -242,6 +242,17 @@ pub fn delete_profile(st: &AppState, id: &str) -> Result<(), String> {
 /// Applies config.yaml to a running core, or starts the core. This is why
 /// "启用配置" works while the proxy is stopped.
 pub async fn reload_core(st: &AppState) {
+    // Keep the sing-box config in sync with the freshly applied subscription.
+    // Conversion is lossless (proxies/groups/rules/DNS/TUN) and cheap; the init
+    // script re-runs it on core switch, this just removes the staleness window
+    // after an import/update/apply so switching is instant.
+    let cfg_path = st.config_path();
+    if let Ok(yaml) = std::fs::read_to_string(&cfg_path) {
+        if let Ok(json) = crate::singbox::convert(&yaml) {
+            let _ = std::fs::write("/tmp/flclash-singbox.json", json);
+        }
+    }
+
     let reachable = crate::ctrl::ctrl_req(
         &st.controller,
         st.secret.as_deref(),
