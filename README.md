@@ -373,10 +373,12 @@ make -j"$(nproc)" package/luci-app-flclash/compile V=s
 binaries (2) ──► package (4) ──► release (1)
 ```
 
+SDK tarball 约 570 MB，官方站对**单连接**限速很紧：早先用单流 `curl --max-time 900` 会中途超时并从 0 字节重来，x86_64 25.12.2 那一组因此长期卡死。现在 `package` job 先装 [FluxDown](https://github.com/zerx-lab/FluxDown) CLI（v0.6.8，按发布页 `SHA256SUMS-cli.txt` 校验二进制），再用 `fluxdown add --local -s 16` 做 16 分段下载（`--local` 在进程内嵌引擎，不需要常驻服务），落地后按 SDK 目录的 `sha256sums` 校验，`.sdk-cache` 交给 `actions/cache`，缓存命中的组合直接跳过下载。
+
 | 阶段 | 运行内容 | 关键校验 |
 | --- | --- | --- |
 | `binaries` | rustup 官方 SDK + Go 官方工具链；`ring` 的 C 编译器按目标注入（aarch64 → `aarch64-linux-gnu-gcc`，x86_64 → `musl-tools` 的 `musl-gcc`），缺编译器时早失败并给出明确提示 | `cargo test --locked`；ELF / 静态 / 目标架构 |
-| `package` | ImmortalWrt SDK 只组装与签名；四组合并行 | 架构闸门、无 `INTERP`、**恰好 1 个 apk** |
+| `package` | ImmortalWrt SDK 只组装与签名；四组合并行；SDK 由 **FluxDown CLI**（`--local`、16 分段）下载并校验 `sha256sums`，`actions/cache` 复用 | 架构闸门、无 `INTERP`、**恰好 1 个 apk** |
 | `release` | 汇总产物、生成 `sha256sums.txt` | **恰好 4 个 apk**，再发布 |
 
 ### 触发与产物

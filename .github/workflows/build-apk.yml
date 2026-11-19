@@ -38,6 +38,8 @@ env:
   # PKG_VERSION / PKG_RELEASE from luci-app-flclash/Makefile so the workflow,
   # the Cargo crate and the apk can never drift apart.
   PKG_RELEASE: 1
+  # Multi-threaded downloader used for the OpenWrt SDK tarballs.
+  FLUXDOWN_VERSION: 0.6.8
 
 jobs:
   # -------------------------------------------------------------------------
@@ -174,7 +176,7 @@ jobs:
     name: APK ${{ matrix.channel }} / ${{ matrix.arch }}
     needs: binaries
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -223,6 +225,22 @@ jobs:
           gcc --version | head -1
           zstd --version
 
+      # FluxDown CLI = the multi-threaded downloader. Pinned version, checksum
+      # verified against the release's own SHA256SUMS-cli.txt.
+      - name: Install FluxDown CLI
+        run: |
+          set -euo pipefail
+          base="https://github.com/zerx-lab/FluxDown/releases/download/v${FLUXDOWN_VERSION}"
+          pkg="FluxDown-CLI-${FLUXDOWN_VERSION}-linux-x64.tar.gz"
+          mkdir -p "$RUNNER_TEMP/fluxdown"
+          curl -fsSL --retry 4 --retry-all-errors -o "$RUNNER_TEMP/fd.tgz" "$base/$pkg"
+          curl -fsSL --retry 4 --retry-all-errors -o "$RUNNER_TEMP/fd.sums" "$base/SHA256SUMS-cli.txt"
+          want=$(awk -v f="$pkg" '$2==f{print $1}' "$RUNNER_TEMP/fd.sums")
+          test -n "$want" || { echo "no checksum for $pkg"; exit 1; }
+          echo "$want  $RUNNER_TEMP/fd.tgz" | sha256sum -c -
+          tar xzf "$RUNNER_TEMP/fd.tgz" -C "$RUNNER_TEMP/fluxdown" --strip-components=1
+          echo "$RUNNER_TEMP/fluxdown" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/fluxdown/fluxdown" --version
       - name: Resolve package version from Makefile
         run: |
           set -euo pipefail
@@ -238,27 +256,63 @@ jobs:
           echo "PKG_RELEASE=$r" >> "$GITHUB_ENV"
           echo "package: luci-app-flclash $v-r$r"
 
-      - name: Download ${{ matrix.channel }} SDK (${{ matrix.subtarget }})
+      - name: Cache OpenWrt SDK (${{ matrix.channel }} / ${{ matrix.arch }})
+        uses: actions/cache@v4
+        with:
+          path: .sdk-cache
+          key: sdk-${{ matrix.channel }}-${{ matrix.arch }}-v2
+
+      - name: Download ${{ matrix.channel }} SDK (${{ matrix.subtarget }}) — FluxDown, 16 segments
+        env:
+          SDK_BASE: ${{ matrix.sdk_base }}
+          SDK_GLOB: ${{ matrix.sdk_glob }}
         run: |
           set -euo pipefail
-          BASE="${{ matrix.sdk_base }}"
-          echo "SDK base: $BASE"
+          mkdir -p .sdk-cache
           file=""
           for attempt in 1 2 3 4 5; do
-            listing=$(curl -fsSL --retry 5 --retry-all-errors --max-time 120 "$BASE/" || true)
+            listing=$(curl -fsSL --retry 5 --retry-all-errors --max-time 120 "$SDK_BASE/" || true)
             file=$(printf '%s\n' "$listing" \
                    | grep -oE 'href="[^"]+\.tar\.zst"' | sed -e 's/href="//' -e 's/"$//' \
-                   | grep -E '${{ matrix.sdk_glob }}' | sort -u | head -n1 || true)
+                   | grep -E "$SDK_GLOB" | sort -u | head -n1 || true)
             [ -n "$file" ] && break
             echo "listing attempt $attempt failed, retrying..."
             sleep 10
           done
-          test -n "$file" || { echo "SDK not found at $BASE"; exit 1; }
+          test -n "$file" || { echo "SDK not found at $SDK_BASE"; exit 1; }
+          url="$SDK_BASE/$file"
           echo "Using SDK: $file"
-          curl -fSL --retry 5 --retry-all-errors --max-time 900 "$BASE/$file" -o "$RUNNER_TEMP/sdk.tar.zst"
-          du -h "$RUNNER_TEMP/sdk.tar.zst"
+
+          want=$(curl -sIL --retry 3 --max-time 60 "$url" \
+                 | awk 'tolower($1)=="content-length:"{v=$2} END{print v}')
+          hash=$(curl -fsSL --retry 3 --max-time 60 "$SDK_BASE/sha256sums" \
+                 | awk -v f="$file" '$2==f{print $1}' || true)
+
+          # actions/cache may already hold a verified tarball; only re-download
+          # when the size disagrees (partial or corrupt copy).
+          if [ -s ".sdk-cache/$file" ] && { [ -z "$want" ] || [ "$(stat -c%s ".sdk-cache/$file")" = "$want" ]; }; then
+            echo "cache hit: $(du -h ".sdk-cache/$file" | cut -f1)"
+          else
+            rm -f ".sdk-cache/$file"
+            # --local: embed the engine, no daemon; blocks until the file is
+            # complete. 16 segments is what beats the per-connection throttle.
+            if [ -n "$hash" ]; then
+              fluxdown add --local -d .sdk-cache -o "$file" -s 16 \
+                --checksum "sha256=$hash" "$url"
+            else
+              fluxdown add --local -d .sdk-cache -o "$file" -s 16 "$url"
+            fi
+          fi
+
+          got=$(stat -c%s ".sdk-cache/$file")
+          if [ -n "$want" ]; then
+            [ "$got" = "$want" ] || { echo "SDK size mismatch: $got != $want"; exit 1; }
+          fi
+          [ -n "$hash" ] && { echo "$hash  .sdk-cache/$file" | sha256sum -c -; }
+          du -h ".sdk-cache/$file"
+
           mkdir -p sdk
-          tar --zstd -xf "$RUNNER_TEMP/sdk.tar.zst" -C sdk --strip-components=1
+          tar --zstd -xf ".sdk-cache/$file" -C sdk --strip-components=1
           test -f sdk/rules.mk
 
       - name: Fetch prebuilt binaries (no compilation here)
