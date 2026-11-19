@@ -167,28 +167,102 @@ pub async fn auto_update(st: std::sync::Arc<AppState>) {
     }
 }
 
+/// skk.moe cf-geoip: keyless Cloudflare-fronted geo API
+/// (ip/country/region/city/asn/asOrg). Verified to answer real data to
+/// non-browser clients (unlike its /v1/home endpoints, which easter-egg).
+async fn fetch_skk_geoip() -> Option<serde_json::Value> {
+    curl_json::<serde_json::Value>("https://ip.api.skk.moe/cf-geoip", 8)
+        .await
+        .ok()
+        .filter(|v| {
+            v.get("ip")
+                .and_then(|v| v.as_str())
+                .map(|s| !s.is_empty())
+                .unwrap_or(false)
+        })
+}
+
+/// ipfinal.com embed card: api.ipfinal.com serves an SVG whose <title> packs
+/// "IP · 国家 · 省 · 市 · ASN" (zh locale). No JSON endpoint exists, so parse
+/// the title for CN-granular region info.
+async fn fetch_ipfinal_card() -> Option<serde_json::Value> {
+    let (_headers, body) = crate::ctrl::curl_fetch(
+        "https://api.ipfinal.com/ip-card/card.svg?layout=card&theme=dark&w=480&lang=zh&tags=home",
+        8,
+    )
+    .await
+    .ok()?;
+    let text = String::from_utf8_lossy(&body);
+    let start = text.find("<title>")? + "<title>".len();
+    let end = text[start..].find("</title>")? + start;
+    let title = &text[start..end];
+    let mut parts = title.split('·').map(|s| s.trim().to_string());
+    let ip = parts.next()?;
+    if ip.is_empty() || !ip.contains('.') {
+        return None;
+    }
+    Some(serde_json::json!({
+        "ip": ip,
+        "country": parts.next().unwrap_or_default(),
+        "region": parts.next().unwrap_or_default(),
+        "city": parts.next().unwrap_or_default(),
+        "asn": parts.next().unwrap_or_default(),
+    }))
+}
+
 /// Caches the outbound IP profile (country/city/ISP/ASN + quality flags).
+/// Source order (user preference): Cloudflare edge trace first — it always
+/// answers and reports exactly what the takeover's egress path sees — then
+/// the geo sources discovered from ip.skk.moe / ipfinal.com, then the
+/// classic keyless providers as last resort.
 pub async fn refresh_outbound(st: std::sync::Arc<AppState>) {
     loop {
         let mut info = crate::state::IpInfo::default();
         let mut ok = false;
-        if let Ok(v) = curl_json::<serde_json::Value>(
-            "http://ip-api.com/json/?fields=status,message,query,country,countryCode,city,isp,org,as,proxy,hosting,mobile&lang=zh-CN",
-            8,
-        )
-        .await
+        // Source 0: Cloudflare cdn-cgi/trace (key=value text, no rate limit).
+        if let Ok((_headers, body)) =
+            crate::ctrl::curl_fetch("https://www.cloudflare.com/cdn-cgi/trace", 8).await
         {
-            info.ip = v.get("query").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            info.country = v.get("country").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            info.country_code = v.get("countryCode").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            info.city = v.get("city").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            info.isp = v.get("isp").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            info.org = v.get("org").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            info.asn = v.get("as").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            info.proxy = v.get("proxy").and_then(|v| v.as_bool()).unwrap_or(false);
-            info.hosting = v.get("hosting").and_then(|v| v.as_bool()).unwrap_or(false);
-            info.mobile = v.get("mobile").and_then(|v| v.as_bool()).unwrap_or(false);
+            let text = String::from_utf8_lossy(&body);
+            let mut colo = String::new();
+            for line in text.lines() {
+                let mut kv = line.splitn(2, '=');
+                match (kv.next(), kv.next()) {
+                    (Some("ip"), Some(v)) => info.ip = v.trim().to_string(),
+                    (Some("loc"), Some(v)) => info.country_code = v.trim().to_string(),
+                    (Some("colo"), Some(v)) => colo = v.trim().to_string(),
+                    (Some("warp"), Some(v)) => info.proxy = v.trim() != "off",
+                    _ => {}
+                }
+            }
             ok = !info.ip.is_empty();
+            if ok {
+                info.city = colo;
+                info.country = info.country_code.clone();
+            }
+        }
+        // Source 1: skk.moe cf-geoip as a full fallback (rich: region/city/asn).
+        if !ok {
+            if let Some(v) = fetch_skk_geoip().await {
+                info.ip = v.get("ip").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let cc = v.get("country").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                info.country_code = cc.clone();
+                info.country = cc;
+                info.city = v
+                    .get("city")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| v.get("region").and_then(|v| v.as_str()))
+                    .unwrap_or("")
+                    .to_string();
+                info.org = v.get("asOrg").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                info.asn = v
+                    .get("asn")
+                    .and_then(|v| v.as_u64())
+                    .map(|a| format!("AS{}", a))
+                    .unwrap_or_default();
+                ok = !info.ip.is_empty();
+            }
         }
         if !ok {
             if let Ok(v) = curl_json::<serde_json::Value>("https://api.ip.sb/geoip", 8).await {
@@ -210,6 +284,131 @@ pub async fn refresh_outbound(st: std::sync::Arc<AppState>) {
                 ok = !info.ip.is_empty();
             }
         }
+        if !ok {
+            // ipwho.is: keyless, different network path than the above.
+            if let Ok(v) = curl_json::<serde_json::Value>("https://ipwho.is/", 10).await {
+                let conn = v.get("connection");
+                info.ip = v.get("ip").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                info.country = v.get("country").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                info.country_code = v
+                    .get("country_code")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                info.city = v.get("city").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                info.isp = conn
+                    .and_then(|c| c.get("isp"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                info.org = conn
+                    .and_then(|c| c.get("org"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                info.asn = conn
+                    .and_then(|c| c.get("asn"))
+                    .and_then(|v| v.as_u64())
+                    .map(|a| format!("AS{}", a))
+                    .unwrap_or_default();
+                ok = !info.ip.is_empty();
+            }
+        }
+        if !ok {
+            // Last resort: ip-api.com (free tier, HTTP only, flaky from CN).
+            if let Ok(v) = curl_json::<serde_json::Value>(
+                "http://ip-api.com/json/?fields=status,message,query,country,countryCode,city,isp,org,as,proxy,hosting,mobile&lang=zh-CN",
+                8,
+            )
+            .await
+            {
+                info.ip = v.get("query").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                info.country = v.get("country").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                info.country_code = v.get("countryCode").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                info.city = v.get("city").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                info.isp = v.get("isp").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                info.org = v.get("org").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                info.asn = v.get("as").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                info.proxy = v.get("proxy").and_then(|v| v.as_bool()).unwrap_or(false);
+                info.hosting = v.get("hosting").and_then(|v| v.as_bool()).unwrap_or(false);
+                info.mobile = v.get("mobile").and_then(|v| v.as_bool()).unwrap_or(false);
+                ok = !info.ip.is_empty();
+            }
+        }
+        // Enrichment: CF trace (and skk) carry no ISP data. Fill org/isp/asn
+        // from the discovered sources; a failed enrichment never undoes the
+        // primary lookup.
+        if ok && info.org.is_empty() && info.isp.is_empty() {
+            if let Some(v) = fetch_skk_geoip().await {
+                info.org = v.get("asOrg").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                info.asn = v
+                    .get("asn")
+                    .and_then(|v| v.as_u64())
+                    .map(|a| format!("AS{}", a))
+                    .unwrap_or_default();
+                if info.city.is_empty() {
+                    info.city = v
+                        .get("city")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                        .or_else(|| v.get("region").and_then(|v| v.as_str()))
+                        .unwrap_or("")
+                        .to_string();
+                }
+            }
+        }
+        if ok && info.org.is_empty() && info.isp.is_empty() {
+            if let Some(v) = fetch_ipfinal_card().await {
+                // zh locale: country/region/city read natively (中国 · 广东 · 深圳).
+                let zh_country = v.get("country").and_then(|v| v.as_str()).unwrap_or("");
+                if !zh_country.is_empty() {
+                    info.country = zh_country.to_string();
+                }
+                let region = v.get("region").and_then(|v| v.as_str()).unwrap_or("");
+                let city = v.get("city").and_then(|v| v.as_str()).unwrap_or("");
+                if !region.is_empty() && info.city.is_empty() {
+                    info.city = if city.is_empty() {
+                        region.to_string()
+                    } else {
+                        format!("{} {}", region, city)
+                    };
+                }
+                let asn = v.get("asn").and_then(|v| v.as_str()).unwrap_or("");
+                if !asn.is_empty() && info.asn.is_empty() && asn.chars().all(|c| c.is_ascii_digit()) {
+                    info.asn = format!("AS{}", asn);
+                }
+            }
+        }
+        if ok && info.org.is_empty() && info.isp.is_empty() {
+            if let Ok(v) = curl_json::<serde_json::Value>("https://api.ip.sb/geoip", 8).await {
+                info.isp = v.get("isp").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                info.org = v
+                    .get("asn_organization")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                info.asn = v.get("asn").map(|a| format!("AS{}", a)).unwrap_or_default();
+                info.hosting = v.get("hosting").and_then(|v| v.as_bool()).unwrap_or(false);
+            } else if let Ok(v) = curl_json::<serde_json::Value>("https://ipwho.is/", 10).await {
+                let conn = v.get("connection");
+                info.isp = conn
+                    .and_then(|c| c.get("isp"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                info.org = conn
+                    .and_then(|c| c.get("org"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                info.asn = conn
+                    .and_then(|c| c.get("asn"))
+                    .and_then(|v| v.as_u64())
+                    .map(|a| format!("AS{}", a))
+                    .unwrap_or_default();
+            }
+        }
+        let succeeded = ok;
         {
             let mut hist = st.hist.lock().unwrap();
             if ok {
@@ -222,10 +421,18 @@ pub async fn refresh_outbound(st: std::sync::Arc<AppState>) {
                 hist.outbound_ok = true;
                 hist.ipinfo = Some(info);
             } else {
+                // Transient upstream failures (rate limits, node switches)
+                // must not wipe the last good data from the dashboard: keep
+                // the stale org/IP and only flag the quality as unknown.
                 hist.outbound_ok = false;
-                hist.outbound_org = "查询失败".into();
+                if hist.outbound_org.is_empty() {
+                    hist.outbound_org = "查询失败".into();
+                }
             }
         }
-        tokio::time::sleep(Duration::from_secs(600)).await;
+        // Retry quickly after a failure; relax to the normal interval once
+        // the lookup succeeds again.
+        let wait = if succeeded { 600 } else { 60 };
+        tokio::time::sleep(Duration::from_secs(wait)).await;
     }
 }

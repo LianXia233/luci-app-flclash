@@ -44,10 +44,13 @@ function run(cmd) {
 }
 
 function core_state() {
-	/* rc.common `status` exits 0 when the procd instance is running. */
-	const rc = system('/etc/init.d/flclash-core status >/dev/null 2>&1');
+	/* The LuCI switch manages the WebUI backend (flclash-api) only. The
+	 * proxy core is intentionally NOT touched here: the user starts/stops
+	 * it from the WebUI's own switch, so LuCI can never silently turn the
+	 * transparent proxy on or off. */
+	const rc = system('/etc/init.d/flclash-api status >/dev/null 2>&1');
 	const running = (rc == 0);
-	const enabled = (system('[ -e /etc/rc.d/S*flclash-core ]') == 0);
+	const enabled = (system('[ -e /etc/rc.d/S*flclash-api ]') == 0);
 	return { running, enabled };
 }
 
@@ -151,7 +154,7 @@ const methods = {
 			if (action != 'start' && action != 'stop' && action != 'restart')
 				return { code: 1, error: '未知操作' };
 
-			const rc = system('/etc/init.d/flclash-core ' + action);
+			const rc = system('/etc/init.d/flclash-api ' + action);
 			/* Give procd a moment so the caller reads the fresh state. */
 			system('sleep 1');
 			const state = core_state();

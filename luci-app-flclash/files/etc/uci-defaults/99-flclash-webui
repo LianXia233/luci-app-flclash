@@ -26,8 +26,12 @@ uci -q get flclash.webui.webui_port >/dev/null || uci set flclash.webui.webui_po
 
 uci commit flclash
 
-# procd services are enabled on first install; idempotent on upgrades.
-[ -x /etc/init.d/flclash-core ] && /etc/init.d/flclash-core enable >/dev/null 2>&1
+# Only the WebUI backend and the takeover-state reconciler live in the boot
+# sequence. The proxy core is deliberately NOT auto-started: the user turns
+# it on from the WebUI's core switch (and enabling the LAN takeover from the
+# WebUI starts it as part of arming the rules).
 [ -x /etc/init.d/flclash-api ] && /etc/init.d/flclash-api enable >/dev/null 2>&1
+[ -x /etc/init.d/flclash-proxy ] && /etc/init.d/flclash-proxy enable >/dev/null 2>&1
+[ -x /etc/init.d/flclash-core ] && /etc/init.d/flclash-core disable >/dev/null 2>&1
 
 exit 0

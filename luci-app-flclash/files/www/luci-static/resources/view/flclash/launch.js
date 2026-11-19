@@ -78,8 +78,12 @@ return view.extend({
 		jumpBtn.addEventListener('click', function () {
 			callServiceState().then(function (state) {
 				if (!state || !state.running) {
-					ui.addNotification(null, E('p', {}, _('FlClash 内核尚未运行,请先启动服务再进入 WebUI。')), 'warning');
-					return;
+					/* The backend is down: bring it up first, then jump. The
+					 * proxy core is NOT started here — the user controls it
+					 * from the WebUI's own switch. */
+					return callServiceToggle('start').then(function () {
+						window.open(target, '_blank');
+					});
 				}
 				window.open(target, '_blank');
 			});
@@ -143,10 +147,10 @@ return view.extend({
 		});
 
 		var svcCard = E('div', { 'class': 'cbi-map' }, [
-			E('div', { 'class': 'cbi-section-descr' }, _('启动/停止 FlClash 后端,更新内核,或一键进入 WebUI。内核停止时 WebUI 仍可管理配置。')),
+			E('div', { 'class': 'cbi-section-descr' }, _('这里的开关只控制 WebUI 后端(flclash-api)。代理内核请在 WebUI 内用核心开关手动启停,内核不会随 LuCI 或开机自动拉起。')),
 			E('div', { 'class': 'flclash-card' }, [
 				E('div', { 'class': 'flclash-row' }, [
-					E('span', { 'class': 'flclash-label' }, _('运行状态')),
+					E('span', { 'class': 'flclash-label' }, _('WebUI 后端')),
 					statusChip,
 					E('span', { 'class': 'flclash-grow' }),
 					toggleBtn

@@ -818,7 +818,48 @@
     positionSlider(current);
   }, 250));
 
+  /* ------------------------------------------------------ rail utility bar */
+
+  function bindRail() {
+    const rail = document.getElementById('rail');
+    const collapse = document.getElementById('rail-collapse');
+    if (collapse && rail) {
+      try {
+        if (window.localStorage.getItem('flclash.rail') === 'collapsed') rail.classList.add('is-collapsed');
+      } catch (error) { /* ignore */ }
+      collapse.addEventListener('click', function () {
+        const collapsed = rail.classList.toggle('is-collapsed');
+        collapse.setAttribute('aria-label', collapsed ? '展开导航' : '收起导航');
+        try { window.localStorage.setItem('flclash.rail', collapsed ? 'collapsed' : 'full'); } catch (error) { /* ignore */ }
+        positionSlider(current);
+      });
+    }
+    const themeBtn = document.getElementById('rail-theme');
+    if (themeBtn) {
+      themeBtn.addEventListener('click', function () {
+        setTheme(cfg.theme === 'dark' ? 'light' : 'dark');
+      });
+    }
+    /* 核心状态 = 手动启停内核,与仪表盘圆形按钮同一行为。内核由此由用户
+     * 手动控制(LuCI 的开关只管 WebUI 后端,不碰内核)。 */
+    let coreBusy = false;
+    const toggleCore = function () {
+      if (coreBusy) return;
+      coreBusy = true;
+      const running = !!(state.status && state.status.running);
+      api.service(running ? 'stop' : 'start')
+        .then(function () { return refreshStatus(); })
+        .catch(function () { /* offline: refreshStatus already marked it */ })
+        .then(function () { coreBusy = false; });
+    };
+    const sideStatus = document.getElementById('rail-status');
+    if (sideStatus) sideStatus.addEventListener('click', toggleCore);
+    const headStatus = document.getElementById('core-status');
+    if (headStatus) headStatus.addEventListener('click', toggleCore);
+  }
+
   buildNav();
+  bindRail();
   applyTheme();
   window.FlClashIcons.mount(document);
   navigate((window.location.hash || '#/dashboard').replace('#/', ''));
