@@ -20,6 +20,22 @@ fi
 
 mkdir -p "$OUT"
 
+# FlClash desktop drives inbound listeners through the gomobile IPC layer
+# (core/config.go -> updateListeners), so upstream comments out the hub-driven
+# listener/TUN creation in executor.ApplyConfig. The standalone OpenWrt CLI has
+# no such IPC layer, so without this patch the binary opens NO ports (mixed,
+# socks, http, TUN) despite a valid config.yaml. Restore those two calls
+# idempotently before building. Guard with grep so re-running is safe if
+# upstream ever restores them itself.
+EXECUTOR="$CORE/hub/executor/executor.go"
+if grep -q '^[[:space:]]*//updateListeners(cfg.General' "$EXECUTOR"; then
+  echo "== patch: enable hub-driven listeners for standalone CLI =="
+  sed -i \
+    -e 's#^[[:space:]]*//updateListeners(cfg.General, cfg.Listeners, force)#\tupdateListeners(cfg.General, cfg.Listeners, force)#' \
+    -e 's#^[[:space:]]*//updateTun(cfg.General)#\tupdateTun(cfg.General)#' \
+    "$EXECUTOR"
+fi
+
 echo "== Go toolchain =="
 "$GO" version
 
