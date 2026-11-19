@@ -384,16 +384,24 @@ jobs:
         run: |
           set -uo pipefail
           TAG="v${PKG_VERSION}"
-          rid=$(gh api "repos/${{ github.repository }}/releases/tags/$TAG" --jq .id 2>/dev/null || true)
-          if [ -z "$rid" ]; then
-            echo "no release for $TAG yet"
+          API="https://api.github.com/repos/${{ github.repository }}"
+          code=$(curl -sS -o "$RUNNER_TEMP/release.json" -w '%{http_code}' \
+            -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' \
+            "$API/releases/tags/$TAG") || code=000
+          if [ "$code" = "404" ]; then
+            echo "no release for $TAG yet (404) - nothing to prune"
             exit 0
           fi
-          echo "release $TAG -> id $rid; pruning same-name assets"
-          gh api "repos/${{ github.repository }}/releases/$rid/assets" --paginate --jq '.[].id' \
-            | while read -r aid; do
-                [ -n "$aid" ] && gh api -X DELETE "repos/${{ github.repository }}/releases/assets/$aid" >/dev/null 2>&1 || true
-              done
+          if [ "$code" != "200" ]; then
+            echo "unexpected HTTP $code for $TAG"; cat "$RUNNER_TEMP/release.json"; exit 1
+          fi
+          rid=$(jq -r .id "$RUNNER_TEMP/release.json")
+          echo "release $TAG -> id $rid; pruning old assets"
+          ids=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" "$API/releases/$rid/assets?per_page=100" | jq -r '.[].id')
+          for aid in $ids; do
+            echo "  delete asset $aid"
+            curl -sS -X DELETE -H "Authorization: Bearer $GH_TOKEN" "$API/releases/assets/$aid" >/dev/null || true
+          done
           echo done
 
       - name: Publish release
