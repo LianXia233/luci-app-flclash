@@ -29,6 +29,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   # Version numbers are NOT hard-coded here: every consumer job derives
   # PKG_VERSION / PKG_RELEASE from luci-app-flclash/Makefile so the workflow,
@@ -335,8 +339,10 @@ jobs:
     name: Release (single-package apk)
     needs: package
     if: |
-      startsWith(github.ref, 'refs/tags/v') ||
-      (github.event_name == 'workflow_dispatch' && inputs.publish == true)
+      needs.package.result == 'success' &&
+      (github.ref == 'refs/heads/main' ||
+       startsWith(github.ref, 'refs/tags/v') ||
+       (github.event_name == 'workflow_dispatch' && inputs.publish == true))
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
@@ -372,6 +378,24 @@ jobs:
           ( cd release && sha256sum *.apk > sha256sums.txt )
           cat release/sha256sums.txt
 
+      - name: Drop stale assets for this tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          TAG="v${PKG_VERSION}"
+          rid=$(gh api "repos/${{ github.repository }}/releases/tags/$TAG" --jq .id 2>/dev/null || true)
+          if [ -z "$rid" ]; then
+            echo "no release for $TAG yet"
+            exit 0
+          fi
+          echo "release $TAG -> id $rid; pruning same-name assets"
+          gh api "repos/${{ github.repository }}/releases/$rid/assets" --paginate --jq '.[].id' \
+            | while read -r aid; do
+                [ -n "$aid" ] && gh api -X DELETE "repos/${{ github.repository }}/releases/assets/$aid" >/dev/null 2>&1 || true
+              done
+          echo done
+
       - name: Publish release
         uses: softprops/action-gh-release@v3
         with:
@@ -379,6 +403,8 @@ jobs:
           name: FlClash v${{ env.PKG_VERSION }} — ImmortalWrt single-package APK
           body: |
             Single-package **luci-app-flclash** (Go core + Rust bridge + LuCI + WebUI in ONE apk).
+
+            Build: `${{ github.sha }}` · workflow run [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) · ${{ github.ref_name }}
 
             | File | Arch | Target SDK |
             | --- | --- | --- |
