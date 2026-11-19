@@ -66,7 +66,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential clang file binutils curl ca-certificates git zstd
+            build-essential clang file binutils curl ca-certificates git zstd \
+            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
 
       # Rust official SDK: rustup + rust-std for the musl target.
       # NOT the OpenWrt SDK, NOT an OP rust package.
@@ -78,6 +79,11 @@ jobs:
 
       - name: Rust tests + static musl build (official SDK)
         working-directory: flclash-api
+        env:
+          # ring (via reqwest/rustls) compiles C for the musl target and
+          # needs an aarch64 cross toolchain; x86_64 uses the host gcc.
+          CC_aarch64_unknown_linux_musl: aarch64-linux-gnu-gcc
+          AR_aarch64_unknown_linux_musl: aarch64-linux-gnu-ar
         run: |
           set -euo pipefail
           cargo --version
