@@ -12,12 +12,14 @@
 //!   config.rs   — config.yaml view + settings persistence
 //!   profiles.rs — profile store, import/update/apply, service control
 //!   loops.rs    — background samplers and maintenance loops
+//!   ipinfo.rs   — outbound IP profile lookup (CF-first multi-source chain)
 //!   api.rs      — HTTP handlers
 
 mod api;
 mod config;
 mod convert;
 mod ctrl;
+mod ipinfo;
 mod loops;
 mod profiles;
 mod singbox;
@@ -139,7 +141,7 @@ async fn main() {
     tokio::spawn(loops::sample_totals(st.clone()));
     tokio::spawn(loops::sync_proxy(st.clone()));
     tokio::spawn(loops::auto_update(st.clone()));
-    tokio::spawn(loops::refresh_outbound(st.clone()));
+    tokio::spawn(ipinfo::refresh_outbound(st.clone()));
 
     let protected = Router::new()
         .route("/status", get(api::status))

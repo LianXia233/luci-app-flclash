@@ -171,34 +171,44 @@ pub async fn core_reachable(st: &crate::state::AppState) -> bool {
     )
 }
 
-/// Downloads a URL through curl and returns (headers, body). TLS stays out of
-/// the binary: the router ships curl and it already trusts the system CA set.
+/// Global native HTTP client (rustls + webpki-roots baked in): no external
+/// curl binary dependency, works for http:// and https:// alike.
+/// IPv4-only on purpose: the transparent proxy takeover hooks the v4 path,
+/// so queries must follow the actual takeover egress — a happy-eyeballs v6
+/// socket would bypass it and always report the router's direct address.
+fn http_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .user_agent("FlClash-OpenWrt/1.2 (luci-app-flclash)")
+            .redirect(reqwest::redirect::Policy::limited(8))
+            .local_address(Some(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)))
+            .build()
+            .expect("reqwest client")
+    })
+}
+
+/// Fetches a URL natively (TLS via rustls/webpki-roots) and returns
+/// (headers, body). Never fails on non-2xx: callers inspect the payload
+/// themselves (the profile converter looks at content-type headers).
 pub async fn curl_fetch(url: &str, timeout_secs: u64) -> Result<(Vec<String>, Vec<u8>), String> {
-    let output = tokio::process::Command::new("curl")
-        .args([
-            "-sS", "-i", "-L",
-            "-m", &timeout_secs.to_string(),
-            "-A", "FlClash-OpenWrt/1.2 (luci-app-flclash)",
-            url,
-        ])
-        .output()
+    let resp = http_client()
+        .get(url)
+        .timeout(Duration::from_secs(timeout_secs))
+        .send()
         .await
-        .map_err(|e| format!("curl: {}", e))?;
-    if !output.status.success() {
-        let err = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("curl: {}", err.trim()));
-    }
-    let raw = output.stdout;
-    // split headers/body at the first CRLFCRLF (or LFLF)
-    for sep in [b"\r\n\r\n".as_slice(), b"\n\n".as_slice()] {
-        if let Some(pos) = find_subslice(&raw, sep) {
-            let head = String::from_utf8_lossy(&raw[..pos]).into_owned();
-            let headers: Vec<String> = head.lines().map(|l| l.to_string()).collect();
-            let body = raw[pos + sep.len()..].to_vec();
-            return Ok((headers, body));
-        }
-    }
-    Ok((Vec::new(), raw))
+        .map_err(|e| format!("fetch {}: {}", url, e))?;
+    let headers: Vec<String> = resp
+        .headers()
+        .iter()
+        .map(|(k, v)| format!("{}: {}", k.as_str(), v.to_str().unwrap_or("<binary>")))
+        .collect();
+    let body = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("body {}: {}", url, e))?
+        .to_vec();
+    Ok((headers, body))
 }
 
 /// Extracts a header value (case-insensitive) from curl-dumped header lines.
@@ -219,6 +229,41 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         return None;
     }
     haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Fetches the Cloudflare trace over IPv6 by pinning www.cloudflare.com to a
+/// CF anycast v6 address — no DNS involved, so it works even when the hijack
+/// DNS answers no AAAA (dns.ipv6: false). Returns the raw trace body.
+pub async fn cf_trace_v6(timeout_secs: u64) -> Result<Vec<u8>, String> {
+    static CLIENT6: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    let client = CLIENT6.get_or_init(|| {
+        reqwest::Client::builder()
+            .user_agent("FlClash-OpenWrt/1.2 (luci-app-flclash)")
+            .redirect(reqwest::redirect::Policy::limited(8))
+            // 2606:4700:4700::1111 — Cloudflare anycast v6, stable for years;
+            // the cert carries the www.cloudflare.com name so TLS verifies.
+            .resolve(
+                "www.cloudflare.com",
+                std::net::SocketAddr::new(
+                    "2606:4700:4700::1111".parse().expect("cf v6 addr"),
+                    443,
+                ),
+            )
+            .build()
+            .expect("reqwest v6 client")
+    });
+    let resp = client
+        .get("https://www.cloudflare.com/cdn-cgi/trace")
+        .timeout(Duration::from_secs(timeout_secs))
+        .send()
+        .await
+        .map_err(|e| format!("cf v6 trace: {}", e))?;
+    let body = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("cf v6 trace body: {}", e))?
+        .to_vec();
+    Ok(body)
 }
 
 /// Runs a short curl fetch whose body is JSON.

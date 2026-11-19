@@ -412,6 +412,7 @@ pub async fn status(State(st): State<Arc<AppState>>) -> Response {
         "uptime": if pid != 0 { core_uptime(pid) } else { 0.0 },
         "mode": cfg.mode,
         "outboundIp": hist.outbound_ip,
+        "outboundIp6": hist.outbound_ip6,
         "countryCode": hist.outbound_cc,
         "organization": hist.outbound_org,
         "ipInfo": ipinfo,

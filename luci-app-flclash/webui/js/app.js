@@ -198,6 +198,8 @@
             '<div class="ip-stack">' +
               '<button class="ip-text" data-role="ip" type="button" title="复制出口 IP">' +
                 (knownIp ? ui.esc(status.outboundIp) : '<span class="sk-line" style="width:220px"></span>') + '</button>' +
+              '<div class="ip6" data-role="ip6"' + (status.outboundIp6 ? '' : ' style="display:none"') + '>' +
+                (status.outboundIp6 ? 'IPv6 ' + ui.esc(status.outboundIp6) : '') + '</div>' +
               '<div class="ip-chips">' +
                 '<span class="chip">' + ui.esc(quality.type || '直连') + '</span>' +
                 '<span class="chip ' + (quality.level === '干净' || quality.level === '质量优' ? 'is-ok' : 'is-warn') + '" data-role="quality">' +
@@ -210,8 +212,8 @@
             '<div class="status-cell"><div class="status-cell-label">运行时长</div>' +
               '<div class="status-cell-value" data-role="uptime">' + (running ? ui.duration(status.uptime) : '—') + '</div></div>' +
             '<div class="status-cell"><div class="status-cell-label">IP 资料</div>' +
-              '<div class="status-cell-value is-muted" data-role="org" title="' + ui.esc([info.isp || info.org || '', info.asn || ''].filter(Boolean).join(' · ')) + '">' +
-                ui.esc(info.isp || info.org || status.organization || '—') + '</div></div>' +
+              '<div class="status-cell-value is-muted" data-role="org" title="' + ui.esc([status.organization || info.isp || info.org || '', info.asn || ''].filter(Boolean).join(' · ')) + '">' +
+                ui.esc(status.organization || info.isp || info.org || '—') + '</div></div>' +
           '</div>' +
         '</div>' +
         '<button class="start-toggle' + (running ? ' is-running' : '') + '" data-act="toggle" type="button" ' +
@@ -556,13 +558,22 @@
     if (ip && status.outboundIp && ip.textContent !== status.outboundIp) {
       ip.textContent = status.outboundIp;
     }
+    const ip6 = ui.$('[data-role="ip6"]', node);
+    if (ip6) {
+      const v6 = status.outboundIp6 || '';
+      const text = v6 ? 'IPv6 ' + v6 : '';
+      if (ip6.textContent !== text) ip6.textContent = text;
+      ip6.style.display = v6 ? '' : 'none';
+    }
     const uptime = ui.$('[data-role="uptime"]', node);
     if (uptime) uptime.textContent = running ? ui.duration(status.uptime) : '—';
     const org = ui.$('[data-role="org"]', node);
     const info = status.ipInfo || {};
     if (org) {
-      org.textContent = info.isp || info.org || status.organization || '—';
-      org.setAttribute('title', [info.isp || info.org || '', info.asn || ''].filter(Boolean).join(' · '));
+      // status.organization is the backend-composed display (localized where
+      // possible) — prefer it over the raw English geo fields.
+      org.textContent = status.organization || info.isp || info.org || '—';
+      org.setAttribute('title', [status.organization || info.isp || info.org || '', info.asn || ''].filter(Boolean).join(' · '));
     }
     const qualityChip = ui.$('[data-role="quality"]', node);
     const qualityNow = status.quality || {};

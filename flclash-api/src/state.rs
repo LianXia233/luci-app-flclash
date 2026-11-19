@@ -67,6 +67,7 @@ pub struct History {
     pub total_dn: f64,
     pub logs: Vec<LogEntry>,
     pub outbound_ip: String,
+    pub outbound_ip6: String,
     pub outbound_cc: String,
     pub outbound_org: String,
     pub outbound_ok: bool,

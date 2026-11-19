@@ -144,14 +144,26 @@ EOF
 		PREPARE_CHANGED=1
 	elif ! grep -qE '^[[:space:]]*listen:[[:space:]]*0\.0\.0\.0:'"$DNS_PORT" "$CFG"; then
 		if awk '/^dns:/{d=1;next} d && /^[^ \t#]/{d=0} d && /^[ \t]*listen:/{found=1;exit} END{exit !found}' "$CFG"; then
+			# Rewrite the existing listen: but KEEP ITS INDENTATION — dns
+			# blocks written by other tools may use 4-space children, and a
+			# hardcoded 2-space rewrite produces mixed indentation the YAML
+			# parser rejects ("mapping values are not allowed").
 			awk -v p="$DNS_PORT" '
 				/^dns:/ {d=1; print; next}
 				d && /^[^ \t#]/ {d=0}
-				d && /^[ \t]*listen:/ {if (!seen) print "  listen: 0.0.0.0:" p; seen=1; next}
+				d && /^[ \t]*listen:/ {if (!seen) { match($0, /^[ \t]*/); print substr($0, 1, RLENGTH) "listen: 0.0.0.0:" p; seen=1 } else { print } ; next}
 				{print}
 			' "$CFG" > "$tmp"
 		else
-			awk -v p="$DNS_PORT" '{print; if ($0 ~ /^dns:/) print "  listen: 0.0.0.0:" p}' "$CFG" > "$tmp"
+			# No listen key: insert one at the dns block's own child indent
+			# (first indented child of the block), not at a hardcoded width.
+			awk -v p="$DNS_PORT" '
+				/^dns:/ {d=1; print; next}
+				d && /^[^ \t#]/ {d=0}
+				d && !ins && /^[ \t]+[^ \t]/ { match($0, /^[ \t]*/); print substr($0, 1, RLENGTH) "listen: 0.0.0.0:" p; ins=1 }
+				{print}
+				END { if (d && !ins) print "  listen: 0.0.0.0:" p }
+			' "$CFG" > "$tmp"
 		fi
 		cp "$tmp" "$CFG" && rm -f "$tmp" && PREPARE_CHANGED=1
 	fi
@@ -234,16 +246,24 @@ EOF
 	cur_dns_ipv6=$(awk '/^dns:/{d=1;next} d && /^[^ \t#]/{d=0} d && /^[ \t]*ipv6:/{print $2; exit}' "$CFG")
 	if [ -n "$cur_dns_ipv6" ]; then
 		if [ "$cur_dns_ipv6" != "$want_dns_ipv6" ]; then
+			# Preserve the existing line's indentation (see the listen
+			# insertion above — mixed indents break the YAML parser).
 			awk -v w="$want_dns_ipv6" '
 				/^dns:/ {d=1; print; next}
 				d && /^[^ \t#]/ {d=0}
-				d && /^[ \t]*ipv6:/ {print "  ipv6: " w; next}
+				d && /^[ \t]*ipv6:/ { match($0, /^[ \t]*/); print substr($0, 1, RLENGTH) "ipv6: " w; next}
 				{print}
 			' "$CFG" > "$tmp" && cp "$tmp" "$CFG" && rm -f "$tmp" && PREPARE_CHANGED=1
 		fi
 	else
-		awk -v w="$want_dns_ipv6" '/^dns:/ {print; print "  ipv6: " w; next} {print}' "$CFG" > "$tmp" && \
-			cp "$tmp" "$CFG" && rm -f "$tmp" && PREPARE_CHANGED=1
+		# Insert at the dns block's own child indent.
+		awk -v w="$want_dns_ipv6" '
+			/^dns:/ {d=1; print; next}
+			d && /^[^ \t#]/ {d=0}
+			d && !ins && /^[ \t]+[^ \t]/ { match($0, /^[ \t]*/); print substr($0, 1, RLENGTH) "ipv6: " w; ins=1 }
+			{print}
+			END { if (d && !ins) print "  ipv6: " w }
+		' "$CFG" > "$tmp" && cp "$tmp" "$CFG" && rm -f "$tmp" && PREPARE_CHANGED=1
 	fi
 	rm -f "$tmp"
 	return 0
