@@ -86,12 +86,30 @@ dns_on() {
 		fi
 	fi
 	mkdir -p /tmp/dnsmasq.d
-	printf 'no-poll\nno-resolv\nserver=127.0.0.1#%s\n' "$DNS_PORT" > "$DNSCONF"
+	# Only mihomo exposes a DNS listener on $DNS_PORT. sing-box's Rust
+	# converter has no port listener, so pointing dnsmasq at 1053 would break
+	# resolution; leave the system resolver alone in that mode.
+	CORE_TYPE=$(uci -q get flclash.main.core_type 2>/dev/null)
+	# UCI server is authoritative: on ujail-enabled builds the conf-dir file
+	# can be hidden from the dnsmasq sandbox, so set the upstream via UCI too.
+	uci -q delete dhcp.@dnsmasq[0].server 2>/dev/null
+	if [ "$CORE_TYPE" = "sing-box" ]; then
+		rm -f "$DNSCONF"
+		uci -q set dhcp.@dnsmasq[0].noresolv=0 2>/dev/null
+	else
+		printf 'no-poll\nno-resolv\nserver=127.0.0.1#%s\n' "$DNS_PORT" > "$DNSCONF"
+		uci -q add_list "dhcp.@dnsmasq[0].server=127.0.0.1#$DNS_PORT" 2>/dev/null
+		uci -q set dhcp.@dnsmasq[0].noresolv=1 2>/dev/null
+	fi
+	uci -q commit dhcp 2>/dev/null
 	/etc/init.d/dnsmasq restart >/dev/null 2>&1
 }
 
 dns_off() {
 	rm -f "$DNSCONF"
+	uci -q delete dhcp.@dnsmasq[0].server 2>/dev/null
+	uci -q set dhcp.@dnsmasq[0].noresolv=0 2>/dev/null
+	uci -q commit dhcp 2>/dev/null
 	/etc/init.d/dnsmasq restart >/dev/null 2>&1
 }
 
@@ -101,6 +119,16 @@ nft_on() {
 
 	ip rule add fwmark "$FWMARK" table 100 2>/dev/null
 	ip route add local default dev lo table 100 2>/dev/null
+
+	# mihomo exposes a DNS listener on $DNS_PORT; sing-box does not. Skip the
+	# port-53 hijack for sing-box so LAN DNS keeps using the system resolver.
+	CORE_TYPE=$(uci -q get flclash.main.core_type 2>/dev/null)
+	if [ "$CORE_TYPE" = "sing-box" ]; then
+		DNS_HIJACK=""
+	else
+		DNS_HIJACK="iifname \"$LAN_IF\" udp dport 53 redirect to :$DNS_PORT
+		iifname \"$LAN_IF\" tcp dport 53 redirect to :$DNS_PORT"
+	fi
 
 	"$NFT" -f - <<EOF
 table inet $TABLE {
@@ -112,8 +140,7 @@ table inet $TABLE {
 
 	chain prerouting_dns {
 		type nat hook prerouting priority dstnat - 10; policy accept;
-		iifname "$LAN_IF" udp dport 53 redirect to :$DNS_PORT
-		iifname "$LAN_IF" tcp dport 53 redirect to :$DNS_PORT
+		$DNS_HIJACK
 	}
 
 	chain prerouting_tcp {
@@ -130,9 +157,12 @@ EOF
 	[ $? -eq 0 ] || return 1
 
 	# Local-machine outbound takeover: redirect the router's own TCP to the
-	# core. Core sockets carry $CORE_MARK (routing-mark) and are excluded so
-	# the core can reach proxy nodes directly without a redirect loop.
-	if [ "$LOCAL_TAKEOVER" = "1" ]; then
+	# core. Only safe with mihomo, whose outbound sockets carry $CORE_MARK
+	# (routing-mark) and can be exempted from the redirect. sing-box has no
+	# such mark; enabling OUTPUT redirect there would loop the core back into
+	# itself, so skip it (LAN takeover still works via redir/tproxy inbounds).
+	CORE_TYPE=$(uci -q get flclash.main.core_type 2>/dev/null)
+	if [ "$LOCAL_TAKEOVER" = "1" ] && [ "$CORE_TYPE" != "sing-box" ]; then
 		nft add chain inet "$TABLE" output_tcp '{ type nat hook output priority dstnat - 10; policy accept; }' 2>/dev/null
 		nft add rule inet "$TABLE" output_tcp "meta mark $CORE_MARK accept" 2>/dev/null
 		nft add rule inet "$TABLE" output_tcp 'ip daddr @private_v4 accept' 2>/dev/null

@@ -80,7 +80,16 @@ start_service() {
 			&& /usr/libexec/flclash/singbox-convert.sh "$config_file" "$sb_config" >/dev/null 2>&1 \
 			&& [ -s "$sb_config" ]; then
 			config_file=$sb_config
+			chmod 0644 "$config_file" 2>/dev/null
 		fi
+		# Legacy rule-set download_detour is emitted by default; allow it on
+		# sing-box 1.14+ until the converter moves to the new syntax.
+		procd_set_param env ENABLE_DEPRECATED_LEGACY_RULE_SET_DOWNLOAD_DETOUR=true
+		# Keep sing-box as root here. On some procd builds dropping to the
+		# sing-box user leaves the instance in a crash loop (verified on
+		# ImmortalWrt snapshot). proxy-rules.sh skips the local OUTPUT redirect
+		# when this core is active, since sing-box has no routing-mark to
+		# exempt its own outbound from the redirect (would form a loop).
 		procd_set_param command "$core_bin" run -c "$config_file"
 	elif [ "$core_mode" = "cli" ] || [ ! -x /usr/bin/flclash-core-bridge ]; then
 		# Standalone mihomo CLI (including the auto-update path).

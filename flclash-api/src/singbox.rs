@@ -282,7 +282,20 @@ fn proxy_to_outbound(p: &Y) -> Option<J> {
             let mut o = common("shadowsocks", &name, p);
             {
                 let m = o.as_object_mut().unwrap();
-                m.insert("method".into(), json!(ystr_any(p, &["cipher", "method"])));
+                // Clash subscriptions sometimes ship metadata/placeholder
+                // nodes with the shorthand `cipher: chacha20`. mihomo tolerates
+                // it, but sing-box aborts startup with "unknown method".
+                // Normalise the common aliases to canonical AEAD method names
+                // so one bad node cannot take down the whole core.
+                let raw_method = ystr_any(p, &["cipher", "method"]);
+                let method = match raw_method.to_ascii_lowercase().as_str() {
+                    "chacha20" | "chacha20-ietf" => "chacha20-ietf-poly1305".to_string(),
+                    "aes-128-gcm" => "aes-128-gcm".to_string(),
+                    "aes-256-gcm" => "aes-256-gcm".to_string(),
+                    "none" | "plain" => "none".to_string(),
+                    _ => raw_method.clone(),
+                };
+                m.insert("method".into(), json!(method));
                 m.insert("password".into(), json!(ystr(p, "password").unwrap_or_default()));
                 if ybool(p, "udp") {
                     m.insert("network".into(), json!(["tcp", "udp"]));
@@ -458,12 +471,31 @@ fn group_to_outbound(g: &Y, known: &std::collections::HashSet<String>) -> Option
         return None;
     }
 
+    // A selector's default must be a usable proxy, not DIRECT/REJECT and not
+    // a metadata/placeholder node. Some subscriptions put DIRECT first and
+    // include fake "traffic remaining"/"expiry" entries that can never
+    // connect. Prefer an auto-select (urltest) group first — it probes and
+    // picks a live node — then the first plausible real node. Recognise common
+    // placeholder labels in both English and Chinese subscription dialects.
+    let is_placeholder = |m: &str| -> bool {
+        let lower = m.to_ascii_lowercase();
+        m == "DIRECT" || m == "REJECT"
+            || lower.contains("remaining") || lower.contains("expire")
+            || lower.contains("剩余") || lower.contains("过期")
+            || lower.contains("流量") || lower.contains("到期")
+    };
+    let default_out = members.iter()
+        .find(|m| m.to_ascii_lowercase().contains("自动选择"))
+        .or_else(|| members.iter().find(|m| !is_placeholder(m)))
+        .cloned()
+        .unwrap_or_else(|| members[0].clone());
+
     match typ.as_str() {
         "select" => Some(json!({
             "type": "selector",
             "tag": name,
             "outbounds": members,
-            "default": members[0].clone(),
+            "default": default_out,
         })),
         "url-test" | "fallback" | "load-balance" => {
             // sing-box has a single `urltest` outbound (no distinct fallback).
@@ -803,13 +835,28 @@ pub fn convert(yaml: &str) -> Result<String, String> {
         }
     }
 
-    // 4) inbounds: mixed (+ tun when requested in config.yaml).
+    // 4) inbounds: mixed (+ redir/tproxy for transparent proxy + tun when requested).
     let mut inbounds: Vec<J> = vec![json!({
         "type": "mixed",
         "tag": "mixed-in",
         "listen": "0.0.0.0",
         "listen_port": mixed_port,
     })];
+    // proxy-rules.sh redirects LAN TCP to 7893 and TPROXYs UDP to 7894.
+    // Emit matching inbounds so the transparent takeover also works under
+    // sing-box (mihomo exposes redir-port/tproxy-port natively).
+    inbounds.push(json!({
+        "type": "redirect",
+        "tag": "redir-in",
+        "listen": "127.0.0.1",
+        "listen_port": 7893,
+    }));
+    inbounds.push(json!({
+        "type": "tproxy",
+        "tag": "tproxy-in",
+        "listen": "127.0.0.1",
+        "listen_port": 7894,
+    }));
     if let Some(tun) = tun_inbound(&doc) {
         inbounds.push(tun);
     }
@@ -817,28 +864,62 @@ pub fn convert(yaml: &str) -> Result<String, String> {
     // 5) DNS with fake-ip parity.
     let dns = dns_object(&doc, &group_names);
 
-    // 6) Collect geoip rule-set references produced by GEOIP rules and declare
-    //    their remote sources (sing-box 1.12+ format).
+    // 6) Resolve geoip rule-set references produced by GEOIP rules.
+    //    A remote rule_set is downloaded at core startup from GitHub raw,
+    //    which fails on many CN networks and makes sing-box FATAL. Prefer a
+    //    local .srs (provisioned by core-update.sh); if none is present, drop
+    //    the rule_set and the rules referencing it so the core still boots and
+    //    domain rules / global mode keep working.
+    let local_srs = std::path::Path::new("/etc/flclash/geoip-cn.srs");
+    let have_local = local_srs.is_file();
     let mut rule_sets: Vec<J> = Vec::new();
     let mut seen_sets: std::collections::HashSet<String> = std::collections::HashSet::new();
     for r in &route_rules {
         if let Some(tag) = r.get("rule_set").and_then(|v| v.as_str()) {
             if seen_sets.insert(tag.to_string()) {
                 let code = tag.strip_prefix("geoip-").unwrap_or("cn");
-                let url = format!(
-                    "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-{}.srs",
-                    code
-                );
-                rule_sets.push(json!({
-                    "tag": tag,
-                    "type": "remote",
-                    "format": "binary",
-                    "url": url,
-                    // Download the geoip set directly: using a proxy node as
-                    // detour would be a chicken-and-egg deadlock at startup.
-                    "download_detour": "DIRECT",
-                }));
+                if have_local && code == "cn" {
+                    rule_sets.push(json!({
+                        "tag": tag,
+                        "type": "local",
+                        "format": "binary",
+                        "path": "/etc/flclash/geoip-cn.srs",
+                    }));
+                }
+                // else: no local set -> skip; referencing rules are removed below.
             }
+        }
+    }
+    // Drop route rules that reference a rule_set we could not provide.
+    route_rules.retain(|r| {
+        match r.get("rule_set").and_then(|v| v.as_str()) {
+            Some(tag) => rule_sets.iter().any(|s| s.get("tag").and_then(|v| v.as_str()) == Some(tag)),
+            None => true,
+        }
+    });
+
+    // sing-box's clash_api has no runtime global/direct switch (mode-list is
+    // always ["rule"]). Emulate the two modes in the generated route:
+    //   global -> everything non-private goes to the main proxy group;
+    //   direct -> everything goes DIRECT.
+    // Find the top-level proxy group (the one not referenced as a member of
+    // another group) to use as the global final.
+    if mode == "global" || mode == "direct" {
+        let main_proxy = group_names.iter()
+            .rev()
+            .find(|g| g.as_str() != "DIRECT" && g.as_str() != "REJECT")
+            .cloned();
+        let private_rule = json!({
+            "ip_cidr": ["0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8",
+                        "169.254.0.0/16", "172.16.0.0/12", "192.0.0.0/24",
+                        "192.168.0.0/16", "224.0.0.0/4", "240.0.0.0/4"],
+            "outbound": "DIRECT",
+        });
+        route_rules = vec![private_rule];
+        if mode == "direct" {
+            final_out = Some("DIRECT".to_string());
+        } else if let Some(p) = main_proxy {
+            final_out = Some(p);
         }
     }
 
@@ -858,7 +939,12 @@ pub fn convert(yaml: &str) -> Result<String, String> {
             }
         },
     });
-    cfg["experimental"]["cache_file"] = json!({"enabled": true});
+    // Put the cache in /tmp so the core can run as an unprivileged user
+    // (uid 5566) for the OUTPUT-redirect loop guard; /etc/flclash is root-only.
+    cfg["experimental"]["cache_file"] = json!({
+        "enabled": true,
+        "path": "/tmp/flclash-singbox-cache.db",
+    });
     if !rule_sets.is_empty() {
         cfg["route"]["rule_set"] = json!(rule_sets);
     }
@@ -920,6 +1006,10 @@ rules:
         let json = convert(YAML).unwrap();
         let v: J = serde_json::from_str(&json).unwrap();
         assert_eq!(v["inbounds"][0]["listen_port"], 7892);
+        // transparent-proxy inbounds must be present for LAN takeover
+        let ins = v["inbounds"].as_array().unwrap();
+        assert!(ins.iter().any(|i| i["type"] == "redirect" && i["listen_port"] == 7893));
+        assert!(ins.iter().any(|i| i["type"] == "tproxy" && i["listen_port"] == 7894));
         let outs = v["outbounds"].as_array().unwrap();
         assert!(outs.iter().any(|o| o["tag"] == "ss1" && o["type"] == "shadowsocks"));
         assert!(outs.iter().any(|o| o["tag"] == "vm1" && o["type"] == "vmess"));
@@ -937,7 +1027,10 @@ rules:
         assert_eq!(v["route"]["final"], "PROXY");
         let rules = v["route"]["rules"].as_array().unwrap();
         assert!(rules.iter().any(|r| r["domain_suffix"] == json!(["google.com"])));
-        assert!(rules.iter().any(|r| r["rule_set"] == json!("geoip-cn")));
+        // Without a local .srs, GEOIP rule_set rules are dropped so the core
+        // never FATALs trying to download a remote set on a blocked network.
+        assert!(!rules.iter().any(|r| r["rule_set"] == json!("geoip-cn")));
+        assert!(v["route"].get("rule_set").is_none());
         assert!(v["dns"]["servers"].as_array().unwrap().iter().any(|s| s["type"] == "fakeip"));
     }
 

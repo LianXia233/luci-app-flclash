@@ -179,10 +179,14 @@ pub async fn save_config(
     let result = persist_config(&st.config_path(), patch);
     // dns, tun and tunStack patches only take effect from the startup config
     // file, so a stopped core is left alone but a live one is reloaded.
+    // mode is included because sing-box has no runtime mode switch: its
+    // global/direct/rule behaviour is baked into the generated route at
+    // startup, so a mode change must reload the core to take effect.
     if result.is_ok()
         && (patch.get("dns").is_some()
             || patch.get("tun").is_some()
-            || patch.get("tunStack").is_some())
+            || patch.get("tunStack").is_some()
+            || patch.get("mode").is_some())
     {
         crate::profiles::reload_core(st).await;
     }

@@ -28,6 +28,15 @@ OUT="${2:-/tmp/flclash-singbox.json}"
 if [ -x /usr/bin/flclash-api ] \
 	&& /usr/bin/flclash-api --singbox-convert "$IN" "$OUT" >/dev/null 2>&1 \
 	&& [ -s "$OUT" ]; then
+	# Normalise Clash-only cipher aliases that sing-box rejects. Some
+	# subscriptions ship metadata/placeholder nodes with `cipher: chacha20`;
+	# mihomo tolerates them but sing-box aborts startup with
+	# "unknown method: chacha20". Map to the standard AEAD name so a single
+	# bad node cannot take down the whole core.
+	sed -i \
+		-e 's/"method"[[:space:]]*:[[:space:]]*"chacha20"/"method": "chacha20-ietf-poly1305"/g' \
+		-e 's/"method"[[:space:]]*:[[:space:]]*"chacha20-ietf"/"method": "chacha20-ietf-poly1305"/g' \
+		"$OUT"
 	exit 0
 fi
 

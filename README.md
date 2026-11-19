@@ -113,6 +113,19 @@ WebUI 的「出站模式」（`mode: rule / global / direct`）与「透明代�
 
 规则模式（`mode: rule`）下国内域名/地址按规则直连、国外走代理；全局模式（`mode: global`）下所有出站统一走代理，可用 `PUT /flclash/api/config` 的 `{"mode":"global"|"rule"}` 切换，运行时与配置文件同时生效。本机接管的流量在 WebUI「连接」页以 `source` 为设备自身 IP 出现，`chain` 显示所选节点。
 
+### sing-box 内核说明
+
+sing-box 通过 `core_switch` 切换后，`singbox-convert.sh` 优先调用 `flclash-api --singbox-convert` 把 `config.yaml` 完整转换为原生 JSON（节点 / 代理组 / DNS / TUN）。转换器针对 sing-box 的差异做了兼容：
+
+- **cipher 别名**：把 Clash 简写 `chacha20` 规范化为 `chacha20-ietf-poly1305`，避免占位节点让内核启动 FATAL。
+- **geoip 规则集**：优先用本地 `/etc/flclash/geoip-cn.srs`；无本地文件时移除远程 rule_set 引用，避免启动时下载 GitHub raw 失败导致 FATAL（国内网络常见）。
+- **透明代理 inbounds**：生成 `redirect:7893` 与 `tproxy:7894` inbounds，使 LAN 透明代理在 sing-box 下同样可用。
+- **selector 默认值**：默认选择 `自动选择`（urltest）组或首个真实节点，跳过 `DIRECT` 与流量/到期等占位节点，避免默认直连或选到无效节点。
+- **全局/规则模式**：sing-box 的 clash_api 无运行时模式切换（`mode-list` 恒为 `["rule"]`），改为在转换时按 `mode` 生成静态路由——`global` 让所有非私网流量走主代理组、`direct` 全部直连；保存模式会触发内核重载使其生效。
+- **缓存路径**：`cache_file.path` 指向 `/tmp/flclash-singbox-cache.db`，避免工作目录权限问题。
+
+**已知限制**：sing-box 模式下不做本机 OUTPUT 劫持（sing-box 出站无 routing-mark，无法豁免，会形成重定向环路），也不会把 LAN DNS 劫持到 1053（sing-box 无独立 DNS 监听端口），此时 dnsmasq 使用系统解析器；LAN 的 TCP/UDP 透明代理与 mixed 代理 7892 正常工作。mihomo 模式下则具备完整的本机出站接管与 fake-ip DNS 接管。某些 procd 构建上 sing-box 以非 root 用户运行会进入 crash loop，因此该内核保持 root 运行。
+
 ## 配置项
 
 `/etc/config/flclash` 分为 `main`、`api`、`webui` 三段。首次启动时 `99-flclash-webui` 只补齐缺失键，不会覆盖已有配置或写入凭据。
