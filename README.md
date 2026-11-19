@@ -4,12 +4,12 @@
 
 **单包 APK · mihomo + sing-box 双内核 · Rust/Tokio API 桥 · HTML5 WebUI**
 
-<a href="https://github.com/LianXia233/luci-app-flclash/releases"><img alt="version" height="20" src="https://img.shields.io/badge/version-1.2.0-0f766e?style=flat-square"></a>
+<a href="https://github.com/LianXia233/luci-app-flclash/releases"><img alt="version" height="20" src="https://img.shields.io/badge/version-1.3.0-0f766e?style=flat-square"></a>
 <a href="LICENSE"><img alt="license" height="20" src="https://img.shields.io/badge/license-GPL--3.0--only-0f766e?style=flat-square"></a>
 <a href="#兼容性与限制"><img alt="arch" height="20" src="https://img.shields.io/badge/arch-aarch64__cortex--a53%20%7C%20x86__64-0891b2?style=flat-square"></a>
 <a href="https://github.com/LianXia233/luci-app-flclash/actions/workflows/build-apk.yml"><img alt="CI" height="20" src="https://img.shields.io/github/actions/workflow/status/LianXia233/luci-app-flclash/build-apk.yml?style=flat-square&label=CI"></a>
 
-[功能](#功能) · [快速开始](#快速开始) · [架构](#架构) · [配置](#配置项) · [API](#api-总览) · [构建](#构建) · [CI 与发布](#ci-与发布) · [兼容性](#兼容性与限制)
+[功能](#功能) · [快速开始](#快速开始) · [架构](#架构) · [透明代理](#透明代理状态机) · [状态卡](#状态卡与-ip-资料) · [配置](#配置项) · [API](#api-总览) · [构建](#构建) · [CI 与发布](#ci-与发布) · [兼容性](#兼容性与限制)
 
 </div>
 
@@ -24,10 +24,12 @@ FlClash 的 OpenWrt 移植：把 **mihomo 内核**、**Rust IPC host**、**Rust/
 - **订阅导入**：Clash YAML、base64 节点列表，以及分享链接 `ss / ssr / vmess / vless / trojan / hysteria (v1) / hysteria2 / hy2 / tuic / anytls`。
 - **配置管理**：订阅更新、编辑（名称 / URL / 自动更新间隔）、流量与到期展示、一键应用。
 - **代理与连接**：代理组 / 节点测速与切换、连接列表与关闭、规则查看、日志采样。
-- **DNS 进阶**：fake-ip / redir-host、DoH / DoT / bootstrap、DNS 查询与缓存刷新。
+- **DNS 进阶**：fake-ip / redir-host / mixed、DoH / DoT / bootstrap、DNS 查询与缓存刷新。
+- **透明代理状态机**：REDIRECT / TPROXY / TUN 三种接管路径由 `proxy-rules.sh sync` 统一收敛（见[透明代理状态机](#透明代理状态机)）；硬件流量卸载自动关闭；核心异常退出自动清理残留规则。
+- **双栈 IP 状态卡**：出口 IPv4 / IPv6 同屏显示，多源查询（Cloudflare 优先）+ 中文归属地 + 启停状态感知（见[状态卡与 IP 资料](#状态卡与-ip-资料)）。
 - **双内核**：内置 mihomo（FlClash native-IPC core，由 `flclash-core-bridge` 驱动）；sing-box 通过在线更新安装，以 `clash_api` 模式接入。WebUI 可查看版本、在线更新、一键切换。
 - **优雅降级**：内核停止时读接口回退到 `config.yaml`，仍可查看状态与保存配置；依赖内核的写操作返回明确的 `503`，`apply` 会自动拉起内核。
-- **LuCI 集成**：`服务 → FlClash` 单页，提供启停、内核更新、日志与一键进入 WebUI。
+- **LuCI 集成**：`服务 → FlClash` 单页。**开关只控制 WebUI 后端（flclash-api）**，代理内核由 WebUI 内的开关手动启停；「一键进入 WebUI」会在后端未运行时自动拉起。
 
 ## 快速开始
 
@@ -55,81 +57,100 @@ apk del flclash-core flclash-api luci-app-flclash-webui
 apk add --allow-untrusted ./luci-app-flclash_*.apk
 ```
 
-`postinst` 会自动启用 `flclash-core` 与 `flclash-api`。安装后：
+安装后的服务自启策略（`99-flclash-webui`）：
 
-1. 打开 LuCI：**服务 → FlClash**，确认服务运行；
-2. 点击「一键进入 WebUI」，或直接访问 `http://<设备IP>:9098/flclash/`；
-3. 在「配置」页导入订阅，应用后即可使用。
+| 服务 | 开机自启 | 说明 |
+| --- | --- | --- |
+| `flclash-api` | ✅ | WebUI + Rust 后端（`9098`） |
+| `flclash-proxy` | ✅ | 接管状态收敛器（按 UCI 期望值恢复接管） |
+| `flclash-core` | ❌ | 代理内核**不随开机启动**，由用户在 WebUI 手动开启 |
+
+安装后：
+
+1. 打开 LuCI：**服务 → FlClash**，「一键进入 WebUI」（后端未运行时会自动启动）；
+2. 在 WebUI 仪表盘点击**启动内核**（蓝色圆形按钮或侧栏核心状态图标）；
+3. 在「设置」开启**局域网接管**（或在「配置」页导入订阅后应用），即可上网。
 
 ## 架构
 
 ```text
 浏览器 ──► LuCI「服务 → FlClash」──► rpcd ubus 对象 flclash
-                                      ├─► /etc/init.d/flclash-core   (mihomo / sing-box)
-                                      └─► /etc/init.d/flclash-api    (Rust 桥接)
+                                      └─► /etc/init.d/flclash-api    (WebUI + Rust 后端)
 
 浏览器 ──► http://<IP>:9098/flclash/        静态 WebUI（与 API 同源）
-        └─ /flclash/api/*                 Rust/Tokio 桥接
+        └─ /flclash/api/*                 Rust/Tokio 桥接（reqwest + rustls 原生出站）
                                               ├─► 127.0.0.1:9097 controller
                                               ├─ mihomo   （native IPC + flclash-core-bridge）
                                               └─ sing-box （clash_api，由 config.yaml 转换）
+
+内核启停 ──► WebUI 核心开关 ──► /etc/init.d/flclash-core ──► 启停后 proxy-rules.sh sync 收敛接管
 ```
 
 | 组件 | 安装路径 | 说明 |
 | --- | --- | --- |
 | Go 内核 | `/usr/bin/mihomo` | FlClash native-IPC core，静态编译，`with_gvisor` |
 | IPC host | `/usr/bin/flclash-core-bridge` | Rust；依次调用 `core.init` → `config.setup` → `listener.start` |
-| API 桥 | `/usr/bin/flclash-api` | Rust / Tokio / axum；REST API + 静态 WebUI |
-| procd 服务 | `/etc/init.d/flclash-core`、`flclash-api`、`flclash-proxy` | 内核、桥接、透明代理接管 |
+| API 桥 | `/usr/bin/flclash-api` | Rust / Tokio / axum；REST API + 静态 WebUI + 原生 HTTPS 出站 |
+| procd 服务 | `/etc/init.d/flclash-core`、`flclash-api`、`flclash-proxy` | 内核（手动）、桥接、接管收敛 |
 | UCI 配置 | `/etc/config/flclash` | 唯一 conffile |
-| 辅助脚本 | `/usr/libexec/flclash/*.sh` | 内核更新、透明代理规则、sing-box 转换 |
+| 辅助脚本 | `/usr/libexec/flclash/*.sh` | 内核更新、透明代理状态机、sing-box 转换 |
 | LuCI | `/usr/share/luci/menu.d`、`/usr/share/rpcd/{acl.d,ucode}` | 菜单、ACL、ubus 对象 |
 | WebUI | `/www/flclash/` | HTML / CSS / JS / 字体 / 图标 |
 
 ### 端口
 
-| 端口 | 默认绑定 | 用途 |
+| 端口 | 绑定 | 用途 |
 | --- | --- | --- |
 | `9097` | `127.0.0.1` | mihomo / sing-box 控制器（`external-controller` / `clash_api`） |
-| `7892` | 本机（默认 `allow-lan: false`） | mixed HTTP/SOCKS 代理入口 |
-| `7893` | `127.0.0.1` | 透明代理 TCP REDIRECT 入口（`redir-port`） |
-| `7894` | `127.0.0.1` | 透明代理 UDP TPROXY 入口（`tproxy-port`） |
-| `1053` | `0.0.0.0` | 内核 DNS 监听器（`dns.listen`），供 dnsmasq 与 LAN DNS 劫持使用 |
+| `7892` | `*`（接管时 `allow-lan` 被强制开启） | mixed HTTP/SOCKS 代理入口 |
+| `7893` | `*` | 透明代理 TCP REDIRECT 入口（`redir-port`） |
+| `7894` | `*` | 透明代理 UDP TPROXY 入口（`tproxy-port`） |
+| `1053` | `*` | 内核 DNS 监听器（`dns.listen`），供 dnsmasq 与 LAN DNS 劫持使用 |
 | `9098` | `0.0.0.0` | `/flclash/api` 与 `/flclash/` WebUI |
+
+接管生效时 `allow-lan` 被强制为 `true`（REDIRECT 的目的地址是接口地址而非回环，绑死 `127.0.0.1` 会让 LAN 劫持连接全部被拒——这是「本机能代理、下挂设备不通」的根因）。作为补偿，`fw4 input` 会插入 **FlClash WAN Proxy Guard**：非 LAN 接口访问 `7893/7894` 直接 reject，避免在 WAN 侧变成开放代理。
 
 `9098` 默认对 LAN 开放。若 LAN 不完全可信，请在 UCI 中设置 `flclash.api.secret`，并为 WebUI 配置对应的请求头（见 [API 总览](#api-总览)）。
 
-### 透明代理与出站模式
+## 透明代理状态机
 
-WebUI 的「出站模式」（`mode: rule / global / direct`）与「透明代理（局域网接管）」是两层独立配置，最终都由内核统一分流：
+所有接管状态由 `proxy-rules.sh sync` **统一收敛**，任何入口（WebUI 开关、内核启停、开机恢复、60 秒自愈循环）都汇入同一状态机：
 
-- **出站模式**：即 mihomo 的 `mode`，决定流量走规则 / 全局 / 直连；在「设置 → 网络」或首页模式条切换，运行时通过 controller `PATCH /configs` 生效。
-- **透明代理（局域网接管）**：由 `POST /proxy/start` 调用 `proxy-rules.sh`，按检测到的防火墙后端（`fw4` → nftables）在 LAN 接口（`br-lan`）的 prerouting 链劫持流量：TCP `REDIRECT` 到 `7893`、UDP `TPROXY` 到 `7894`、DNS（TCP/UDP 53）`REDIRECT` 到 `1053`；同时写入 dnsmasq 片段将系统 DNS 指向 `127.0.0.1#1053`。私网地址段（RFC1918 等）被排除，路由器管理面（SSH / LuCI）不受影响。状态保存在 UCI `flclash.proxy.enabled`、`/tmp/flclash-proxy.state` 与 nft 规则三处，重启后由 `/etc/init.d/flclash-proxy` 恢复。
-- **DNS（进阶）**：设置页写入 `config.yaml` 的 `dns` 块（fake-ip / redir-host、`nameserver`、`default-nameserver` 等）。后端在渲染该块时会固定写出 `dns.listen: 0.0.0.0:1053`，确保内核始终提供 DNS 监听；`proxy-rules.sh` 另有兜底自愈，启用接管时若发现该字段缺失会自动补回并重载内核。因此修改 DNS 设置不会破坏透明代理的 DNS 劫持。
-- **默认 DNS 模式为 redir-host（真实 IP）**：新导入订阅与未显式指定 `enhanced-mode` 时，后端统一生成 `redir-host`，DNS 返回真实 IP 而非 `198.18.0.0/15` 假地址。这样 LAN 客户端拿到真实目标 IP，nftables 的 `REDIRECT` / `TPROXY` 才能按 IP 正确分流，避免假地址绕过。需要 fake-ip 加速时可在「设置 → DNS（进阶）」显式切换；`mixed`（fake-ip + sniffer）模式语义不变。注意：切换 DNS 模式后需重启 dnsmasq 清缓存（`service dnsmasq restart`），否则 53 端口会短暂返回旧缓存记录。
+```text
+            ┌─ 内核未运行 ──► 全部拆除（REDIRECT 表 / DNS 劫持 / TUN 残留工件）
+sync() ─────┼─ config.tun.enable=true 且 TUN 在线 ──► TUN 模式（内核接管，撤下 REDIRECT 表）
+            ├─ 其余 + UCI wish=1 ──► REDIRECT 模式（LAN 劫持表 + dnsmasq→1053 + 本机 OUTPUT）
+            └─ 其余 ──► 全部拆除
+```
 
-典型旁路由拓扑下，`eth0` 为 WAN（上级路由），`br-lan` 为 LAN（客户端网关指向本机）；透明代理应挂在 `br-lan` 才能接管客户端流量。可用 `LAN_IF` 环境变量覆盖默认接口。
+| 要点 | 说明 |
+| --- | --- |
+| **管理面豁免** | prerouting 只挂 `br-lan` 且排除 RFC1918 目的地址；本机 OUTPUT 链带 `ct direction reply accept` 与 `ct original ip daddr private accept`——即使客户端是公网地址，SSH / LuCI 的回包也不会被劫持 |
+| **TUN 模式** | WebUI「虚拟网卡」开关写入 `tun:` 块并**完整重启内核**（IPC 内核热重载不会创建 TUN 设备）；接管期间撤下 REDIRECT 表与 DNS 手工接管，由内核 `Meta` 设备 + 策略路由接管 LAN，本机流量仍由 OUTPUT 链送入内核；`route-exclude-address` 固定排除全部管理/内网网段 |
+| **本机接管** | nft `output` 链把本机非私网 TCP REDIRECT 到 `7893`，路由器自身请求同样经内核分流；环路防护依赖 `routing-mark: 333`（内核 socket 携带 `0x14d` mark 首条规则放行） |
+| **残留清理** | 内核被 SIGKILL / 异常退出会在 ip rules 9000-9010、table 2022、nft `inet mihomo` 留下指向死端口的残留规则，把 LAN 打进黑洞——`start_service` 与 `sync` 都会清除 |
+| **硬件卸载** | `flow_offloading` / `flow_offloading_hw` 被强制关闭，`bridger` 被停用并禁自启：硬件快路径的流绕过 netfilter，会让 REDIRECT 对 LAN TCP 失效（UDP 走 mangle 链幸存，更具迷惑性）；仅在此刻一次性 `conntrack -F` |
+| **DNS 过滤** | 客户端 53 端口被直接劫持到内核 `1053`，不经过 dnsmasq，所以 dnsmasq 层 `filter_aaaa` 是无效摆设——改为在源头设 `dns.ipv6: false`（`flclash.proxy.filter_aaaa=1` 默认），双栈客户端回退 v4 进入接管路径 |
+| **缩进自适应** | `prepare_config` 对 `config.yaml` 的所有插入（`listen` / `routing-mark` / `dns.ipv6` / TUN `route-exclude-address`）按 dns 块自身的缩进对齐——混合缩进会让 YAML 解析失败、核心无限 respawn |
+| **出站模式** | `mode: rule / global / direct` 经 controller 运行时生效并持久化；sing-box 无运行时切换，由转换器按模式生成静态路由 |
 
-**本机出站接管**：prerouting 只能接管过路流量，路由器自身产生的连接走 OUTPUT 链。为此 `proxy-rules.sh` 还在 nft `output` 链把本机非私网 TCP `REDIRECT` 到 `7893`，从而让设备自身的请求也经内核分流。环路防护依赖 `config.yaml` 顶层的 `routing-mark: 333`（mihomo 官方字段，启动时日志 `Use routing mark: 0x14d`）：内核自身出站 socket 携带该 mark，`output` 链首条规则 `meta mark 0x14d accept` 直接放行，使其能直连代理节点而不被再次劫持。`dns_on()` 会在缺失时自动补写 `routing-mark`，与 `dns.listen` 一同自愈。设 `LOCAL_TAKEOVER=0` 可关闭本机接管，仅保留 LAN 接管。管理面（SSH / LuCI）访问私网地址，不在 output 劫持范围内。
+状态落在三处：UCI `flclash.proxy.enabled`（用户期望，重启保留）、`/tmp/flclash-proxy.state`（`on` / `tun` / `off`，收敛结果）、nft 规则本身。`flclash-core` 每次启动前清理残留，启动后 5 秒与 API 每 60 秒各收敛一次。
 
-规则模式（`mode: rule`）下国内域名/地址按规则直连、国外走代理；全局模式（`mode: global`）下所有出站统一走代理，可用 `PUT /flclash/api/config` 的 `{"mode":"global"|"rule"}` 切换，运行时与配置文件同时生效。本机接管的流量在 WebUI「连接」页以 `source` 为设备自身 IP 出现，`chain` 显示所选节点。
+## 状态卡与 IP 资料
 
-### sing-box 内核说明
+仪表盘状态卡的出口 IP 由 `ipinfo.rs` 独立模块维护：
 
-sing-box 通过 `core_switch` 切换后，`singbox-convert.sh` 优先调用 `flclash-api --singbox-convert` 把 `config.yaml` 完整转换为原生 JSON（节点 / 代理组 / DNS / TUN）。转换器针对 sing-box 的差异做了兼容：
-
-- **cipher 别名**：把 Clash 简写 `chacha20` 规范化为 `chacha20-ietf-poly1305`，避免占位节点让内核启动 FATAL。
-- **geoip 规则集**：优先用本地 `/etc/flclash/geoip-cn.srs`；无本地文件时移除远程 rule_set 引用，避免启动时下载 GitHub raw 失败导致 FATAL（国内网络常见）。
-- **透明代理 inbounds**：生成 `redirect:7893` 与 `tproxy:7894` inbounds，使 LAN 透明代理在 sing-box 下同样可用。
-- **selector 默认值**：默认选择 `自动选择`（urltest）组或首个真实节点，跳过 `DIRECT` 与流量/到期等占位节点，避免默认直连或选到无效节点。
-- **全局/规则模式**：sing-box 的 clash_api 无运行时模式切换（`mode-list` 恒为 `["rule"]`），改为在转换时按 `mode` 生成静态路由——`global` 让所有非私网流量走主代理组、`direct` 全部直连；保存模式会触发内核重载使其生效。
-- **缓存路径**：`cache_file.path` 指向 `/tmp/flclash-singbox-cache.db`，避免工作目录权限问题。
-
-**已知限制**：sing-box 模式下不做本机 OUTPUT 劫持（sing-box 出站无 routing-mark，无法豁免，会形成重定向环路），也不会把 LAN DNS 劫持到 1053（sing-box 无独立 DNS 监听端口），此时 dnsmasq 使用系统解析器；LAN 的 TCP/UDP 透明代理与 mixed 代理 7892 正常工作。mihomo 模式下则具备完整的本机出站接管与 fake-ip DNS 接管。某些 procd 构建上 sing-box 以非 root 用户运行会进入 crash loop，因此该内核保持 root 运行。
+- **多源链**（按用户偏好排序）：Cloudflare `cdn-cgi/trace` 优先（恒可达、反映真实出口）→ `ip.api.skk.moe/cf-geoip` → ipfinal.com 卡片（中文省市）→ `api.ip.sb` → `ipwho.is` → `ip-api.com`（zh-CN，最后兜底）。
+- **双栈显示**：节点有 IPv6 出口时，IPv4 与 IPv6 同屏显示（v6 通过 CF anycast v6 固定地址采样，不依赖 DNS，不受 AAAA 过滤影响）；节点无 v6 则隐藏该行。
+- **启停感知**：内核启停会切换出口路径（代理出口 ↔ 直连 WAN），采样在接管状态文件回位后立即重跑——「已停止」状态下显示的是真实直连出口，且保持更新。
+- **节点抖动重试**：代理组 url-test 偶发选到故障节点会导致整链超时，最多 3 轮整链重试（间隔 3 秒）。
+- **汉化与占位符过滤**：显示无中文时自动走 zh-CN 源补中文归属；`Private Customer`、裸 RIR 名等占位符永不显示，无主 IP 回退「中文地区 · ASxxxx」格式。
+- **显示对齐**：IP 资料与运行时长统一字号与基线，长名称自动换行不省略（桌面与手机一致）。
+- HTTP(S) 全部为 Rust 原生出站（reqwest + rustls/webpki-roots），客户端强制 IPv4 绑定，确保采样跟随 v4 接管路径。
 
 ## 配置项
 
-`/etc/config/flclash` 分为 `main`、`api`、`webui` 三段。首次启动时 `99-flclash-webui` 只补齐缺失键，不会覆盖已有配置或写入凭据。
+`/etc/config/flclash` 分为 `main`、`proxy`、`api`、`webui` 四段。首次启动时 `99-flclash-webui` 只补齐缺失键，不会覆盖已有配置或写入凭据。
 
 <details>
 <summary><b>完整 UCI 配置</b></summary>
@@ -144,16 +165,17 @@ sing-box 通过 `core_switch` 切换后，`singbox-convert.sh` 优先调用 `flc
 | `main` | `log_level` | `info` | 日志级别 |
 | `main` | `core_type` | `mihomo` | `mihomo` / `sing-box` |
 | `main` | `core_mode` | `ipc` | `ipc`（内置 FlClash core）/ `cli`（在线更新后的独立 mihomo） |
-| `main` | `clash_api_port` | `9097` | 兼容 / 展示字段 |
 | `main` | `tun_enabled` | `0` | TUN 开关（由 WebUI 配置块接管） |
-| `main` | `tun_name` | 空 | TUN 设备名，空为自动 |
-| `main` | `routing_mode` | 空 | 兼容 / 展示字段 |
-| `main` | `ipv6` | `0` | IPv6 兼容字段 |
 | `api` | `enabled` | `1` | 桥接服务开关 |
 | `api` | `listen` | `0.0.0.0:9098` | API / WebUI 监听地址 |
 | `api` | `ui_dir` | `/www/flclash` | 静态资源目录 |
 | `api` | `data_dir` | `/etc/flclash` | 订阅与配置数据目录 |
 | `api` | `secret` | 空 | 非空时启用请求鉴权 |
+| `proxy` | `enabled` | `1` | 局域网接管期望值（重启保留） |
+| `proxy` | `backend` | 自动 | `nftables` / `iptables`（自动检测） |
+| `proxy` | `lan_if` | 自动 | 接管接口（默认 ubus 检测 LAN 设备） |
+| `proxy` | `filter_aaaa` | `1` | 接管时过滤 AAAA（源头上设 `dns.ipv6: false`） |
+| `proxy` | `saved_*` / `dns_filter_managed` | 空 | dns_off 恢复 dnsmasq 原状用 |
 | `webui` | `enabled` | `1` | WebUI 开关 |
 | `webui` | `webui_path` | `/flclash/` | WebUI 路径 |
 | `webui` | `webui_port` | `9098` | WebUI 端口（与 `api.listen` 一致） |
@@ -162,28 +184,18 @@ sing-box 通过 `core_switch` 切换后，`singbox-convert.sh` 优先调用 `flc
 
 ## API 总览
 
-所有接口以 `/flclash/api` 为前缀。若设置 `api.secret`，请求需携带：
-
-```http
-X-FlClash-Secret: <secret>
-```
-
-或：
-
-```http
-Authorization: Bearer <secret>
-```
+所有接口以 `/flclash/api` 为前缀。若设置 `api.secret`，请求需携带 `X-FlClash-Secret: <secret>` 或 `Authorization: Bearer <secret>`。
 
 ### 状态与内核
 
 | 方法与路径 | 说明 |
 | --- | --- |
-| `GET /status` | 运行状态、出口 IP / 地区 / 质量、内存等 |
+| `GET /status` | 运行状态、出口 IP（`outboundIp` / `outboundIp6`）/ 归属 / 质量、`takeoverState`、内存等 |
 | `GET /version` | 内核与桥接版本 |
 | `GET /memory` | 内存统计 |
-| `POST /service/{action}` | `start` / `stop` / `restart` 内核服务 |
-| `GET /system/proxy` | 系统透明代理状态 |
-| `GET /proxy`、`POST /proxy/{action}` | 透明代理开关与状态 |
+| `POST /service/{action}` | `start` / `stop` / `restart` 内核服务（启停后自动收敛接管） |
+| `GET /system/proxy` | 系统透明代理状态摘要 |
+| `GET /proxy`、`POST /proxy/{action}` | 透明代理开关与状态（`takeover` / `tunActive` / `coreRunning` / `proxyWish`） |
 
 ### 代理与连接
 
@@ -201,7 +213,7 @@ Authorization: Bearer <secret>
 
 | 方法与路径 | 说明 |
 | --- | --- |
-| `GET /config`、`PUT /config`、`PATCH /config` | 标量与 `dns` 块；持久化到 `config.yaml` |
+| `GET /config`、`PUT /config`、`PATCH /config` | 标量（`mode` / `tun` / `proxyLan`…）与 `dns` 块；持久化到 `config.yaml`；`tun` 变更触发内核完整重启并收敛接管 |
 | `GET /rules` | 规则列表 |
 | `GET /providers/proxies` | 代理提供者 |
 | `GET /dns/resolve`、`GET /dns/queries`、`POST /dns/flush` | DNS 解析、查询历史、刷新缓存 |
@@ -216,12 +228,7 @@ Authorization: Bearer <secret>
 | `POST /profiles/{id}/apply` | 转换 → 原子写 `config.yaml` → 重载或启动内核 |
 | `PATCH /profiles/{id}`、`PUT /profiles/{id}`、`DELETE /profiles/{id}` | 编辑名称 / URL / 自动更新间隔，或删除 |
 
-静态资源：
-
-| 路径 | 说明 |
-| --- | --- |
-| `GET /`、`GET /flclash`、`GET /flclash/` | WebUI 入口 |
-| `GET /flclash/*` | WebUI 文件 |
+静态资源：`GET /flclash/`（WebUI 入口）与 `GET /flclash/*`。
 
 > 内核未运行时，读接口返回 `200` + `config.yaml` 文件回显；依赖内核的写操作返回 `503`，不回传底层 dial 错误。
 
@@ -232,8 +239,8 @@ LuCI 侧通过 ubus 对象 `flclash` 调用（定义于 `files/usr/share/rpcd/uc
 | 方法 | 类型 | 说明 |
 | --- | --- | --- |
 | `system_proxy` | 读 | 系统代理状态摘要 |
-| `service_state` | 读 | `{ running, enabled }` |
-| `service_toggle` | 写 | `start` / `stop` / `restart` |
+| `service_state` | 读 | `{ running, enabled }` —— **flclash-api（WebUI 后端）的状态** |
+| `service_toggle` | 写 | `start` / `stop` / `restart` —— 只作用于 flclash-api |
 | `core_log` | 读 | `logread` 中的内核日志 |
 | `core_update` | 写 | 触发 `core-update.sh` |
 | `core_update_status` | 读 | 更新状态、日志、版本 |
@@ -247,24 +254,32 @@ LuCI 侧通过 ubus 对象 `flclash` 调用（定义于 `files/usr/share/rpcd/uc
 | 工具 | 用途 |
 | --- | --- |
 | Rust stable + `rust-std` musl target | 编译 `flclash-api` 与 `flclash-core-bridge` |
+| **aarch64 musl C 交叉编译器** | `ring`（reqwest/rustls 引入）需要 C 工具链编译目标平台代码 |
 | Go 1.27 | 编译 FlClash IPC 内核 |
 | OpenWrt SDK | 仅组装 / 签名 apk，**不编译 Rust** |
-| `make` / `gcc` / `perl` / `rsync` / `zstd` | SDK 打包所需主机工具 |
 
-### Rust 桥接（官方 SDK）
+### Rust 桥接（WSL 交叉编译推荐）
 
-`flclash-api/.cargo/config.toml` 已固定 `rust-lld` 与 `link-self-contained` 参数：
+`ring` 的构建脚本需要 C 交叉编译器，Windows 的 rust-lld 环境无法提供，推荐在 WSL 内编译（仓库根的 `build-wsl.sh` 封装了拷贝源码 + 交叉编译 + 回传产物）：
 
 ```bash
-rustup target add aarch64-unknown-linux-musl x86_64-unknown-linux-musl
+# WSL 内一次性环境
+curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain stable --profile minimal
+rustup target add aarch64-unknown-linux-musl
+sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
 
-cd flclash-api
-cargo test --locked
-cargo build --release --locked --target aarch64-unknown-linux-musl --bins
-cargo build --release --locked --target x86_64-unknown-linux-musl --bins
+bash build-wsl.sh   # 产物回传到 flclash-api/target/flclash-api-wsl
 ```
 
-产物为 `target/<target>/release/{flclash-api,flclash-core-bridge}`，静态 ELF，约 1.3 MiB（ARM64）/ 1.5 MiB（x86_64）。
+等价的裸命令：
+
+```bash
+export CC_aarch64_unknown_linux_musl=aarch64-linux-gnu-gcc
+export AR_aarch64_unknown_linux_musl=aarch64-linux-gnu-ar
+cargo build --release --target aarch64-unknown-linux-musl --bins
+```
+
+产物为静态 ELF；`flclash-api` 约 2.4 MiB（内置 rustls/webpki-roots TLS，不再依赖系统 curl）。`flclash-api/.cargo/config.toml` 固定 `rust-lld` 与 `link-self-contained`。
 
 ### Go 内核
 
@@ -298,23 +313,14 @@ binaries (2) ──► package (4) ──► release (1)
 
 | 阶段 | 运行内容 | 关键校验 |
 | --- | --- | --- |
-| `binaries` | rustup 官方 SDK + Go 官方工具链；两架构并行 | `cargo test --locked`；ELF / 静态 / 目标架构 |
+| `binaries` | rustup 官方 SDK（含 aarch64 交叉 gcc 供 ring）+ Go 官方工具链 | `cargo test --locked`；ELF / 静态 / 目标架构 |
 | `package` | ImmortalWrt SDK 只组装与签名；四组合并行 | 架构闸门、无 `INTERP`、**恰好 1 个 apk** |
 | `release` | 汇总产物、生成 `sha256sums.txt` | **恰好 4 个 apk**，再发布 |
-
-### 构建矩阵
-
-| 通道 | SDK | 架构 | 目标 |
-| --- | --- | --- | --- |
-| `immortalwrt-25.12.2` | `immortalwrt-sdk-25.12.2-*_gcc-*_musl` | `aarch64_cortex-a53` | `mediatek/filogic` |
-| `immortalwrt-25.12.2` | `immortalwrt-sdk-25.12.2-x86-64_*` | `x86_64` | `x86/64` |
-| `immortalwrt-snapshot` | `immortalwrt-sdk-*_gcc-*_musl` | `aarch64_cortex-a53` | `mediatek/filogic` |
-| `immortalwrt-snapshot` | `immortalwrt-sdk-x86-64_*` | `x86_64` | `x86/64` |
 
 ### 触发与产物
 
 - `push` 到 `main`：改动 `luci-app-flclash/**`、`flclash-api/**`、`scripts/**`、workflow 或 `README.md` 时触发构建（不发布）。
-- `push` 标签 `v*`：构建并发布。
+- `push` 标签 `v*`：构建并发布（tag 名取 workflow env `PKG_VERSION`）。
 - 手动：`gh workflow run build-apk.yml -f publish=true`。
 
 产物命名：
@@ -326,26 +332,18 @@ luci-app-flclash_<ver>-r<rel>_<arch>_immortalwrt-snapshot.apk
 
 每个 Release 固定 5 个资产：4 个单包 apk + `sha256sums.txt`。
 
-当前 `v1.2.0` 实测体积：
-
-| 架构 / 通道 | 大小 |
-| --- | --- |
-| ARM64-A53 / 25.12.2 | 28,362,844 B（27.05 MiB） |
-| ARM64-A53 / snapshot | 28,362,805 B（27.05 MiB） |
-| x86_64 / 25.12.2 | 30,772,515 B（29.35 MiB） |
-| x86_64 / snapshot | 30,772,703 B（29.35 MiB） |
-
 ## 兼容性与限制
 
 - **固件**：ImmortalWrt **25.12.2** 与 **snapshot**，两者各自产出独立单包；同为 apk 包格式。
 - **架构**：`aarch64_cortex-a53`（ARM64-A53）与 `x86_64`（通用 `GOAMD64=v1`）。其他架构需自行用脚本编译，发布矩阵暂不覆盖。
-- **静态二进制**：`mihomo`、`flclash-api`、`flclash-core-bridge` 均为静态 ELF，无 glibc / musl 运行时依赖，无 `INTERP`。
+- **静态二进制**：`mihomo`、`flclash-api`、`flclash-core-bridge` 均为静态 ELF，无 glibc / musl 运行时依赖，无 `INTERP`。`flclash-api` 内置 rustls + webpki-roots，HTTPS 出站不依赖系统 CA 或 curl。
 - **内核依赖**：透明代理需要设备内核具备 `TUN` 与 `nftables`（ImmortalWrt 默认镜像已带 `firewall4` / `nftables`）。这些 `kmod-*` 未在 25.12 的 apk 源发布，因此**不写入硬依赖**，避免 `apk add` 解依赖失败。
+- **硬件卸载**：接管期间 `flow_offloading` / `flow_offloading_hw` / `bridger` 会被自动关闭并禁自启（快路径流绕过 netfilter，REDIRECT 对 LAN TCP 失效）。关闭接管后如需恢复，请手动开启。
 - **sing-box 不随包内置**：单包只带 mihomo。sing-box 通过 LuCI / WebUI 的「更新内核」在线安装到 `/usr/bin/sing-box`，再由 `core_type=sing-box` 启用。
 - **在线更新依赖网络**：内核更新从 GitHub Releases 下载，设备需能访问 `api.github.com` 与 release 资源；受限网络下可手动放置二进制。
 - **安装签名**：构建 SDK 的 apk 签名不在设备默认信任库，需 `--allow-untrusted`。
 - **升级**：旧版三包与单包写入相同路径，升级前先 `apk del` 旧三包。
-- **安全**：`9098` 默认监听 `0.0.0.0`。在不可信 LAN 中请设置 `flclash.api.secret`，或改为仅监听回环并自行做反代。
+- **安全**：`9098` 默认监听 `0.0.0.0`。在不可信 LAN 中请设置 `flclash.api.secret`，或改为仅监听回环并自行做反代。代理端口 `7893/7894` 在非 LAN 接口被 reject（WAN Proxy Guard）。
 
 ## 验证
 
@@ -353,62 +351,47 @@ luci-app-flclash_<ver>-r<rel>_<arch>_immortalwrt-snapshot.apk
 
 | 检查 | 方式 | 结果 |
 | --- | --- | --- |
-| Rust 单元测试 | `cd flclash-api && cargo test --locked` | 15 passed / 0 failed |
+| Rust 单元测试 | `cd flclash-api && cargo test --locked` | 全部通过 |
 | 二进制架构与静态性 | CI `binaries` / `package` 架构闸门 | ELF、静态、目标架构、无 `INTERP` |
 | 单包约束 | `package` job 断言 | 每个组合**恰好 1 个** apk |
 | 发布一致性 | `release` job + `sha256sum -c` | 4 个 apk 全部匹配 |
-| 包内容 | 解包核对 | 38 个文件（35 个有效文件 + 3 个 apk 元数据） |
 
 设备端透明代理与 DNS 的复核方法：
 
 ```sh
 # 1. 状态三处一致：UCI 开关 / 状态文件 / nft 规则
-uci get flclash.proxy.enabled          # 应为 1
-cat /tmp/flclash-proxy.state           # 应为 on
-/usr/libexec/flclash/proxy-rules.sh status  # 应为 ACTIVE (nftables)
+uci get flclash.proxy.enabled               # 用户期望值
+cat /tmp/flclash-proxy.state                # on（REDIRECT）/ tun（TUN）/ off
+/usr/libexec/flclash/proxy-rules.sh status  # ACTIVE (nftables) / ACTIVE-TUN
 
 # 2. 劫持规则挂在正确的 LAN 接口（旁路由通常是 br-lan）
 nft list table inet flclash | grep iifname
 #   应见 br-lan 的 53 -> 1053、TCP -> 7893、UDP -> TPROXY 7894
 
-# 3. 内核各监听端口就绪（含 DNS 1053）
-netstat -lntup | grep -E ':1053|:7893|:7894|:9097'
+# 3. 无残留 TUN 策略路由（核心死亡会留下 9000-9010 残留）
+ip rule | grep -c 2022                      # 接管时应为 0（TUN 模式除外）
+nft list tables | grep mihomo               # TUN 模式下存在属正常
 
-# 4. DNS 经劫持由内核应答（默认 redir-host，返回真实 IP）
-nslookup www.example.com 127.0.0.1     # 应返回真实 IP；若显式启用 fake-ip 则为 198.18.x.x
-# 切换 DNS 模式后若仍返回旧记录，先清缓存：service dnsmasq restart
+# 4. 内核各监听端口就绪（接管时 allow-lan 使 7893/7894 绑定 *）
+netstat -lntup | grep -E ':1053|:7893|:7894|:9097'
 
 # 5. LAN 客户端默认网关指向本机，访问外网应出现在连接列表
 wget -q -O - http://<设备IP>:9098/flclash/api/connections
 ```
 
-若第 4 步返回真实 IP 或超时，先检查 `config.yaml` 的 `dns.listen` 是否为 `0.0.0.0:1053`，再确认 dnsmasq 片段 `/tmp/dnsmasq.d/flclash-dns.conf` 是否指向 `127.0.0.1#1053`。管理面（SSH / LuCI）走私网地址，不在劫持范围内，应始终可用。
-
-验证本机出站接管与全局/规则模式：
+验证启停状态感知与双栈显示：
 
 ```sh
-# 本机 TCP 是否进入 output 劫持链（应见 output_tcp 的 redirect 计数增长）
-nft list chain inet flclash output_tcp
+# 核心停止：出口应变为本机直连 WAN IP（20 秒内）
+curl -s -X POST http://127.0.0.1:9098/flclash/api/service/stop
+wget -q -O - http://127.0.0.1:9098/flclash/api/status | grep -oE '"outboundIp[^,]*'
 
-# routing-mark 环路防护是否生效（内核启动日志）
-logread | grep 'Use routing mark'   # 应见 0x14d
-
-# 规则模式：国内域名直连、国外域名走代理
-wget -q -O - http://myip.ipip.net       # 规则模式下应为本地运营商 IP
-wget -q -O - https://api.ip.sb/ip       # 应为代理出口 IP
-
-# 切到全局模式：国内域名也应显示代理出口 IP
-curl -s -X PUT http://<设备IP>:9098/flclash/api/config \
-  -H 'Content-Type: application/json' -d '{"mode":"global"}'
-wget -q -O - http://myip.ipip.net       # 全局模式下应为代理出口 IP
-
-# 观察连接来源与所选节点
-wget -q -O - http://<设备IP>:9098/flclash/api/connections
+# 核心启动：接管自动回位（state=on），出口显示代理节点 IP（+ 节点有 v6 时附带 IPv6）
+curl -s -X POST http://127.0.0.1:9098/flclash/api/service/start
+wget -q -O - http://127.0.0.1:9098/flclash/api/status | grep -oE '"outboundIp[^,]*'
 ```
 
-若本机请求出现 SSL 错误但连接页显示该请求已匹配节点，多为 wget 与 fake-ip / 证书链交互问题，换 curl 或浏览器复测即可；关键是连接页有 `source` 为设备自身 IP、`chain` 为所选节点的记录，且出口 IP 与直连不同。
-
-设备端的 TUN 接管、内核切换与分流效果取决于具体固件与网络环境，建议在目标机型上按[快速开始](#快速开始)复核。
+管理面（SSH / LuCI）走私网地址，不在劫持范围内，应始终可用；接管期间公网来源的回包由 `ct direction reply` / `ct original daddr private` 规则豁免。
 
 ## 目录结构
 
@@ -417,11 +400,13 @@ wget -q -O - http://<设备IP>:9098/flclash/api/connections
 ├── .github/workflows/build-apk.yml   # 二进制 → 打包 → 发布
 ├── flclash-api/                      # Rust crate
 │   ├── src/main.rs                   # axum 路由与鉴权
+│   ├── src/ipinfo.rs                 # 出口 IP 多源查询（CF 优先 / 双栈 / 汉化 / 启停感知）
 │   ├── src/{config,convert,profiles,singbox,loops}.rs
 │   └── src/bin/flclash-core-bridge.rs
 ├── luci-app-flclash/
 │   ├── Makefile                      # 唯一 BuildPackage
 │   ├── files/                        # 配置、init、脚本、LuCI、rpcd
+│   │   └── usr/libexec/flclash/proxy-rules.sh   # 透明代理状态机
 │   └── webui/                        # HTML5 WebUI（css / js / views / fonts / img）
 ├── scripts/
 │   ├── build-core.sh                 # Go 内核交叉编译
@@ -429,11 +414,11 @@ wget -q -O - http://<设备IP>:9098/flclash/api/connections
 └── README.md
 ```
 
-WebUI 按视图拆分：`profiles`、`proxies`、`requests`、`rules`、`dns`、`logs`、`settings`、`tools`，共 8 个视图；首页仪表盘展示出口 IP、地区与质量。
+WebUI 按视图拆分：`profiles`、`proxies`、`requests`、`rules`、`dns`、`logs`、`settings`、`tools`，共 8 个视图；首页仪表盘展示双栈出口 IP、归属与质量。
 
 ## 许可证与致谢
 
 - 本项目：**GPL-3.0-only**，见 [LICENSE](LICENSE)。
 - 上游：[FlClash](https://github.com/chen08209/FlClash)（IPC core）、[mihomo](https://github.com/MetaCubeX/mihomo)、[sing-box](https://github.com/SagerNet/sing-box)。
 
-> 本项目不向项目作者收集订阅或设备凭据。为展示出口 IP 归属与质量，运行时会向 `ip-api.com`、`api.ip.sb` 发起查询（会暴露当前出口 IP）；其余数据仅保存在设备本地。
+> 本项目不向项目作者收集订阅或设备凭据。为展示出口 IP 归属与质量，运行时会向 `www.cloudflare.com`（cdn-cgi trace）、`ip.api.skk.moe`、`api.ipfinal.com`、`api.ip.sb`、`ipwho.is`、`ip-api.com` 发起查询（会暴露当前出口 IP）；其余数据仅保存在设备本地。
