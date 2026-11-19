@@ -12,7 +12,7 @@ permissions:
 env:
   TARGET_SUBTARGET: mediatek/filogic
   SDK_DIR: sdk
-  RELEASE_TAG: apk-aarch64-cortex-a53-v5
+  RELEASE_TAG: apk-aarch64-cortex-a53-v1.0.0
 
 jobs:
   build:
@@ -149,7 +149,7 @@ jobs:
     env:
       TARGET_SUBTARGET: x86/64
       SDK_DIR: sdk-x86
-      RELEASE_TAG: apk-x86-64-v6
+      RELEASE_TAG: apk-x86-64-v1.0.0
     steps:
       - name: Checkout
         uses: actions/checkout@v5
