@@ -22,6 +22,12 @@ DNS_PORT=1053
 REDIR_PORT=7893
 TPROXY_PORT=7894
 FWMARK=0x162
+# Core outbound mark (routing-mark in config.yaml). The core's own sockets
+# carry this mark and are excluded from OUTPUT redirect to avoid a loop.
+CORE_MARK=0x14d
+# Take over the router's own outbound TCP in addition to LAN clients.
+# Requires routing-mark in config.yaml; set LOCAL_TAKEOVER=0 to disable.
+LOCAL_TAKEOVER=${LOCAL_TAKEOVER:-1}
 
 # RFC1918 + loopback + CGN + link-local + multicast + reserved. fake-ip
 # (198.18.0.0/15) is deliberately NOT excluded: traffic to those addresses is
@@ -61,11 +67,20 @@ dns_on() {
 	# DNS hijack to work. The WebUI's DNS save path rewrites the dns: block
 	# without a listen key, so ensure it is present on every takeover.
 	CFG=/etc/flclash/config.yaml
-	if [ -f "$CFG" ] && ! grep -qE '^[[:space:]]*listen:[[:space:]]*0\.0\.0\.0:'"$DNS_PORT" "$CFG"; then
-		if grep -q '^dns:' "$CFG"; then
+	NEED_RELOAD=0
+	if [ -f "$CFG" ]; then
+		if ! grep -qE '^[[:space:]]*listen:[[:space:]]*0\.0\.0\.0:'"$DNS_PORT" "$CFG" && grep -q '^dns:' "$CFG"; then
 			awk -v p="$DNS_PORT" '{print; if ($0 ~ /^dns:/) print "  listen: 0.0.0.0:" p}' "$CFG" > "$CFG.tmp" && \
 				cp "$CFG.tmp" "$CFG" && rm -f "$CFG.tmp"
-			# Reload the core so the new listener takes effect.
+			NEED_RELOAD=1
+		fi
+		# OUTPUT takeover needs the core's routing-mark as a loop guard.
+		if [ "$LOCAL_TAKEOVER" = "1" ] && ! grep -qE '^routing-mark:' "$CFG"; then
+			awk '{print; if ($0 ~ /^external-controller:/) print "routing-mark: 333"}' "$CFG" > "$CFG.tmp" && \
+				cp "$CFG.tmp" "$CFG" && rm -f "$CFG.tmp"
+			NEED_RELOAD=1
+		fi
+		if [ "$NEED_RELOAD" = "1" ]; then
 			/etc/init.d/flclash-core restart >/dev/null 2>&1
 			sleep 2
 		fi
@@ -113,6 +128,19 @@ table inet $TABLE {
 }
 EOF
 	[ $? -eq 0 ] || return 1
+
+	# Local-machine outbound takeover: redirect the router's own TCP to the
+	# core. Core sockets carry $CORE_MARK (routing-mark) and are excluded so
+	# the core can reach proxy nodes directly without a redirect loop.
+	if [ "$LOCAL_TAKEOVER" = "1" ]; then
+		nft add chain inet "$TABLE" output_tcp '{ type nat hook output priority dstnat - 10; policy accept; }' 2>/dev/null
+		nft add rule inet "$TABLE" output_tcp "meta mark $CORE_MARK accept" 2>/dev/null
+		nft add rule inet "$TABLE" output_tcp 'ip daddr @private_v4 accept' 2>/dev/null
+		nft add rule inet "$TABLE" output_tcp 'tcp dport 53 accept' 2>/dev/null
+		nft add rule inet "$TABLE" output_tcp 'tcp dport 9097 accept' 2>/dev/null
+		nft add rule inet "$TABLE" output_tcp 'tcp dport 1053 accept' 2>/dev/null
+		nft add rule inet "$TABLE" output_tcp "meta l4proto tcp redirect to :$REDIR_PORT" 2>/dev/null
+	fi
 	return 0
 }
 

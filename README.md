@@ -109,6 +109,10 @@ WebUI 的「出站模式」（`mode: rule / global / direct`）与「透明代�
 
 典型旁路由拓扑下，`eth0` 为 WAN（上级路由），`br-lan` 为 LAN（客户端网关指向本机）；透明代理应挂在 `br-lan` 才能接管客户端流量。可用 `LAN_IF` 环境变量覆盖默认接口。
 
+**本机出站接管**：prerouting 只能接管过路流量，路由器自身产生的连接走 OUTPUT 链。为此 `proxy-rules.sh` 还在 nft `output` 链把本机非私网 TCP `REDIRECT` 到 `7893`，从而让设备自身的请求也经内核分流。环路防护依赖 `config.yaml` 顶层的 `routing-mark: 333`（mihomo 官方字段，启动时日志 `Use routing mark: 0x14d`）：内核自身出站 socket 携带该 mark，`output` 链首条规则 `meta mark 0x14d accept` 直接放行，使其能直连代理节点而不被再次劫持。`dns_on()` 会在缺失时自动补写 `routing-mark`，与 `dns.listen` 一同自愈。设 `LOCAL_TAKEOVER=0` 可关闭本机接管，仅保留 LAN 接管。管理面（SSH / LuCI）访问私网地址，不在 output 劫持范围内。
+
+规则模式（`mode: rule`）下国内域名/地址按规则直连、国外走代理；全局模式（`mode: global`）下所有出站统一走代理，可用 `PUT /flclash/api/config` 的 `{"mode":"global"|"rule"}` 切换，运行时与配置文件同时生效。本机接管的流量在 WebUI「连接」页以 `source` 为设备自身 IP 出现，`chain` 显示所选节点。
+
 ## 配置项
 
 `/etc/config/flclash` 分为 `main`、`api`、`webui` 三段。首次启动时 `99-flclash-webui` 只补齐缺失键，不会覆盖已有配置或写入凭据。
@@ -364,6 +368,30 @@ wget -q -O - http://<设备IP>:9098/flclash/api/connections
 ```
 
 若第 4 步返回真实 IP 或超时，先检查 `config.yaml` 的 `dns.listen` 是否为 `0.0.0.0:1053`，再确认 dnsmasq 片段 `/tmp/dnsmasq.d/flclash-dns.conf` 是否指向 `127.0.0.1#1053`。管理面（SSH / LuCI）走私网地址，不在劫持范围内，应始终可用。
+
+验证本机出站接管与全局/规则模式：
+
+```sh
+# 本机 TCP 是否进入 output 劫持链（应见 output_tcp 的 redirect 计数增长）
+nft list chain inet flclash output_tcp
+
+# routing-mark 环路防护是否生效（内核启动日志）
+logread | grep 'Use routing mark'   # 应见 0x14d
+
+# 规则模式：国内域名直连、国外域名走代理
+wget -q -O - http://myip.ipip.net       # 规则模式下应为本地运营商 IP
+wget -q -O - https://api.ip.sb/ip       # 应为代理出口 IP
+
+# 切到全局模式：国内域名也应显示代理出口 IP
+curl -s -X PUT http://<设备IP>:9098/flclash/api/config \
+  -H 'Content-Type: application/json' -d '{"mode":"global"}'
+wget -q -O - http://myip.ipip.net       # 全局模式下应为代理出口 IP
+
+# 观察连接来源与所选节点
+wget -q -O - http://<设备IP>:9098/flclash/api/connections
+```
+
+若本机请求出现 SSL 错误但连接页显示该请求已匹配节点，多为 wget 与 fake-ip / 证书链交互问题，换 curl 或浏览器复测即可；关键是连接页有 `source` 为设备自身 IP、`chain` 为所选节点的记录，且出口 IP 与直连不同。
 
 设备端的 TUN 接管、内核切换与分流效果取决于具体固件与网络环境，建议在目标机型上按[快速开始](#快速开始)复核。
 
