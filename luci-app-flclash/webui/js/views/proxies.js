@@ -123,9 +123,19 @@
       });
     }
 
+    // Airport subscriptions inject fake "剩余流量/过期时间" entries that are
+    // real proxies to dead servers. They must never look clickable.
+    const INFO_PREFIXES = ['剩余流量', '过期时间', '套餐', '到期时间', '距离下次', '流量重置', '官网', '订阅', '客服'];
+    function isPlaceholder(name) {
+      const text = String(name || '');
+      return INFO_PREFIXES.some(function (prefix) { return text.indexOf(prefix) === 0; });
+    }
+
     function nodesOf() {
       const data = state.proxies || { nodes: [] };
       let nodes = (data.nodes || []).filter(function (node) {
+        return !isPlaceholder(node.name);
+      }).filter(function (node) {
         if (activeGroup && (node.group !== activeGroup && (node.groups || []).indexOf(activeGroup) === -1)) return false;
         if (!keyword) return true;
         const haystack = (node.name + ' ' + (node.type || '') + ' ' + (node.group || '')).toLowerCase();

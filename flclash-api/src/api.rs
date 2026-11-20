@@ -95,6 +95,25 @@ fn is_global_group(name: &str) -> bool {
     name == "GLOBAL"
 }
 
+/// Airport subscriptions often inject fake "nodes" that only carry account
+/// text (remaining traffic, expiry). They are real shadowsocks entries to the
+/// controller, so clicking one switches routing to a dead server — which looks
+/// exactly like "manual switching is broken" (the page loses connectivity).
+fn is_placeholder_node(name: &str) -> bool {
+    const PREFIXES: [&str; 9] = [
+        "剩余流量",
+        "过期时间",
+        "套餐",
+        "到期时间",
+        "距离下次",
+        "流量重置",
+        "官网",
+        "订阅",
+        "客服",
+    ];
+    PREFIXES.iter().any(|prefix| name.starts_with(prefix))
+}
+
 fn proxy_tested(proxy: &Value) -> bool {
     proxy
         .get("history")
@@ -145,20 +164,23 @@ pub(crate) fn build_proxies(proxies: &serde_json::Map<String, Value>) -> Value {
         }
         let kind = proxy_type(proxy);
         let selectable = is_selector(&kind);
+        // Account-info pseudo entries are not selectable servers; keep them
+        // out of the grid and out of the group's node count.
+        let members: Vec<String> = all
+            .iter()
+            .filter_map(|m| m.as_str().map(|s| s.to_string()))
+            .filter(|member| !is_placeholder_node(member))
+            .collect();
         groups.push(json!({
             "name": name,
             "type": kind,
             "now": proxy.get("now").and_then(|v| v.as_str()).unwrap_or(""),
-            "count": all.len(),
+            "count": members.len(),
             "selectable": selectable,
         }));
         group_names.push(name.clone());
         group_selectable.push(selectable);
-        member_names.push(
-            all.iter()
-                .filter_map(|m| m.as_str().map(|s| s.to_string()))
-                .collect(),
-        );
+        member_names.push(members);
     }
 
     let mut nodes: Vec<Value> = Vec::new();
@@ -424,11 +446,19 @@ fn groups_summary_from(data: &Value) -> Value {
             if delay == 0 {
                 timeout += 1;
             }
+            let count = all
+                .iter()
+                .filter(|m| {
+                    m.as_str()
+                        .map(|name| !is_placeholder_node(name))
+                        .unwrap_or(false)
+                })
+                .count();
             groups.push(json!({
                 "name": name,
                 "type": proxy.get("type").and_then(|v| v.as_str()).unwrap_or("").to_lowercase(),
                 "now": proxy.get("now").and_then(|v| v.as_str()).unwrap_or(""),
-                "count": all.len(),
+                "count": count,
             }));
         }
     }
@@ -1459,10 +1489,19 @@ async fn serve_file(st: &Arc<AppState>, rel: &str) -> Response {
         Ok(bytes) => {
             let mime = mime_of(&rel);
             (
-                [(
-                    axum::http::header::CONTENT_TYPE,
-                    format!("{}; charset=utf-8", mime),
-                )],
+                [
+                    (
+                        axum::http::header::CONTENT_TYPE,
+                        format!("{}; charset=utf-8", mime),
+                    ),
+                    // The UI ships unhashed asset names. Without an explicit
+                    // policy browsers heuristically cache them, so a deployed
+                    // JS fix can keep running as the previous version for days
+                    // (exactly what made "manual switching" look broken after
+                    // the backend was already fixed).
+                    (axum::http::header::CACHE_CONTROL, "no-store".to_string()),
+                    (axum::http::header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+                ],
                 bytes,
             )
                 .into_response()
@@ -1867,6 +1906,32 @@ mod proxy_tests {
         // The dashboard summary drops the synthetic group.
         let summary = groups_summary_from(&json!({"proxies": map}));
         assert_eq!(summary["count"], 2);
+    }
+
+    #[test]
+    fn account_info_placeholders_are_not_nodes() {
+        let map = json!({
+            "节点选择": {
+                "type": "Selector",
+                "now": "香港 01",
+                "all": ["香港 01", "剩余流量：80% 100GB", "过期时间：2026-12-18"]
+            },
+            "香港 01": {"type": "Vmess"},
+            "剩余流量：80% 100GB": {"type": "Shadowsocks"},
+            "过期时间：2026-12-18": {"type": "Shadowsocks"}
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let payload = build_proxies(&map);
+        assert_eq!(payload["groups"][0]["count"], 1);
+        let names: Vec<&str> = payload["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|node| node["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["香港 01"]);
     }
 
     #[tokio::test]
