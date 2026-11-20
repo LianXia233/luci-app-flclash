@@ -297,8 +297,8 @@ jobs:
       - name: Cache OpenWrt SDK (${{ matrix.channel }} / ${{ matrix.arch }})
         uses: actions/cache@v4
         with:
-          path: .sdk-cache
-          key: sdk-${{ matrix.channel }}-${{ matrix.arch }}-v2
+          path: ${{ runner.temp }}/sdk-cache
+          key: sdk-${{ matrix.channel }}-${{ matrix.arch }}-v3
 
       - name: Download ${{ matrix.channel }} SDK (${{ matrix.subtarget }}) — FluxDown, 16 segments
         env:
@@ -306,51 +306,80 @@ jobs:
           SDK_GLOB: ${{ matrix.sdk_glob }}
         run: |
           set -euo pipefail
-          mkdir -p .sdk-cache
-          file=""
-          for attempt in 1 2 3 4 5; do
+          sdk_dir="$RUNNER_TEMP/sdk-cache"
+          mkdir -p "$sdk_dir"
+
+          # sha256sums is authoritative for BOTH the filename and the digest.
+          # Parsing the HTML index first is fragile: rewritten/absolute hrefs,
+          # '*file' and './file' checksum forms all used to poison the URL or
+          # the --checksum value handed to FluxDown.
+          sums=$(curl -fsSL --retry 5 --retry-all-errors --max-time 120 "$SDK_BASE/sha256sums" || true)
+          file=$(printf '%s\n' "$sums" \
+                 | awk '{ n=$2; sub(/^\*/,"",n); sub(/^.*\//,"",n);
+                          if (n ~ ENVIRON["SDK_GLOB"]) { print n; exit } }' || true)
+          if [ -z "$file" ]; then
             listing=$(curl -fsSL --retry 5 --retry-all-errors --max-time 120 "$SDK_BASE/" || true)
             file=$(printf '%s\n' "$listing" \
                    | grep -oE 'href="[^"]+\.tar\.zst"' | sed -e 's/href="//' -e 's/"$//' \
+                   | sed -e 's#^\./##' -e 's#^.*/##' \
                    | grep -E "$SDK_GLOB" | sort -u | head -n1 || true)
-            [ -n "$file" ] && break
-            echo "listing attempt $attempt failed, retrying..."
-            sleep 10
-          done
+          fi
           test -n "$file" || { echo "SDK not found at $SDK_BASE"; exit 1; }
           url="$SDK_BASE/$file"
           echo "Using SDK: $file"
 
-          want=$(curl -sIL --retry 3 --max-time 60 "$url" \
-                 | awk 'tolower($1)=="content-length:"{v=$2} END{print v}')
-          hash=$(curl -fsSL --retry 3 --max-time 60 "$SDK_BASE/sha256sums" \
-                 | awk -v f="$file" '$2==f{print $1}' || true)
-
-          # actions/cache may already hold a verified tarball; only re-download
-          # when the size disagrees (partial or corrupt copy).
-          if [ -s ".sdk-cache/$file" ] && { [ -z "$want" ] || [ "$(stat -c%s ".sdk-cache/$file")" = "$want" ]; }; then
-            echo "cache hit: $(du -h ".sdk-cache/$file" | cut -f1)"
-          else
-            rm -f ".sdk-cache/$file"
-            # --local: embed the engine, no daemon; blocks until the file is
-            # complete. 16 segments is what beats the per-connection throttle.
+          hash=$(printf '%s\n' "$sums" \
+                 | awk -v f="$file" '{ n=$2; sub(/^\*/,"",n); sub(/^.*\//,"",n);
+                                      if (n==f) { print $1; exit } }' || true)
+          verify() {
             if [ -n "$hash" ]; then
-              fluxdown add --local -d .sdk-cache -o "$file" -s 16 \
-                --checksum "sha256=$hash" "$url"
+              echo "$hash  $sdk_dir/$file" | sha256sum -c -
             else
-              fluxdown add --local -d .sdk-cache -o "$file" -s 16 "$url"
+              echo "warning: no sha256 for $file in sha256sums; size check only"
+            fi
+          }
+
+          want=$(curl -sIL --retry 3 --max-time 60 "$url" \
+                 | tr -d '\r' \
+                 | awk 'tolower($1)=="content-length:" && $2+0>1024 {v=$2} END{print v}' || true)
+
+          # A cached tarball is trusted only when size AND digest match.
+          if [ -s "$sdk_dir/$file" ] \
+             && { [ -z "$want" ] || [ "$(stat -c%s "$sdk_dir/$file")" = "$want" ]; } \
+             && verify >/dev/null 2>&1; then
+            echo "cache hit: $(du -h "$sdk_dir/$file" | cut -f1)"
+          else
+            rm -f "$sdk_dir/$file"
+            # FluxDown stays the only downloader. Use 16 segments only when the
+            # mirror honours Range; mirrors that ignore it get one connection.
+            seg=16
+            rc=$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 -r 0-0 "$url" || true)
+            case "$rc" in
+              206|416) ;;
+              *) seg=1 ;;
+            esac
+            echo "FluxDown: $seg segment(s)"
+            fd=(--local -d "$sdk_dir" -o "$file" -s "$seg")
+            if [ -n "$hash" ]; then fd+=(--checksum "sha256=$hash"); fi
+            if ! fluxdown add "${fd[@]}" "$url"; then
+              echo "FluxDown $seg-segment download failed; retrying with 1 segment"
+              rm -f "$sdk_dir/$file"
+              fd=(--local -d "$sdk_dir" -o "$file.retry" -s 1)
+              if [ -n "$hash" ]; then fd+=(--checksum "sha256=$hash"); fi
+              fluxdown add "${fd[@]}" "$url"
+              mv "$sdk_dir/$file.retry" "$sdk_dir/$file"
             fi
           fi
 
-          got=$(stat -c%s ".sdk-cache/$file")
+          got=$(stat -c%s "$sdk_dir/$file")
           if [ -n "$want" ]; then
             [ "$got" = "$want" ] || { echo "SDK size mismatch: $got != $want"; exit 1; }
           fi
-          [ -n "$hash" ] && { echo "$hash  .sdk-cache/$file" | sha256sum -c -; }
-          du -h ".sdk-cache/$file"
+          verify
+          du -h "$sdk_dir/$file"
 
           mkdir -p sdk
-          tar --zstd -xf ".sdk-cache/$file" -C sdk --strip-components=1
+          tar --zstd -xf "$sdk_dir/$file" -C sdk --strip-components=1
           test -f sdk/rules.mk
 
       - name: Fetch prebuilt binaries (no compilation here)
