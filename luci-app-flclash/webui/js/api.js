@@ -5,6 +5,34 @@ window.FlClashAPI = (function () {
   const cfg = window.FlClashConfig;
   const mock = window.FlClashMock;
 
+  /* One prompt at a time: REST, WebSocket and binary transfers all funnel
+   * through the same 401 handler, so a parallel burst asks only once. */
+  const auth = {
+    pending: null,
+    ask: function (reason) {
+      if (auth.pending) return auth.pending;
+      const flow = new Promise(function (resolve) {
+        if (!window.FlClashUI || !window.FlClashUI.promptSecret) {
+          resolve(false);
+          return;
+        }
+        window.FlClashUI.promptSecret(reason).then(function (secret) {
+          if (!secret) {
+            resolve(false);
+            return;
+          }
+          cfg.secret = secret;
+          try { window.sessionStorage.setItem('flclash.secret', secret); } catch (error) { /* ignore */ }
+          resolve(true);
+        });
+      });
+      auth.pending = flow;
+      flow.then(function () { auth.pending = null; }, function () { auth.pending = null; });
+      return flow;
+    }
+  };
+  window.FlClashAuth = auth;
+
   function url(path) {
     return cfg.apiBase.replace(/\/$/, '') + path;
   }
@@ -15,7 +43,7 @@ window.FlClashAPI = (function () {
     return { signal: controller.signal, done: function () { window.clearTimeout(timer); } };
   }
 
-  async function request(path, options) {
+  async function request(path, options, retried) {
     const init = Object.assign({
       method: 'GET',
       headers: { Accept: 'application/json' },
@@ -40,6 +68,10 @@ window.FlClashAPI = (function () {
     }
 
     if (!response.ok) {
+      if (response.status === 401 && !retried) {
+        const ok = await auth.ask('该设备要求 API 密钥，请输入后继续（可在 LuCI 查看 flclash.api.secret）。');
+        if (ok) return request(path, options, true);
+      }
       let detail = response.statusText;
       try {
         const payload = await response.json();
@@ -201,25 +233,31 @@ window.FlClashAPI = (function () {
       return live('backupDelete', { path: '/backup/' + encodeURIComponent(name), method: 'DELETE' });
     },
     /* Raw gzip body — bypasses the JSON wrapper on purpose. */
-    backupUpload: async function (bytes) {
+    backupUpload: async function (bytes, retried) {
       if (cfg.mock && mock && typeof mock.backupUpload === 'function') return mock.backupUpload(bytes);
       const headers = { 'Content-Type': 'application/gzip', Accept: 'application/json' };
       if (cfg.secret) headers['X-FlClash-Secret'] = cfg.secret;
       const response = await fetch(url('/backup/upload'), {
         method: 'POST', body: bytes, headers: headers, credentials: 'same-origin'
       });
+      if (response.status === 401 && !retried && await auth.ask()) {
+        return window.FlClashAPI.backupUpload(bytes, true);
+      }
       const payload = await response.json().catch(function () { return {}; });
       if (!response.ok) throw new Error(payload.error || '恢复失败');
       return payload;
     },
     // Authenticated blob download: REST auth accepts headers only, so the
     // secret never travels in a URL (no logs / history leakage).
-    backupDownload: async function (name) {
+    backupDownload: async function (name, retried) {
       const headers = { Accept: 'application/gzip' };
       if (cfg.secret) headers['X-FlClash-Secret'] = cfg.secret;
       const response = await fetch(url('/backup/download/' + encodeURIComponent(name)), {
         headers: headers, credentials: 'same-origin', cache: 'no-store'
       });
+      if (response.status === 401 && !retried && await auth.ask()) {
+        return window.FlClashAPI.backupDownload(name, true);
+      }
       if (!response.ok) throw new Error('下载失败 (' + response.status + ')');
       return response.blob();
     }

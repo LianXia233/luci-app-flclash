@@ -341,6 +341,68 @@ window.FlClashUI = (function () {
     return '<span class="letter-tile ' + (cls || '') + '">' + esc(first) + '</span>';
   }
 
+  /* API-key prompt for backends that answer 401. Resolves with the typed
+   * secret or null on cancel; persistence is the caller's job. */
+  function promptSecret(message) {
+    return new Promise(function (resolve) {
+      const overlay = document.createElement('div');
+      overlay.setAttribute('style',
+        'position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.55);padding:20px');
+      const card = document.createElement('form');
+      card.className = 'card';
+      card.setAttribute('style', 'width:100%;max-width:380px;padding:22px;display:flex;flex-direction:column;gap:12px;margin:0');
+      const title = document.createElement('h3');
+      title.textContent = '需要 API 密钥';
+      title.setAttribute('style', 'margin:0;font-size:16px');
+      const desc = document.createElement('p');
+      desc.textContent = message || '此设备启用了 API 鉴权，请输入密钥后继续。';
+      desc.setAttribute('style', 'margin:0;font-size:13px;opacity:.75;line-height:1.5');
+      const input = document.createElement('input');
+      input.type = 'password';
+      input.className = 'input';
+      input.autocomplete = 'current-password';
+      input.placeholder = 'API 密钥';
+      const row = document.createElement('div');
+      row.setAttribute('style', 'display:flex;gap:10px;justify-content:flex-end');
+      const cancel = document.createElement('button');
+      cancel.type = 'button';
+      cancel.className = 'btn';
+      cancel.textContent = '取消';
+      const ok = document.createElement('button');
+      ok.type = 'submit';
+      ok.className = 'btn is-primary';
+      ok.textContent = '确定';
+      row.appendChild(cancel);
+      row.appendChild(ok);
+      card.appendChild(title);
+      card.appendChild(desc);
+      card.appendChild(input);
+      card.appendChild(row);
+      overlay.appendChild(card);
+
+      function finish(value) {
+        window.removeEventListener('keydown', onKey, true);
+        overlay.remove();
+        resolve(value);
+      }
+      function onKey(event) {
+        if (event.key === 'Escape') {
+          event.stopPropagation();
+          finish(null);
+        }
+      }
+      cancel.addEventListener('click', function () { finish(null); });
+      card.addEventListener('submit', function (event) {
+        event.preventDefault();
+        const value = input.value.trim();
+        if (value) finish(value);
+      });
+      window.addEventListener('keydown', onKey, true);
+      document.body.appendChild(overlay);
+      window.setTimeout(function () { input.focus(); }, 30);
+    });
+  }
+
   return {
     $: $, $$: $$, esc: esc, bytes: bytes, splitBytes: splitBytes, rate: rate,
     count: count, duration: duration, clock: clock, delayTone: delayTone,
@@ -348,6 +410,6 @@ window.FlClashUI = (function () {
     toast: toast, openSheet: openSheet, closeSheet: closeSheet, confirmSheet: confirmSheet,
     switchHtml: switchHtml, head: head, empty: empty, skeletonRows: skeletonRows,
     pressable: pressable, countUp: countUp, renderChart: renderChart, wave: wave,
-    letterTile: letterTile
+    letterTile: letterTile, promptSecret: promptSecret
   };
 })();
