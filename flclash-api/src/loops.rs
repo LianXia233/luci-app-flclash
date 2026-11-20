@@ -300,13 +300,16 @@ fn parse_dns_target(rest: &str) -> Option<(String, String, String)> {
 }
 
 /// The egress path the DNS query itself used, derived from the upstream:
-/// DoH resolvers are reached through the proxy chain ("代理"), the system
-/// resolver is neither ("其他"), everything plain goes straight out WAN.
+/// encrypted transports (DoH / DoT / DoQ, and gRPC or QUIC pools) are
+/// reached through the proxy chain ("代理"), the system resolver is neither
+/// ("其他"), plain UDP goes straight out WAN ("直连").
 fn dns_origin(upstream: &str) -> &'static str {
-    if upstream.contains("/dns-query") {
+    if upstream.starts_with("system(") {
+        return "其他";
+    }
+    let scheme = upstream.split("://").next().unwrap_or("");
+    if upstream.contains("/dns-query") || matches!(scheme, "https" | "h3" | "tls" | "quic" | "grpc") {
         "代理"
-    } else if upstream.starts_with("system(") {
-        "其他"
     } else {
         "直连"
     }
@@ -509,5 +512,12 @@ mod dns_log_tests {
             Some(DnsEvent::Answer { ips, .. }) => assert_eq!(ips, ""),
             _ => panic!("empty answer not parsed"),
         }
+        // encrypted transports classify as 代理 by their scheme alone, so a
+        // resolver whose path is not /dns-query is still attributed correctly
+        assert_eq!(dns_origin("tls://8.8.8.8"), "代理");
+        assert_eq!(dns_origin("quic://dns.example.net"), "代理");
+        assert_eq!(dns_origin("https://203.0.113.10:8443/resolver"), "代理");
+        assert_eq!(dns_origin("udp://8.8.4.4:53"), "直连");
+        assert_eq!(dns_origin("system(udp://127.0.0.1:53,udp://[::1]:53)"), "其他");
     }
 }
