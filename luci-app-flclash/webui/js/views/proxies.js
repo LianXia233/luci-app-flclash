@@ -59,13 +59,17 @@
     }
 
     /** Group a click should apply to: active selector, else primary selector.
+     * GLOBAL is mihomo's built-in "everything" selector: in rule/direct mode
+     * switching it changes nothing, so it is never the default target. It is
+     * still usable when the user explicitly opens the GLOBAL tab (mode: global).
      * An active *auto* group never redirects the click to another group — it
      * is blocked with an explanation instead (see `activate`). */
     function targetGroup(node) {
       const groups = (node.groups && node.groups.length) ? node.groups : [node.group];
       if (activeGroup) return groups.indexOf(activeGroup) !== -1 ? activeGroup : '';
-      const manual = groups.filter(function (name) { return selectableOf(groupInfo(name)); })[0];
-      return manual || groups[0] || node.group || '';
+      const routing = groups.filter(function (name) { return name && name !== 'GLOBAL'; });
+      const manual = routing.filter(function (name) { return selectableOf(groupInfo(name)); })[0];
+      return manual || routing[0] || groups[0] || node.group || '';
     }
 
     function renderNote() {
@@ -87,7 +91,11 @@
     }
 
     function renderGroups() {
-      const groups = groupList();
+      // GLOBAL is a synthetic container, not a routing group: show it last so
+      // the real selectors (节点选择/自动选择) are the first thing users see.
+      const groups = groupList().slice().sort(function (a, b) {
+        return (a.name === 'GLOBAL' ? 1 : 0) - (b.name === 'GLOBAL' ? 1 : 0);
+      });
       if (!groups.length) {
         groupsBar.innerHTML = ui.empty('内核停止或无策略组', 'layers');
         renderNote();
@@ -144,6 +152,9 @@
       const manual = node.selectable !== false && (node.selectable === true ||
         (node.groups || [node.group]).some(function (name) { return selectableOf(groupInfo(name)); }));
       const active = groupList().some(function (group) {
+        // GLOBAL's `now` mirrors a node even in rule mode; ignoring it keeps
+        // the "active" badge tied to the group that actually routes traffic.
+        if (!activeGroup && group.name === 'GLOBAL') return false;
         return group.now === node.name && (activeGroup ? group.name === activeGroup : selectableOf(group));
       });
       const group = targetGroup(node);
