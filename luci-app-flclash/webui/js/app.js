@@ -33,7 +33,7 @@
 
   const META = {
     dashboard: '仪表盘', proxies: '代理', profiles: '配置', requests: '连接',
-    tools: '工具', dns: 'DNS 测试', logs: '日志', rules: '规则', settings: '设置',
+    tools: '工具', dns: 'DNS 查询', logs: '日志', rules: '规则', settings: '设置',
     backup: '备份与恢复', mixin: '配置混入', acl: '访问控制', dnsAdvanced: 'DNS 进阶'
   };
 
@@ -191,6 +191,15 @@
     const knownIp = status.outboundIp && status.outboundIp !== '—';
     const info = status.ipInfo || {};
     const locationText = [info.country || '', info.city || ''].filter(Boolean).join(' · ');
+    // IP 资料: owner (isp/org, backend-localized when possible) + ASN; fall
+    // back to the region line when no owner is known, never "未知" while an
+    // IP is on screen.
+    const ownerSource = [info.isp || '', info.org || '', status.organization || '']
+      .filter(function (s) { return s && s !== '未知' && s !== '查询失败'; })[0] || '';
+    const ipOwnerText = ownerSource
+      ? [ownerSource, info.asn || ''].filter(Boolean).join(' · ')
+      : (locationText || '—');
+    const ipOwnerTitle = [ownerSource, info.asn || '', locationText].filter(Boolean).join(' · ');
     return '<section class="card status-card span-2' + (running ? ' is-running' : '') + '" data-role="status">' +
       '<div class="status-inner">' +
         '<div class="status-main">' +
@@ -222,8 +231,8 @@
             '<div class="status-cell"><div class="status-cell-label">运行时长</div>' +
               '<div class="status-cell-value" data-role="uptime">' + (running ? ui.duration(status.uptime) : '—') + '</div></div>' +
             '<div class="status-cell"><div class="status-cell-label">IP 资料</div>' +
-              '<div class="status-cell-value is-muted" data-role="org" title="' + ui.esc([status.organization || info.isp || info.org || '', info.asn || ''].filter(Boolean).join(' · ')) + '">' +
-                ui.esc(status.organization || info.isp || info.org || '—') + '</div></div>' +
+              '<div class="status-cell-value is-muted" data-role="org" title="' + ui.esc(ipOwnerTitle) + '">' +
+                ui.esc(ipOwnerText) + '</div></div>' +
           '</div>' +
         '</div>' +
         '<button class="start-toggle' + (running ? ' is-running' : '') + '" data-act="toggle" type="button" ' +
@@ -615,10 +624,13 @@
     const org = ui.$('[data-role="org"]', node);
     const info = status.ipInfo || {};
     if (org) {
-      // status.organization is the backend-composed display (localized where
-      // possible) — prefer it over the raw English geo fields.
-      org.textContent = status.organization || info.isp || info.org || '—';
-      org.setAttribute('title', [status.organization || info.isp || info.org || '', info.asn || ''].filter(Boolean).join(' · '));
+      // Same composition as the render path: localized owner first, ASN as
+      // the second segment, region line when no owner is known.
+      const owner = [info.isp || '', info.org || '', status.organization || '']
+        .filter(function (s) { return s && s !== '未知' && s !== '查询失败'; })[0] || '';
+      const loc = [info.country || '', info.city || ''].filter(Boolean).join(' · ');
+      org.textContent = owner ? [owner, info.asn || ''].filter(Boolean).join(' · ') : (loc || '—');
+      org.setAttribute('title', [owner, info.asn || '', loc].filter(Boolean).join(' · '));
     }
     const qualityChip = ui.$('[data-role="quality"]', node);
     const qualityNow = status.quality || {};

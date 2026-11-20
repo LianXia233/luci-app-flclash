@@ -12,6 +12,38 @@ pub const MAX_HISTORY: usize = 60;
 pub const MAX_LOGS: usize = 500;
 pub const MAX_BODY: usize = 32 << 20;
 
+/// One parsed mihomo DNS-query log line pair (resolve → answer / cache hit).
+/// `origin` groups the query by the egress its upstream uses:
+///   代理 — the airport DoH pool from `proxy-server-nameserver`/`nameserver`
+///   直连 — plain udp/tcp resolvers (default-nameserver bootstrap, direct-nameserver)
+///   其他 — the `system` resolver
+#[derive(Debug, Clone)]
+pub struct DnsQueryEntry {
+    pub time: i64,
+    pub domain: String,
+    pub qtype: String,
+    pub origin: String,
+    pub result: String,
+    pub source: String,
+    pub elapsed: i64,
+    pub cached: bool,
+}
+
+impl DnsQueryEntry {
+    pub fn to_json(&self) -> Value {
+        json!({
+            "time": self.time,
+            "domain": self.domain,
+            "qtype": self.qtype,
+            "origin": self.origin,
+            "result": self.result,
+            "source": self.source,
+            "elapsed": self.elapsed,
+            "cached": self.cached,
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct LogEntry {
     pub time: i64,
@@ -90,6 +122,14 @@ pub struct AppState {
     pub init_script: String,
     pub secret: Option<String>,
     pub hist: Mutex<History>,
+    pub dns_log: Mutex<Vec<DnsQueryEntry>>,
+    /// Millis of the last request to GET /dns/queries. The DNS sampler only
+    /// flips the core to log-level=debug while this is recent (the page is
+    /// open) — debug mode logs every connection and would flood syslog.
+    pub dns_log_active: AtomicI64,
+    /// Server domains of the current subscription's proxies: DNS queries for
+    /// these are node-domain resolutions, i.e. they ride the proxy chain.
+    pub node_domains: Mutex<std::collections::HashSet<String>>,
     /// Cross-transport event bus (WebSocket fan-out + task progress).
     pub bus: EventBus,
     /// Long-running operation registry.
@@ -127,6 +167,9 @@ impl AppState {
             init_script,
             secret,
             hist: Mutex::default(),
+            dns_log: Mutex::default(),
+            dns_log_active: AtomicI64::new(0),
+            node_domains: Mutex::default(),
             bus,
             tasks,
             latest,

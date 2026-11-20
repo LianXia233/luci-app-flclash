@@ -146,6 +146,21 @@ pub async fn proxies_payload(st: &AppState) -> Result<Value, String> {
         .get("proxies")
         .and_then(|v| v.as_object())
         .ok_or_else(|| "bad proxies payload".to_string())?;
+    // Remember the subscription's node server domains: the DNS query log uses
+    // them to tag node-domain resolutions as 代理.
+    {
+        let mut domains = st.node_domains.lock().unwrap();
+        for (_name, item) in proxies.iter() {
+            if let Some(server) = item.get("server").and_then(|v| v.as_str()) {
+                if !server.is_empty() && server.contains('.') {
+                    domains.insert(server.to_string());
+                }
+            }
+        }
+        if domains.len() > 5000 {
+            domains.clear();
+        }
+    }
     Ok(build_proxies(proxies))
 }
 
@@ -1011,8 +1026,18 @@ pub async fn connection_close(State(st): State<Arc<AppState>>, Path(id): Path<St
     }
 }
 
-pub async fn dns_queries() -> Response {
-    ok_json(json!([]))
+/// GET /dns/queries — the DNS query log distilled from mihomo's debug log.
+/// Marking the access here is what arms the sampler: the core is patched to
+/// log-level=debug while this endpoint keeps being polled (the page is open)
+/// and back to its configured level afterwards.
+pub async fn dns_queries(State(st): State<Arc<AppState>>) -> Response {
+    st.dns_log_active
+        .store(crate::events::now_millis(), std::sync::atomic::Ordering::Relaxed);
+    let entries = st.dns_log.lock().unwrap().clone();
+    ok_json(json!(entries
+        .iter()
+        .map(|entry| entry.to_json())
+        .collect::<Vec<_>>()))
 }
 
 pub async fn dns_flush(State(st): State<Arc<AppState>>) -> Response {

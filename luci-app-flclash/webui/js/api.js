@@ -124,6 +124,15 @@ window.FlClashAPI = (function () {
       return request('/dns/resolve?name=' + encodeURIComponent(name) + '&type=' + encodeURIComponent(type || 'A'));
     },
 
+    /* Live DNS query log — GET /dns/queries (backend distils the core debug
+     * log; polling this endpoint is what keeps the capture armed). */
+    dnsQueries: function () {
+      if (cfg.mock && mock && typeof mock.dnsQueries === 'function') {
+        return mock.dnsQueries();
+      }
+      return live('dnsQueries', '/dns/queries');
+    },
+
     systemProxy: function () {
       if (cfg.mock && mock && typeof mock.systemProxy === 'function') {
         return mock.systemProxy();

@@ -388,8 +388,7 @@ async fn lookup_once(st: &AppState) -> bool {
     // Localization pass (user preference: 汉化 where possible): the geo DBs
     // answer English owner names; ip-api.com (zh-CN) carries Chinese ISP/org
     // for most networks. Only consulted when the display has no CJK yet.
-    if ok && !has_cjk(&info.isp) && !has_cjk(&info.org) {
-        if let Ok(v) = curl_json::<serde_json::Value>(
+    if ok && !has_cjk(&info.isp) && !has_cjk(&info.org) {        if let Ok(v) = curl_json::<serde_json::Value>(
             "http://ip-api.com/json/?fields=status,isp,org,as&lang=zh-CN",
             8,
         )
@@ -404,6 +403,11 @@ async fn lookup_once(st: &AppState) -> bool {
                 info.org = org.to_string();
             }
         }
+    }
+    // Sources like skk.moe only answer an owner (asOrg); mirror it into isp
+    // so display and quality consumers never see one without the other.
+    if ok && info.isp.trim().is_empty() && !junk_org(&info.org) {
+        info.isp = info.org.clone();
     }
     let succeeded = ok;
     {

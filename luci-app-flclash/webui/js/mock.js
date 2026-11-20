@@ -388,6 +388,15 @@ window.FlClashMock = (function () {
       }));
     },
     version: function () { return Promise.resolve({ version: '0.9.3', core: 'v1.19.33' }); },
+    dnsQueries: function () {
+      const now = Math.floor(Date.now() / 1000);
+      return [
+        { time: now - 2, domain: 'node-02.example.net', qtype: 'A', origin: '代理', result: '203.0.113.20, 203.0.113.21', source: 'https://203.0.113.10:8443/dns-query/abcd', elapsed: 34, cached: false },
+        { time: now - 4, domain: 'edge.example.net', qtype: 'A', origin: '直连', result: '198.51.100.50', source: 'udp://8.8.4.4:53', elapsed: 21, cached: false },
+        { time: now - 6, domain: 'www.gstatic.com', qtype: 'A', origin: '缓存', result: '198.18.0.4', source: '', elapsed: 0, cached: true },
+        { time: now - 9, domain: 'www.cloudflare.com', qtype: 'AAAA', origin: '其他', result: '2606:4700::6810:7b60', source: 'udp://223.5.5.5:53', elapsed: 35, cached: false }
+      ];
+    },
     systemProxy: function () {
       return Promise.resolve({
         backend: 'flclash',

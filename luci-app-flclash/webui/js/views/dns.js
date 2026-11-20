@@ -1,102 +1,151 @@
-/* View: DNS 测试 — real resolution through the core (GET /dns/query),
- * replacing the old dead "query history" page: mihomo keeps no history, but
- * it does resolve — so the page is an actual working tool. */
+/* View: DNS 查询 — live mihomo DNS query log.
+ *
+ * Data source: the backend distils the core's debug log ([DNS] resolve /
+ * cache hit / answer lines) into GET /dns/queries while this page polls it.
+ * The core is temporarily switched to log-level=debug while the page is open
+ * and restored afterwards — passive logging without flooding syslog.
+ * A manual resolver is kept in the toolbar: those queries go through the
+ * core resolver too, so they show up in the same log.
+ */
 (function () {
   'use strict';
 
   const ui = window.FlClashUI;
   const icon = window.FlClashIcons.svg;
 
-  function dns(ctx) {
+  const TABS = ['全部', 'A', 'AAAA', '代理', '其他', '直连', '缓存'];
+
+  function dnsQuery(ctx) {
     const api = ctx.api;
     const root = document.createElement('div');
     root.className = 'view page';
-    const history = [];
+    let tab = '全部';
+    let keyword = '';
+    let rows = [];
 
     root.innerHTML =
+      '<style>' +
+        '.dns-domain{max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}' +
+        '.dns-result{word-break:break-all;max-width:420px}' +
+        '.dns-source{max-width:230px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}' +
+        '.dns-note{font-size:12px;opacity:.6;margin:8px 2px}' +
+      '</style>' +
       '<div class="page-toolbar">' +
-        '<div class="search grow">' + icon('globe', 16) +
-          '<input class="input" id="dns-name" type="text" placeholder="输入域名,例如 www.apple.com" aria-label="解析域名">' +
+        '<div class="search">' + icon('search', 16) +
+          '<input class="input" type="search" placeholder="过滤域名 / IP / 上游" aria-label="过滤 DNS 查询">' +
         '</div>' +
-        '<select class="select" id="dns-type" aria-label="记录类型">' +
-          '<option value="A">A</option><option value="AAAA">AAAA</option><option value="CNAME">CNAME</option>' +
-          '<option value="TXT">TXT</option><option value="MX">MX</option><option value="NS">NS</option></select>' +
-        '<button class="btn is-primary" data-act="resolve" type="button">' + icon('bolt', 16) + '解析</button>' +
+        '<input class="input" data-role="resolve-name" type="text" placeholder="手动查询域名" style="max-width:230px">' +
+        '<select class="select" data-role="resolve-type" aria-label="记录类型">' +
+          '<option value="A">A</option><option value="AAAA">AAAA</option>' +
+          '<option value="CNAME">CNAME</option><option value="TXT">TXT</option></select>' +
+        '<button class="btn is-primary" data-act="resolve" type="button">' + icon('bolt', 16) + '查询</button>' +
       '</div>' +
-      '<section class="card"><div class="card-head"><span class="glyph" data-icon="dns"></span>' +
-        '<span class="card-title">解析结果</span><span class="card-end"><span class="chip" data-role="status">就绪</span></span></div>' +
-        '<div data-role="result">' + ui.empty('输入域名开始解析测试', 'dns') + '</div></section>' +
-      '<section class="card is-flush" style="margin-top:14px">' +
-        '<div class="card-head"><span class="glyph" data-icon="history"></span><span class="card-title">本次会话记录</span>' +
-        '<span class="card-end"><button class="icon-button" data-act="clear" type="button" aria-label="清空记录">' + icon('trash', 15) + '</button></span></div>' +
-        '<div class="dns-history" data-role="history">' + ui.empty('暂无记录', 'history') + '</div>' +
-      '</section>';
+      '<div class="dns-note">查看本页时内核会临时开启 DNS 查询日志（debug），离开页面自动恢复；「发起」= 该解析使用的出站路径。</div>' +
+      '<div class="seg-chips" data-role="tabs" role="tablist" aria-label="过滤"></div>' +
+      '<section class="card is-flush"><div data-role="table"></div></section>';
 
-    const resultBox = ui.$('[data-role="result"]', root);
-    const historyBox = ui.$('[data-role="history"]', root);
-    const statusChip = ui.$('[data-role="status"]', root);
+    const search = ui.$('[type="search"]', root);
+    const tabsBar = ui.$('[data-role="tabs"]', root);
+    const table = ui.$('[data-role="table"]', root);
 
-    function renderHistory() {
-      if (!history.length) {
-        historyBox.innerHTML = ui.empty('暂无记录', 'history');
+    function rowsOf() {
+      return rows.filter(function (row) {
+        if (tab === 'A' || tab === 'AAAA') {
+          if ((row.qtype || '') !== tab) return false;
+        } else if (tab === '缓存') {
+          if (!row.cached) return false;
+        } else if (tab !== '全部') {
+          if ((row.origin || '') !== tab) return false;
+        }
+        if (!keyword) return true;
+        const hay = ((row.domain || '') + ' ' + (row.result || '') + ' ' + (row.source || '')).toLowerCase();
+        return hay.indexOf(keyword.toLowerCase()) !== -1;
+      });
+    }
+
+    function renderTabs() {
+      tabsBar.innerHTML = TABS.map(function (label) {
+        return '<button class="seg-chip' + (tab === label ? ' is-active' : '') +
+          '" data-tab="' + label + '" type="button" role="tab" aria-selected="' + (tab === label) + '">' +
+          label + '</button>';
+      }).join('');
+      ui.$$('[data-tab]', tabsBar).forEach(function (button) {
+        button.addEventListener('click', function () {
+          tab = button.getAttribute('data-tab');
+          renderTabs();
+          renderRows();
+        });
+      });
+    }
+
+    function renderRows() {
+      const list = rowsOf();
+      if (!list.length) {
+        table.innerHTML = ui.empty('暂无 DNS 查询记录 — 打开本页后内核会开始记录', 'dns');
         return;
       }
-      historyBox.innerHTML = history.map(function (item) {
-        return '<div class="dns-row"><span class="dns-time">' + ui.esc(ui.clock(item.time)) + '</span>' +
-          '<span class="dns-name">' + ui.esc(item.name) + '</span>' +
-          '<span class="chip">' + ui.esc(item.type) + '</span>' +
-          '<span class="dns-answer' + (item.fake ? ' is-fake' : '') + '">' + ui.esc(item.answer) + '</span>' +
-          '<span class="dns-elapsed">' + ui.esc(item.elapsed) + '</span></div>';
-      }).join('');
+      table.innerHTML = '<table class="data"><thead><tr>' +
+          '<th>时间</th><th>域名</th><th>类型</th><th>发起</th><th>结果</th><th>来源</th><th class="num">耗时</th>' +
+        '</tr></thead><tbody>' +
+        list.map(function (row) {
+          const cached = row.cached ? '<span class="chip">缓存</span> ' : '';
+          const result = row.result ? ui.esc(row.result) : '—';
+          return '<tr>' +
+            '<td class="muted">' + ui.esc(ui.clock(row.time)) + '</td>' +
+            '<td class="dns-domain" title="' + ui.esc(row.domain) + '">' + ui.esc(row.domain) + '</td>' +
+            '<td><span class="chip chip-plain">' + ui.esc(row.qtype || '—') + '</span></td>' +
+            '<td><span class="chip chip-plain">' + ui.esc(row.origin || '其他') + '</span></td>' +
+            '<td class="dns-result">' + cached + result + '</td>' +
+            '<td class="muted dns-source" title="' + ui.esc(row.source || '') + '">' + ui.esc(row.source || '—') + '</td>' +
+            '<td class="num">' + (row.elapsed || 0) + ' ms</td>' +
+          '</tr>';
+        }).join('') + '</tbody></table>';
     }
 
-    function resolve() {
-      const name = ui.$('#dns-name', root).value.trim();
-      const type = ui.$('#dns-type', root).value;
-      if (!name) { ui.toast('请输入域名', 'error'); return; }
-      statusChip.textContent = '解析中…';
-      statusChip.className = 'chip';
-      const started = performance.now();
-      api.dnsResolve(name, type)
-        .then(function (data) {
-          const elapsed = Math.round(performance.now() - started) + ' ms';
-          const answers = [];
-          (data && data.answer ? data.answer : []).forEach(function (item) {
-            if (item && item.data) answers.push(String(item.data));
-          });
-          const answer = answers.length ? answers.join(', ') : '无记录';
-          const fake = answer.indexOf('198.18.') === 0 || answer.indexOf('28.0.0.') === 0;
-          statusChip.textContent = answers.length ? '成功' : '空';
-          statusChip.className = 'chip' + (answers.length ? ' is-ok' : ' is-warn');
-          resultBox.innerHTML = '<div class="kv"><span class="k">域名</span><span class="v">' + ui.esc(name) + '</span></div>' +
-            '<div class="kv"><span class="k">类型</span><span class="v">' + ui.esc(type) + '</span></div>' +
-            '<div class="kv"><span class="k">结果</span><span class="v dns-answer' + (fake ? ' is-fake' : '') + '">' + ui.esc(answer) + '</span></div>' +
-            '<div class="kv"><span class="k">耗时</span><span class="v">' + ui.esc(elapsed) + '</span></div>' +
-            (fake ? '<p class="sheet-note">结果为 fake-ip(198.18.0.0/15),属内核正常劫持行为。</p>' : '');
-          history.unshift({ time: Math.floor(Date.now() / 1000), name: name, type: type, answer: answer, fake: fake, elapsed: elapsed });
-          if (history.length > 20) history.pop();
-          renderHistory();
+    function refresh() {
+      return api.dnsQueries().then(function (data) {
+        rows = Array.isArray(data) ? data : [];
+        renderRows();
+      }).catch(function (error) {
+        if (error && error.status === 401) throw error;
+        /* offline: keep the last rows on screen */
+      });
+    }
+
+    search.addEventListener('input', ui.debounce(function () {
+      keyword = search.value.trim();
+      renderRows();
+    }, 150));
+
+    ui.$('[data-act="resolve"]', root).addEventListener('click', function () {
+      const button = this;
+      const input = ui.$('[data-role="resolve-name"]', root);
+      const typeSel = ui.$('[data-role="resolve-type"]', root);
+      const name = (input.value || '').trim();
+      if (!name) { ui.toast('请输入要查询的域名', 'error'); return; }
+      button.disabled = true;
+      api.dnsResolve(name, typeSel.value)
+        .then(function (reply) {
+          const answers = ((reply && (reply.answer || reply.Answer)) || [])
+            .map(function (record) { return record.data; });
+          ui.toast(name + ' → ' + (answers.length ? answers.join(', ') : '无记录'), answers.length ? 'ok' : 'error');
+          return refresh();
         })
-        .catch(function (error) {
-          statusChip.textContent = '失败';
-          statusChip.className = 'chip is-warn';
-          resultBox.innerHTML = ui.empty(error.message, 'info');
-        });
-    }
-
-    ui.$('[data-act="resolve"]', root).addEventListener('click', resolve);
-    ui.$('#dns-name', root).addEventListener('keydown', function (event) {
-      if (event.key === 'Enter') resolve();
-    });
-    ui.$('[data-act="clear"]', root).addEventListener('click', function () {
-      history.length = 0;
-      renderHistory();
+        .catch(function (error) { ui.toast('查询失败: ' + (error.message || error), 'error'); })
+        .then(function () { button.disabled = false; });
     });
 
-    renderHistory();
+    renderTabs();
+    renderRows();
+    refresh();
+    const timer = window.setInterval(function () {
+      if (document.hidden) return;
+      refresh();
+    }, 2000);
+    if (ctx.onTeardown) ctx.onTeardown(function () { window.clearInterval(timer); });
     return root;
   }
 
   window.FlClashViews = window.FlClashViews || {};
-  window.FlClashViews.dns = dns;
+  window.FlClashViews.dns = dnsQuery;
 })();

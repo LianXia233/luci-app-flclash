@@ -9,7 +9,7 @@
     const root = document.createElement('div');
     root.className = 'view page';
     const items = [
-      ['dns', 'DNS 测试', '通过内核实时解析并查看结果', 'dns'],
+      ['dns', 'DNS 查询', '内核 DNS 解析日志与手动查询', 'dns'],
       ['logs', '运行日志', '内核事件与排障信息', 'logs'],
       ['rules', '规则', '当前生效的分流规则', 'split'],
       ['requests', '实时连接', '当前活动连接与流量', 'requests'],
