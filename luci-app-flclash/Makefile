@@ -103,6 +103,7 @@ define Package/luci-app-flclash/install
 	$(INSTALL_DATA) ./webui/js/ui.js $(1)/www/flclash/js/ui.js
 	$(INSTALL_DATA) ./webui/js/mock.js $(1)/www/flclash/js/mock.js
 	$(INSTALL_DATA) ./webui/js/api.js $(1)/www/flclash/js/api.js
+	$(INSTALL_DATA) ./webui/js/comm.js $(1)/www/flclash/js/comm.js
 	$(INSTALL_DATA) ./webui/js/views.js $(1)/www/flclash/js/views.js
 	$(INSTALL_DATA) ./webui/js/app.js $(1)/www/flclash/js/app.js
 	$(INSTALL_DATA) ./webui/js/views/*.js $(1)/www/flclash/js/views/
