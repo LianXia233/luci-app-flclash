@@ -333,7 +333,10 @@ window.FlClashComm = (function () {
   function activeTopics() {
     const topics = ['status'];
     topicSubs.forEach(function (set, topic) {
-      if (set.size && specs[topic]) topics.push(topic);
+      /* Only live topics may be pushed. Subscribing to a poll-only topic
+       * (profiles, config) makes the server reject the whole frame with
+       * "unknown topic", which drops every other topic in the same sync. */
+      if (set.size && specs[topic] && specs[topic].live) topics.push(topic);
     });
     return topics.filter(function (topic, index, list) { return list.indexOf(topic) === index; });
   }
