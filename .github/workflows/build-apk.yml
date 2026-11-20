@@ -295,7 +295,7 @@ jobs:
           echo "package: luci-app-flclash $v-r$r"
 
       - name: Cache OpenWrt SDK (${{ matrix.channel }} / ${{ matrix.arch }})
-        uses: actions/cache@v4
+        uses: actions/cache@v6 # node24
         with:
           path: ${{ runner.temp }}/sdk-cache
           key: sdk-${{ matrix.channel }}-${{ matrix.arch }}-v3
@@ -383,7 +383,7 @@ jobs:
           test -f sdk/rules.mk
 
       - name: Fetch prebuilt binaries (no compilation here)
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@v7 # node24
         with:
           name: bins-${{ matrix.platform }}
           path: luci-app-flclash/files/usr/bin
@@ -469,7 +469,7 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Download all apk artifacts
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@v7 # node24
         with:
           pattern: apk-*
           path: release
