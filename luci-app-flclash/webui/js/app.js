@@ -173,11 +173,12 @@
           : '轮询模式（REST 回退）';
   }
 
+  const notifiedTaskIds = new Set();
   function notifyTaskFailures(tasks) {
     if (!tasks || !tasks.length) return;
     tasks.forEach(function (task) {
-      if (!task || task.state !== 'failed' || task.__notified) return;
-      task.__notified = true;
+      if (!task || task.state !== 'failed' || !task.id || notifiedTaskIds.has(task.id)) return;
+      notifiedTaskIds.add(task.id);
       ui.toast((task.label || '任务') + '失败: ' + (task.error || '未知错误'), 'error');
     });
   }
