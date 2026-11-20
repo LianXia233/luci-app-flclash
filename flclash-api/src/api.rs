@@ -87,6 +87,14 @@ pub(crate) fn is_selector(kind: &str) -> bool {
     kind == "selector"
 }
 
+/// mihomo's built-in `GLOBAL` selector contains *every* proxy and group, so it
+/// is always first in `/proxies`. It is only meaningful in `mode: global`; in
+/// rule/direct mode switching it changes nothing, yet it used to win the
+/// "primary group" election and made manual switching look broken.
+fn is_global_group(name: &str) -> bool {
+    name == "GLOBAL"
+}
+
 fn proxy_tested(proxy: &Value) -> bool {
     proxy
         .get("history")
@@ -169,9 +177,15 @@ pub(crate) fn build_proxies(proxies: &serde_json::Map<String, Value>) -> Value {
                         list.push(Value::String(name.clone()));
                     }
                 }
-                if group_selectable[gi] && !node["selectable"].as_bool().unwrap_or(false) {
-                    node["selectable"] = json!(true);
-                    node["group"] = json!(name);
+                // Prefer a real routing selector as the click target. GLOBAL is
+                // kept in `groups` (the global-mode tab needs it) but never
+                // becomes the default group.
+                if group_selectable[gi] && !is_global_group(name) {
+                    let current = node["group"].as_str().unwrap_or("");
+                    if current.is_empty() || is_global_group(current) {
+                        node["selectable"] = json!(true);
+                        node["group"] = json!(name);
+                    }
                 }
                 continue;
             }
@@ -181,7 +195,9 @@ pub(crate) fn build_proxies(proxies: &serde_json::Map<String, Value>) -> Value {
                 "type": proxy_type(item),
                 "delay": proxy_delay(item),
                 "tested": proxy_tested(item),
-                "group": name,
+                // Empty lets the UI fall back to `groups[0]` (which may be
+                // GLOBAL for nodes that only live there).
+                "group": if group_selectable[gi] && !is_global_group(name) { name.clone() } else { String::new() },
                 "groups": [name],
                 "selectable": group_selectable[gi],
                 // A node that is itself a group (自动选择 inside 节点选择):
@@ -222,24 +238,35 @@ pub(crate) fn resolve_selector(
     }
     // Legacy or ambiguous callers may address an auto group (url-test /
     // fallback / load-balance). Manual selection still has a well-defined
-    // meaning: switch the first selector group that contains the node.
-    let mut candidates: Vec<String> = Vec::new();
+    // meaning: switch the first *routing* selector that contains the node.
+    // GLOBAL only applies when nothing else does (mode: global).
+    let mut preferred: Vec<String> = Vec::new();
+    let mut global: Option<String> = None;
     for (other, proxy) in proxies {
         let list = proxy.get("all").and_then(|v| v.as_array());
         let contains = list
             .map(|l| l.iter().any(|m| m.as_str() == Some(name)))
             .unwrap_or(false);
         if contains && is_selector(&proxy_type(proxy)) {
-            candidates.push(other.clone());
+            if is_global_group(other) {
+                if global.is_none() {
+                    global = Some(other.clone());
+                }
+            } else {
+                preferred.push(other.clone());
+            }
         }
     }
-    match candidates.len() {
-        0 => Err(format!(
-            "策略组「{}」由内核自动选择节点，且该节点不在任何手动策略组中，无法手动切换",
-            group
-        )),
-        _ => Ok((candidates.remove(0), true)),
+    if let Some(first) = preferred.into_iter().next() {
+        return Ok((first, true));
     }
+    if let Some(only_global) = global {
+        return Ok((only_global, true));
+    }
+    Err(format!(
+        "策略组「{}」由内核自动选择节点，且该节点不在任何手动策略组中，无法手动切换",
+        group
+    ))
 }
 
 /// days-from-civil for RFC3339 timestamps (inverse of Howard Hinnant's
@@ -384,6 +411,11 @@ fn groups_summary_from(data: &Value) -> Value {
     let mut timeout = 0usize;
     if let Some(proxies) = proxies {
         for (name, proxy) in proxies {
+            // GLOBAL duplicates every proxy/group and is not a routing group
+            // outside mode:global; keep it out of the dashboard summary.
+            if is_global_group(name) {
+                continue;
+            }
             let all = proxy.get("all").and_then(|v| v.as_array()).unwrap_or(&empty);
             if all.is_empty() {
                 continue;
@@ -1794,6 +1826,47 @@ mod proxy_tests {
         let payload = build_proxies(&map);
         assert_eq!(payload["nodes"][0]["selectable"], false);
         assert_eq!(payload["nodes"][0]["tested"], false);
+    }
+
+    #[test]
+    fn global_is_never_the_primary_target() {
+        // Controller order puts GLOBAL first, exactly like mihomo does. The
+        // node's primary group used to become GLOBAL, so manual clicks in the
+        // "全部" view switched a group that rule mode never reads.
+        let map = json!({
+            "GLOBAL": {"type": "Selector", "now": "香港 01", "all": ["自动选择", "香港 01", "日本 02"]},
+            "自动选择": {"type": "URLTest", "now": "香港 01", "all": ["香港 01", "日本 02"]},
+            "节点选择": {"type": "Selector", "now": "自动选择", "all": ["自动选择", "香港 01", "日本 02"]},
+            "香港 01": {"type": "Vmess", "history": [{"delay": 40}]},
+            "日本 02": {"type": "Trojan", "history": [{"delay": 50}]}
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        let payload = build_proxies(&map);
+        let nodes = payload["nodes"].as_array().unwrap();
+        let hk = nodes.iter().find(|n| n["name"] == "香港 01").unwrap();
+        assert_eq!(
+            hk["group"], "节点选择",
+            "GLOBAL must not win the primary-group election"
+        );
+        assert_eq!(hk["groups"].as_array().unwrap().len(), 3);
+
+        // Resolving an auto group prefers the routing selector over GLOBAL.
+        assert_eq!(
+            resolve_selector(&map, "自动选择", "日本 02").unwrap(),
+            ("节点选择".to_string(), true)
+        );
+        // Explicitly addressing GLOBAL still works (mode: global).
+        assert_eq!(
+            resolve_selector(&map, "GLOBAL", "日本 02").unwrap(),
+            ("GLOBAL".to_string(), false)
+        );
+
+        // The dashboard summary drops the synthetic group.
+        let summary = groups_summary_from(&json!({"proxies": map}));
+        assert_eq!(summary["count"], 2);
     }
 
     #[tokio::test]
