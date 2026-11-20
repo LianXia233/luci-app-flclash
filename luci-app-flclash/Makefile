@@ -77,6 +77,7 @@ define Package/luci-app-flclash/install
 	$(INSTALL_DIR) $(1)/usr/libexec/flclash
 	$(INSTALL_BIN) ./files/usr/libexec/flclash/core-update.sh $(1)/usr/libexec/flclash/core-update.sh
 	$(INSTALL_BIN) ./files/usr/libexec/flclash/proxy-rules.sh $(1)/usr/libexec/flclash/proxy-rules.sh
+	$(INSTALL_BIN) ./files/usr/libexec/flclash/stop-all.sh $(1)/usr/libexec/flclash/stop-all.sh
 	$(INSTALL_BIN) ./files/usr/libexec/flclash/singbox-convert.sh $(1)/usr/libexec/flclash/singbox-convert.sh
 
 	# --- LuCI entry + rpcd object --------------------------------------------

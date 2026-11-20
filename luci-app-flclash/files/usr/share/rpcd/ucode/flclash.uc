@@ -154,7 +154,20 @@ const methods = {
 			if (action != 'start' && action != 'stop' && action != 'restart')
 				return { code: 1, error: '未知操作' };
 
-			const rc = system('/etc/init.d/flclash-api ' + action);
+			let rc;
+			if (action == 'stop') {
+				/* Stop the whole stack: backend (WebUI/API) + proxy core +
+				 * transparent proxy, and clear every proxy artifact. stop-all.sh
+				 * is idempotent and guards against re-entrancy. */
+				rc = system('/usr/libexec/flclash/stop-all.sh >/dev/null 2>&1');
+			} else {
+				/* start/restart: bring up the core first so the API can reach
+				 * its controller, then the backend. Transparent proxy follows
+				 * its own UCI wish and is NOT force-enabled here. */
+				if (action == 'start')
+					system('/etc/init.d/flclash-core start >/dev/null 2>&1');
+				rc = system('/etc/init.d/flclash-api ' + action);
+			}
 			/* Give procd a moment so the caller reads the fresh state. */
 			system('sleep 1');
 			const state = core_state();
