@@ -141,8 +141,15 @@ pub async fn ws_handler(
     let pre_auth = match &st.secret {
         None => true,
         Some(secret) => {
-            header_secret(&headers).as_deref() == Some(secret.as_str())
-                || query.get("secret").map(|v| v.as_str()) == Some(secret.as_str())
+            let provided = header_secret(&headers);
+            let query_secret = query.get("secret");
+            provided
+                .as_deref()
+                .map(|v| crate::secret_eq(v.as_bytes(), secret.as_bytes()))
+                == Some(true)
+                || query_secret
+                    .map(|v| crate::secret_eq(v.as_bytes(), secret.as_bytes()))
+                    == Some(true)
         }
     };
     ws.max_message_size(MAX_CLIENT_MESSAGE)
@@ -266,7 +273,9 @@ pub async fn serve(socket: WebSocket, st: Arc<AppState>, pre_auth: bool) {
                 let provided = msg.get("secret").and_then(|v| v.as_str()).unwrap_or("");
                 match &st.secret {
                     None => authed = true,
-                    Some(secret) if provided == secret => authed = true,
+                    Some(secret) if crate::secret_eq(provided.as_bytes(), secret.as_bytes()) => {
+                        authed = true
+                    }
                     Some(_) => {
                         close(&mut sink, 4401, "unauthorized").await;
                         return;
@@ -449,8 +458,16 @@ pub async fn serve(socket: WebSocket, st: Arc<AppState>, pre_auth: bool) {
                         if !conn.subs.contains(event.topic.as_str()) { continue; }
                         // Per-topic gap detection: a lost frame means the
                         // client's incremental view is unusable → snapshot.
-                        let expected = conn.last_topic_seq.get(&event.topic).copied().unwrap_or(0) + 1;
-                        let gap = event.topic_seq != expected;
+                        //
+                        // An *unknown* topic is seeded, never treated as a gap.
+                        // After connect (or any resync) the bus topic counter is
+                        // already at an arbitrary value; assuming it starts at 1
+                        // made every first event look like a gap, so each event
+                        // triggered a full snapshot — a permanent resync storm
+                        // per client (each snapshot re-probes the controller).
+                        let previous = conn.last_topic_seq.get(&event.topic).copied();
+                        let expected = previous.map(|value| value.saturating_add(1));
+                        let gap = matches!(expected, Some(next) if event.topic_seq != next);
                         conn.last_topic_seq.insert(event.topic.clone(), event.topic_seq);
                         if gap {
                             let notice = Envelope::local("resync", "system", json!({

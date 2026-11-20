@@ -25,6 +25,25 @@ fail() {
 	exit 1
 }
 
+# Only one updater at a time: two concurrent runs would race on the same
+# /tmp paths and on the binary rename. mkdir is atomic on every OpenWrt FS.
+LOCK=/tmp/flclash-core-update.lock
+if ! mkdir "$LOCK" 2>/dev/null; then
+	oldpid=$(cat "$LOCK/pid" 2>/dev/null)
+	if [ -n "$oldpid" ] && kill -0 "$oldpid" 2>/dev/null; then
+		# Do NOT touch the state file: the running update owns it.
+		echo "[update] another update is already running (pid $oldpid)"
+		exit 3
+	fi
+	rm -rf "$LOCK"
+	mkdir "$LOCK" 2>/dev/null || {
+		echo "[update] cannot acquire update lock"
+		exit 3
+	}
+fi
+echo $$ > "$LOCK/pid"
+trap 'rm -rf "$LOCK"' EXIT INT TERM
+
 # Map kernel arch to the asset tokens used by mihomo / sing-box releases.
 case "$(uname -m)" in
 	x86_64|amd64)   MIHOMO_ARCH=amd64;  SB_ARCH=amd64;  SB_LIB=musl ;;
@@ -91,21 +110,77 @@ NEWVER=$("$TMP" -v 2>/dev/null | head -n1)
 [ -n "$NEWVER" ] || fail "new binary does not execute"
 echo "[update] new core: $NEWVER"
 
-echo "[update] installing…"
-[ -x "$INIT" ] && "$INIT" stop >/dev/null 2>&1
-sleep 3
-[ -f "$DEST" ] && cp -a "$DEST" "${DEST}.old-$(date +%s)"
-mv "$TMP" "$DEST"
-[ -x "$INIT" ] && "$INIT" start >/dev/null 2>&1
-sleep 3
+# --- integrity -------------------------------------------------------------
+# GitHub releases usually publish "<asset>.sha256". Verify when present; when
+# absent, say so explicitly instead of silently trusting the transport. The
+# previous code executed whatever arrived and replaced /usr/bin with it.
+if command -v sha256sum >/dev/null 2>&1; then
+	if curl -fsSL -m 30 -o /tmp/flclash-core.sha256 "${ASSET_URL}.sha256" 2>/dev/null \
+		&& [ -s /tmp/flclash-core.sha256 ]; then
+		WANT=$(awk '{print $1}' /tmp/flclash-core.sha256 | head -n1)
+		GOT=$(sha256sum /tmp/flclash-core-new.bin | awk '{print $1}')
+		[ -n "$WANT" ] && [ "$WANT" = "$GOT" ] || fail "sha256 mismatch (expected $WANT, got $GOT)"
+		echo "[update] sha256 verified"
+	else
+		echo "[update] WARNING: no .sha256 asset found; integrity relies on HTTPS"
+	fi
+else
+	echo "[update] WARNING: sha256sum unavailable; integrity relies on HTTPS"
+fi
 
-# Keep UCI in sync: online mihomo is the standalone CLI (core_mode=cli); the
-# prebuilt FlClash IPC core uses core_mode=ipc. sing-box selects its own core.
+# --- install with rollback -------------------------------------------------
+# core_type must be persisted BEFORE the restart, otherwise `init.d start`
+# still launches the previous core and the freshly downloaded one is ignored.
+OLD_CORE=$(uci -q get flclash.main.core_type 2>/dev/null)
+OLD_MODE=$(uci -q get flclash.main.core_mode 2>/dev/null)
 uci -q set flclash.main.core_type="$CORE" 2>/dev/null
 if [ "$CORE" = "mihomo" ]; then
 	uci -q set flclash.main.core_mode="cli" 2>/dev/null
 fi
 uci -q commit flclash 2>/dev/null
+
+core_ready() {
+	local port
+	port=$(uci -q get flclash.main.external_controller 2>/dev/null)
+	port=${port##*:}
+	[ -n "$port" ] || port=9097
+	netstat -lnt 2>/dev/null | grep -q ":$port "
+}
+
+wait_core_ready() {
+	local i=0
+	while [ $i -lt 10 ]; do
+		core_ready && return 0
+		sleep 1
+		i=$((i+1))
+	done
+	return 1
+}
+
+echo "[update] installing…"
+[ -x "$INIT" ] && "$INIT" stop >/dev/null 2>&1
+sleep 3
+BACKUP=""
+[ -f "$DEST" ] && {
+	BACKUP="${DEST}.old-$(date +%s)"
+	cp -a "$DEST" "$BACKUP"
+}
+mv "$TMP" "$DEST" || fail "cannot replace $DEST"
+[ -x "$INIT" ] && "$INIT" start >/dev/null 2>&1
+
+if ! wait_core_ready; then
+	echo "[update] new core did not become reachable; rolling back"
+	if [ -n "$BACKUP" ]; then
+		"$INIT" stop >/dev/null 2>&1
+		sleep 1
+		cp -a "$BACKUP" "$DEST"
+		[ -n "$OLD_CORE" ] && uci -q set flclash.main.core_type="$OLD_CORE" 2>/dev/null
+		[ -n "$OLD_MODE" ] && uci -q set flclash.main.core_mode="$OLD_MODE" 2>/dev/null
+		uci -q commit flclash 2>/dev/null
+		"$INIT" start >/dev/null 2>&1
+	fi
+	fail "new core failed to start"
+fi
 
 FINAL=$("$DEST" -v 2>/dev/null | head -n1)
 [ -n "$FINAL" ] || FINAL=$("$DEST" version 2>/dev/null | head -n1)

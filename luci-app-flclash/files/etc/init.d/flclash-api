@@ -18,6 +18,17 @@ start_service() {
 	config_get data api data_dir '/etc/flclash'
 	config_get secret api secret ''
 
+	# The API can rewrite configs, install cores, restore backups and drive the
+	# firewall. A LAN-reachable listener with an empty secret is therefore an
+	# unauthenticated root console; at least make the exposure visible.
+	case "$listen" in
+		127.0.0.1:*|localhost:*|\[::1\]:*) ;;
+		*)
+			[ -n "$secret" ] || logger -t flclash-api \
+				"WARNING: $listen is reachable from the LAN without flclash.api.secret (unauthenticated control of the proxy)"
+			;;
+	esac
+
 	[ -x /usr/bin/flclash-api ] || {
 		logger -t flclash-api "bridge binary missing: /usr/bin/flclash-api"
 		return 1

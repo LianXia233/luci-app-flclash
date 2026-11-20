@@ -117,7 +117,7 @@ apk add --allow-untrusted ./luci-app-flclash_*.apk
 
 接管生效时 `allow-lan` 被强制为 `true`（REDIRECT 的目的地址是接口地址而非回环，绑死 `127.0.0.1` 会让 LAN 劫持连接全部被拒——这是「本机能代理、下挂设备不通」的根因）。作为补偿，`fw4 input` 会插入 **FlClash WAN Proxy Guard**：非 LAN 接口访问 `7893/7894` 直接 reject，避免在 WAN 侧变成开放代理。
 
-`9098` 默认对 LAN 开放。若 LAN 不完全可信，请在 UCI 中设置 `flclash.api.secret`，并为 WebUI 配置对应的请求头（见 [API 总览](#api-总览)）。
+`9098` 默认对 LAN 开放，但**首次安装会自动生成 `flclash.api.secret`**（仅当监听地址不是回环）。LuCI 的「一键进入 WebUI」会把密钥带进跳转链接，WebUI 收到后存入 `sessionStorage` 并从地址栏抹掉；直接访问 `9098` 时会弹窗要求输入密钥（可用 `uci get flclash.api.secret` 查看）。若确实不需要鉴权（例如只监听 `127.0.0.1`），清空该值即可。
 
 ## 透明代理状态机
 
@@ -136,7 +136,7 @@ sync() ─────┼─ config.tun.enable=true 且 TUN 在线 ──► TUN
 | **TUN 模式** | WebUI「虚拟网卡」开关写入 `tun:` 块并**完整重启内核**（IPC 内核热重载不会创建 TUN 设备）；接管期间撤下 REDIRECT 表与 DNS 手工接管，由内核 `Meta` 设备 + 策略路由接管 LAN，本机流量仍由 OUTPUT 链送入内核；`route-exclude-address` 固定排除全部管理/内网网段 |
 | **本机接管** | nft `output` 链把本机非私网 TCP REDIRECT 到 `7893`，路由器自身请求同样经内核分流；环路防护依赖 `routing-mark: 333`（内核 socket 携带 `0x14d` mark 首条规则放行） |
 | **残留清理** | 内核被 SIGKILL / 异常退出会在 ip rules 9000-9010、table 2022、nft `inet mihomo` 留下指向死端口的残留规则，把 LAN 打进黑洞——`start_service` 与 `sync` 都会清除 |
-| **硬件卸载** | `flow_offloading` / `flow_offloading_hw` 被强制关闭，`bridger` 被停用并禁自启：硬件快路径的流绕过 netfilter，会让 REDIRECT 对 LAN TCP 失效（UDP 走 mangle 链幸存，更具迷惑性）；仅在此刻一次性 `conntrack -F` |
+| **硬件卸载** | `flow_offloading` / `flow_offloading_hw` 被强制关闭，`bridger` 被停用并禁自启：硬件快路径的流绕过 netfilter，会让 REDIRECT 对 LAN TCP 失效（UDP 走 mangle 链幸存，更具迷惑性）；仅在此刻一次性 `conntrack -F`。停止接管时按接管前记录还原 |
 | **DNS 过滤** | 客户端 53 端口被直接劫持到内核 `1053`，不经过 dnsmasq，所以 dnsmasq 层 `filter_aaaa` 是无效摆设——改为在源头设 `dns.ipv6: false`（`flclash.proxy.filter_aaaa=1` 默认），双栈客户端回退 v4 进入接管路径 |
 | **缩进自适应** | `prepare_config` 对 `config.yaml` 的所有插入（`listen` / `routing-mark` / `dns.ipv6` / TUN `route-exclude-address`）按 dns 块自身的缩进对齐——混合缩进会让 YAML 解析失败、核心无限 respawn |
 | **出站模式** | `mode: rule / global / direct` 经 controller 运行时生效并持久化；sing-box 无运行时切换，由转换器按模式生成静态路由 |
@@ -177,8 +177,8 @@ sync() ─────┼─ config.tun.enable=true 且 TUN 在线 ──► TUN
 | `api` | `listen` | `0.0.0.0:9098` | API / WebUI 监听地址 |
 | `api` | `ui_dir` | `/www/flclash` | 静态资源目录 |
 | `api` | `data_dir` | `/etc/flclash` | 订阅与配置数据目录 |
-| `api` | `secret` | 空 | 非空时启用请求鉴权 |
-| `proxy` | `enabled` | `1` | 局域网接管期望值（重启保留） |
+| `api` | `secret` | 首次安装自动生成 | 非空时启用请求鉴权（LAN 监听下由 uci-defaults / postinst 生成） |
+| `proxy` | `enabled` | `0` | 局域网接管期望值（重启保留） |
 | `proxy` | `backend` | 自动 | `nftables` / `iptables`（自动检测） |
 | `proxy` | `lan_if` | 自动 | 接管接口（默认 ubus 检测 LAN 设备） |
 | `proxy` | `filter_aaaa` | `1` | 接管时过滤 AAAA（源头上设 `dns.ipv6: false`） |
@@ -186,7 +186,7 @@ sync() ─────┼─ config.tun.enable=true 且 TUN 在线 ──► TUN
 | `proxy` | `acl_ip` / `acl_mac` | 空 | 名单项，可重复（IP / CIDR / MAC，单类上限 256 条） |
 | `proxy` | `bypass_cidr` / `bypass_port` | 空 | 不接管的目标网段 / 目的端口 |
 | `proxy` | `local_takeover` | `1` | 路由器自身出站是否也送入内核 |
-| `proxy` | `saved_*` / `dns_filter_managed` | 空 | dns_off 恢复 dnsmasq 原状用 |
+| `proxy` | `saved_*` / `dns_filter_managed` / `offload_saved` / `bridger_saved` | 空 | 停止接管时恢复 dnsmasq / 硬件卸载 / bridger 原状用 |
 | `webui` | `enabled` | `1` | WebUI 开关 |
 | `webui` | `webui_path` | `/flclash/` | WebUI 路径 |
 | `webui` | `webui_port` | `9098` | WebUI 端口（与 `api.listen` 一致） |
@@ -195,7 +195,7 @@ sync() ─────┼─ config.tun.enable=true 且 TUN 在线 ──► TUN
 
 ## API 总览
 
-所有接口以 `/flclash/api` 为前缀。若设置 `api.secret`，请求需携带 `X-FlClash-Secret: <secret>` 或 `Authorization: Bearer <secret>`（WebSocket 用首帧 `auth` 消息）。
+所有接口以 `/flclash/api` 为前缀。若设置 `api.secret`，请求需携带 `X-FlClash-Secret: <secret>` 或 `Authorization: Bearer <secret>`（WebSocket 用首帧 `auth` 消息）。唯一例外是 `GET /flclash/api/version`（只返回内核版本字符串，LuCI 用 busybox wget 读取），不参与鉴权。
 
 REST 只负责**控制与查询**；实时数据由 `GET /ws` 推送。两者读取同一份构造器（`status_payload` / `build_proxies`），不会出现数值分叉。
 
@@ -341,7 +341,7 @@ export AR_x86_64_unknown_linux_musl=ar
 cargo build --release --target x86_64-unknown-linux-musl --bins
 ```
 
-产物为静态 ELF；`flclash-api` 约 2.4 MiB（内置 rustls/webpki-roots TLS，不再依赖系统 curl）。`flclash-api/.cargo/config.toml` 固定 `rust-lld` 与 `link-self-contained`。
+产物为静态 ELF；`flclash-api` 约 2.4 MiB（内置 rustls/webpki-roots TLS：订阅下载、IP 查询等 HTTPS 出站不依赖系统 curl/CA；仅实时流量与日志两条长连接流用 `curl -N`，已作为运行时依赖声明）。`flclash-api/.cargo/config.toml` 固定 `rust-lld` 与 `link-self-contained`。
 
 ### Go 内核
 
@@ -408,14 +408,14 @@ luci-app-flclash_<ver>-r<rel>_<arch>_immortalwrt-snapshot.apk
 
 - **固件**：ImmortalWrt **25.12.2** 与 **snapshot**，两者各自产出独立单包；同为 apk 包格式。
 - **架构**：`aarch64_cortex-a53`（ARM64-A53）与 `x86_64`（通用 `GOAMD64=v1`）。其他架构需自行用脚本编译，发布矩阵暂不覆盖。
-- **静态二进制**：`mihomo`、`flclash-api`、`flclash-core-bridge` 均为静态 ELF，无 glibc / musl 运行时依赖，无 `INTERP`。`flclash-api` 内置 rustls + webpki-roots，HTTPS 出站不依赖系统 CA 或 curl。
+- **静态二进制**：`mihomo`、`flclash-api`、`flclash-core-bridge` 均为静态 ELF，无 glibc / musl 运行时依赖，无 `INTERP`。`flclash-api` 内置 rustls + webpki-roots，HTTPS 出站不依赖系统 CA；实时流量/日志流仍使用 `curl -N`（apk 已声明 `+curl` 依赖）。
 - **内核依赖**：透明代理需要设备内核具备 `TUN` 与 `nftables`（ImmortalWrt 默认镜像已带 `firewall4` / `nftables`）。这些 `kmod-*` 未在 25.12 的 apk 源发布，因此**不写入硬依赖**，避免 `apk add` 解依赖失败。
-- **硬件卸载**：接管期间 `flow_offloading` / `flow_offloading_hw` / `bridger` 会被自动关闭并禁自启（快路径流绕过 netfilter，REDIRECT 对 LAN TCP 失效）。关闭接管后如需恢复，请手动开启。
+- **硬件卸载**：接管期间 `flow_offloading` / `flow_offloading_hw` / `bridger` 会被自动关闭并禁自启（快路径流绕过 netfilter，REDIRECT 对 LAN TCP 失效）。关闭接管时三者都会还原：offloading 恢复为接管前的值（`flclash.proxy.saved_*`），`bridger` 仅在接管前本就启用时才重新启用（`flclash.proxy.bridger_saved`）。
 - **sing-box 不随包内置**：单包只带 mihomo。sing-box 通过 LuCI / WebUI 的「更新内核」在线安装到 `/usr/bin/sing-box`，再由 `core_type=sing-box` 启用。
-- **在线更新依赖网络**：内核更新从 GitHub Releases 下载，设备需能访问 `api.github.com` 与 release 资源；受限网络下可手动放置二进制。
+- **在线更新依赖网络**：内核更新从 GitHub Releases 下载，设备需能访问 `api.github.com` 与 release 资源；受限网络下可手动放置二进制。更新前会校验 `<asset>.sha256`（上游未发布时在日志中明确告警），替换前备份 `/usr/bin/<core>.old-*`，新内核 10 秒内未监听控制器会自动回滚。
 - **安装签名**：构建 SDK 的 apk 签名不在设备默认信任库，需 `--allow-untrusted`。
 - **升级**：旧版三包与单包写入相同路径，升级前先 `apk del` 旧三包。
-- **安全**：`9098` 默认监听 `0.0.0.0`。在不可信 LAN 中请设置 `flclash.api.secret`，或改为仅监听回环并自行做反代。代理端口 `7893/7894` 在非 LAN 接口被 reject（WAN Proxy Guard）。
+- **安全**：`9098` 默认监听 `0.0.0.0`，首次安装会生成 `flclash.api.secret`（回环监听时不生成）。LuCI 跳转链接自带密钥，直接访问时 WebUI 会提示输入；`uci get flclash.api.secret` 可查看。代理端口 `7893/7894` 在非 LAN 接口被 reject（WAN Proxy Guard）。
 
 ## 验证
 
@@ -450,19 +450,21 @@ nft list tables | grep mihomo               # TUN 模式下存在属正常
 netstat -lntup | grep -E ':1053|:7893|:7894|:9097'
 
 # 5. LAN 客户端默认网关指向本机，访问外网应出现在连接列表
-wget -q -O - http://<设备IP>:9098/flclash/api/connections
+KEY="$(uci get flclash.api.secret)"          # 默认已自动生成；清空则无需请求头
+wget -q -O - --header "X-FlClash-Secret: $KEY" http://<设备IP>:9098/flclash/api/connections
 ```
 
 验证启停状态感知与双栈显示：
 
 ```sh
 # 核心停止：出口应变为本机直连 WAN IP（20 秒内）
-curl -s -X POST http://127.0.0.1:9098/flclash/api/service/stop
-wget -q -O - http://127.0.0.1:9098/flclash/api/status | grep -oE '"outboundIp[^,]*'
+KEY="$(uci get flclash.api.secret)"
+curl -s -H "X-FlClash-Secret: $KEY" -X POST http://127.0.0.1:9098/flclash/api/service/stop
+wget -q -O - --header "X-FlClash-Secret: $KEY" http://127.0.0.1:9098/flclash/api/status | grep -oE '"outboundIp[^,]*'
 
 # 核心启动：接管自动回位（state=on），出口显示代理节点 IP（+ 节点有 v6 时附带 IPv6）
-curl -s -X POST http://127.0.0.1:9098/flclash/api/service/start
-wget -q -O - http://127.0.0.1:9098/flclash/api/status | grep -oE '"outboundIp[^,]*'
+curl -s -H "X-FlClash-Secret: $KEY" -X POST http://127.0.0.1:9098/flclash/api/service/start
+wget -q -O - --header "X-FlClash-Secret: $KEY" http://127.0.0.1:9098/flclash/api/status | grep -oE '"outboundIp[^,]*'
 ```
 
 管理面（SSH / LuCI）走私网地址，不在劫持范围内，应始终可用；接管期间公网来源的回包由 `ct direction reply` / `ct original daddr private` 规则豁免。

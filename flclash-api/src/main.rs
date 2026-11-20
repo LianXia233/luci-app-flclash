@@ -51,17 +51,31 @@ use state::AppState;
 /// Accepts both `-flag value` and `-flag=value` (and `--flag`), matching the
 /// flag style the Go bridge accepted from /etc/init.d/flclash-api.
 fn flag_value(args: &[String], name: &str, default: &str) -> String {
+    let long = format!("-{}", name); // "-listen" -> "--listen"
     for (i, arg) in args.iter().enumerate() {
-        if arg == name {
+        if arg == name || arg == &long {
             return args.get(i + 1).cloned().unwrap_or_else(|| default.to_string());
         }
-        for prefix in [format!("{}=", name), format!("-{}", name)] {
+        for prefix in [format!("{}=", name), format!("{}=", long)] {
             if let Some(rest) = arg.strip_prefix(&prefix) {
                 return rest.to_string();
             }
         }
     }
     default.to_string()
+}
+
+/// Length-independent comparison for the shared secret: `==` short-circuits on
+/// the first differing byte and leaks prefix length over the network.
+pub(crate) fn secret_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 async fn auth(
@@ -81,7 +95,11 @@ async fn auth(
                     .and_then(|v| v.to_str().ok())
                     .map(|s| s.trim_start_matches("Bearer ").trim().to_string())
             });
-        if got.as_deref() != Some(secret.as_str()) {
+        if got
+            .as_deref()
+            .map(|value| secret_eq(value.as_bytes(), secret.as_bytes()))
+            != Some(true)
+        {
             return (StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"})))
                 .into_response();
         }
@@ -136,7 +154,6 @@ async fn main() {
     tokio::spawn(loops::sample_status(st.clone()));
     tokio::spawn(loops::sample_traffic(st.clone()));
     tokio::spawn(loops::sample_logs(st.clone()));
-    tokio::spawn(loops::sample_totals(st.clone()));
     tokio::spawn(loops::sample_proxies(st.clone()));
     tokio::spawn(loops::sample_connections(st.clone()));
     tokio::spawn(loops::sync_proxy(st.clone()));
@@ -145,7 +162,6 @@ async fn main() {
 
     let protected = Router::new()
         .route("/status", get(api::status))
-        .route("/version", get(api::version))
         .route("/memory", get(api::memory))
         .route("/rules", get(api::rules))
         .route("/providers/proxies", get(api::providers))
@@ -203,8 +219,13 @@ async fn main() {
     // header) together with an Origin check.
     let realtime = Router::new().route("/ws", get(ws::ws_handler));
 
+    // Public metadata: the LuCI page reads the core version with busybox wget
+    // (no header support for a quoting-safe secret), and a version string is
+    // not sensitive. Everything else stays behind the secret.
+    let public = Router::new().route("/version", get(api::version));
+
     let app: Router<()> = Router::new()
-        .nest("/flclash/api", protected.merge(realtime))
+        .nest("/flclash/api", public.merge(protected).merge(realtime))
         .route("/", get(api::static_index))
         .route("/flclash", get(api::static_index))
         .route("/flclash/", get(api::static_root))

@@ -135,14 +135,39 @@ pub fn update_start(core: &str) -> Result<Value, String> {
     if state.trim() == "running" {
         return Err("已有更新正在进行".into());
     }
-    std::process::Command::new("/bin/sh")
+    // The shell updater owns done/failed, but somebody has to publish "running"
+    // for the WebUI path (the LuCI path does it in ucode). Without this the
+    // status endpoint reported "idle" for the whole download.
+    let _ = std::fs::write(UPDATE_STATE, "running\n");
+    let _ = std::fs::write(UPDATE_LOG, "");
+    let spawned = std::process::Command::new("/bin/sh")
         .arg(UPDATE_SCRIPT)
         .arg(core)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|e| format!("启动更新失败: {e}"))?;
-    Ok(json!({"ok": true, "core": core}))
+        .spawn();
+    match spawned {
+        Ok(_) => Ok(json!({"ok": true, "core": core})),
+        Err(e) => {
+            let _ = std::fs::write(UPDATE_STATE, "failed\n");
+            Err(format!("启动更新失败: {e}"))
+        }
+    }
+}
+
+/// Last `max` bytes of `text`, moved forward to a UTF-8 boundary.
+/// `&text[text.len() - n..]` panics when the cut lands inside a multi-byte
+/// character — and the updater log is full of Chinese lines. With
+/// `panic = "abort"` that panic takes the whole API process down.
+fn tail(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_string();
+    }
+    let mut start = text.len() - max;
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    text[start..].to_string()
 }
 
 pub fn update_status() -> Value {
@@ -153,7 +178,7 @@ pub fn update_status() -> Value {
         .unwrap_or_else(|| "idle".into());
     let log = std::fs::read_to_string(UPDATE_LOG).unwrap_or_default();
     // Tail only: the log can grow across retries; the UI shows a live window.
-    let tail: String = if log.len() > 4000 { log[log.len() - 4000..].to_string() } else { log };
+    let tail = tail(&log, 4000);
     let core = active();
     json!({
         "state": state,
@@ -187,5 +212,16 @@ mod tests {
         let value = update_status();
         assert!(value.get("state").is_some());
         assert!(value.get("core_type").is_some());
+    }
+
+    #[test]
+    fn tail_never_splits_a_utf8_character() {
+        // Updater logs are Chinese; cutting mid-character used to panic and,
+        // with panic=abort, killed the whole API process.
+        let text = "更".repeat(2000); // 6000 bytes
+        let out = tail(&text, 4001);
+        assert!(out.len() <= 4001);
+        assert!(out.chars().all(|c| c == '更'));
+        assert_eq!(tail("short", 4000), "short");
     }
 }

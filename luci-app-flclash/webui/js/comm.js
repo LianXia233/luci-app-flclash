@@ -243,6 +243,28 @@ window.FlClashComm = (function () {
     emit('meta');
   }
 
+  /* The socket cannot set headers during upgrade, so auth is in-band. When the
+   * backend requires (or rejects) a secret, ask once and retry — cancelling
+   * permanently falls back to REST polling. */
+  let authAsking = false;
+  function requestAuth(reason) {
+    if (authAsking || !window.FlClashAuth) return;
+    authAsking = true;
+    window.FlClashAuth.ask(reason).then(function (ok) {
+      authAsking = false;
+      if (!ok) {
+        closedByAuth = true;
+        meta.lastError = '实时通道需要 API 密钥';
+        setTransport('rest');
+        return;
+      }
+      closedByAuth = false;
+      attempts = 0;
+      teardownSocket();
+      connect();
+    }, function () { authAsking = false; });
+  }
+
   function scheduleReconnect() {
     if (closedByAuth || cfg.mock) return;
     attempts += 1;
@@ -310,10 +332,15 @@ window.FlClashComm = (function () {
       meta.connected = false;
       meta.connecting = false;
       if (event && event.code === 4401) {
-        closedByAuth = true;
-        meta.lastError = 'WebSocket 认证失败';
+        meta.connected = false;
+        meta.connecting = false;
         setTransport('rest');
-        if (window.FlClashUI) window.FlClashUI.toast('实时通道认证失败，已回退到轮询', 'error');
+        if (!closedByAuth) {
+          requestAuth('实时通道要求 API 密钥，请输入后继续。');
+        } else {
+          meta.lastError = 'WebSocket 认证失败';
+          if (window.FlClashUI) window.FlClashUI.toast('实时通道认证失败，已回退到轮询', 'error');
+        }
         return;
       }
       if (event && (event.code === 4400 || event.code === 4029)) {
@@ -382,12 +409,7 @@ window.FlClashComm = (function () {
     }
     if (type === 'auth.required') {
       if (cfg.secret) send({ type: 'auth', secret: cfg.secret });
-      else {
-        closedByAuth = true;
-        teardownSocket();
-        setTransport('rest');
-        if (window.FlClashUI) window.FlClashUI.toast('后端要求 API 密钥', 'error');
-      }
+      else requestAuth('后端要求 API 密钥，请输入后继续。');
       return;
     }
     if (type === 'ping') {

@@ -188,26 +188,50 @@ fn http_client() -> &'static reqwest::Client {
     })
 }
 
+/// Hard cap for a downloaded body (subscriptions, outbound lookup). Without it
+/// a hostile or broken URL could make the API allocate until the router OOMs.
+pub const MAX_FETCH_BYTES: usize = 8 << 20;
+
 /// Fetches a URL natively (TLS via rustls/webpki-roots) and returns
 /// (headers, body). Never fails on non-2xx: callers inspect the payload
 /// themselves (the profile converter looks at content-type headers).
 pub async fn curl_fetch(url: &str, timeout_secs: u64) -> Result<(Vec<String>, Vec<u8>), String> {
+    use futures_util::StreamExt;
+
     let resp = http_client()
         .get(url)
         .timeout(Duration::from_secs(timeout_secs))
         .send()
         .await
         .map_err(|e| format!("fetch {}: {}", url, e))?;
+    if let Some(length) = resp.content_length() {
+        if length as usize > MAX_FETCH_BYTES {
+            return Err(format!(
+                "fetch {}: response too large ({} bytes)",
+                url, length
+            ));
+        }
+    }
     let headers: Vec<String> = resp
         .headers()
         .iter()
         .map(|(k, v)| format!("{}: {}", k.as_str(), v.to_str().unwrap_or("<binary>")))
         .collect();
-    let body = resp
-        .bytes()
-        .await
-        .map_err(|e| format!("body {}: {}", url, e))?
-        .to_vec();
+    // Stream instead of `resp.bytes()`: a chunked response has no
+    // content-length, so the cap must be enforced while reading.
+    let mut body = Vec::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("body {}: {}", url, e))?;
+        if body.len() + chunk.len() > MAX_FETCH_BYTES {
+            return Err(format!(
+                "fetch {}: response exceeds {} MiB",
+                url,
+                MAX_FETCH_BYTES >> 20
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
     Ok((headers, body))
 }
 

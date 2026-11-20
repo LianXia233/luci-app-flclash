@@ -10,7 +10,11 @@
 
 NFT=/usr/sbin/nft
 DNSCONF=/tmp/dnsmasq.d/flclash-dns.conf
-CFG=${CFG:-/etc/flclash/config.yaml}
+# The WebUI stores the config path in UCI; honour it instead of assuming the
+# default (a user pointing config_file elsewhere used to get a state machine
+# that parsed and rewrote the wrong file).
+[ -n "${CFG:-}" ] || CFG=$(uci -q get flclash.main.config_file 2>/dev/null)
+[ -n "${CFG:-}" ] || CFG=/etc/flclash/config.yaml
 TABLE=flclash
 CORE_TABLE=mihomo
 LAN_IF=${LAN_IF:-}
@@ -101,14 +105,34 @@ core_type() {
 }
 
 core_alive() {
-	local port
-	port=$(uci -q get flclash.main.external_controller 2>/dev/null | sed 's/.*://')
-	[ -n "$port" ] || port=9097
-	netstat -lnt 2>/dev/null | grep -q "127.0.0.1:$port "
+	local addr host port
+	addr=$(uci -q get flclash.main.external_controller 2>/dev/null)
+	[ -n "$addr" ] || addr=127.0.0.1:9097
+	# Strip the port from the right so IPv6 literals ([::1]:9097) survive;
+	# `sed 's/.*://'` swallowed the address itself.
+	port=${addr##*:}
+	host=${addr%:*}
+	case "$host" in
+		''|0.0.0.0|'::'|'[::]') host=127.0.0.1 ;;
+	esac
+	netstat -lnt 2>/dev/null | grep -q "127.0.0.1:$port " && return 0
+	# A wildcard bind (allow-lan / 0.0.0.0) only shows up as 0.0.0.0:<port>.
+	netstat -lnt 2>/dev/null | grep -q "0.0.0.0:$port " && return 0
+	[ "$host" = 127.0.0.1 ] && return 1
+	netstat -lnt 2>/dev/null | grep -q "$host:$port "
 }
 
 core_proc() {
-	ps w 2>/dev/null | grep -v grep | grep -qE "mihomo|sing-box"
+	# Ask /proc directly: `ps | grep mihomo` also matched unrelated instances
+	# and awk pipelines, which kept sync() from cleaning up stale rules.
+	local comm
+	for comm in /proc/[0-9]*/comm; do
+		[ -r "$comm" ] || continue
+		case "$(cat "$comm" 2>/dev/null)" in
+			mihomo|sing-box) return 0 ;;
+		esac
+	done
+	return 1
 }
 
 wait_core() {
@@ -699,6 +723,18 @@ output_local_on() {
 offload_guard() {
 	local changed=0 opt
 	OFFLOAD_CHANGED=0
+	# Remember the pre-proxy values ONCE so stopping the proxy can put the
+	# router back instead of leaving hardware offloading disabled forever.
+	if [ "$(uci -q get flclash.proxy.offload_saved 2>/dev/null)" != "1" ]; then
+		uci -q set flclash.proxy=proxy
+		uci -q set flclash.proxy.offload_saved=1
+		for opt in flow_offloading flow_offloading_hw; do
+			uci -q delete "flclash.proxy.saved_$opt" 2>/dev/null
+			val=$(uci -q get "firewall.@defaults[0].$opt" 2>/dev/null)
+			[ -n "$val" ] && uci -q set "flclash.proxy.saved_$opt=$val"
+		done
+		uci -q commit flclash
+	fi
 	for opt in flow_offloading flow_offloading_hw; do
 		if [ "$(uci -q get firewall.@defaults[0].$opt)" != "0" ]; then
 			uci -q set firewall.@defaults[0].$opt='0' && changed=1
@@ -714,6 +750,43 @@ offload_guard() {
 	if [ -x /etc/init.d/bridger ] && /etc/init.d/bridger enabled 2>/dev/null; then
 		/etc/init.d/bridger stop 2>/dev/null
 		/etc/init.d/bridger disable 2>/dev/null
+		uci -q set flclash.proxy.bridger_saved=1
+		uci -q commit flclash
+	fi
+	return 0
+}
+
+# Restores the flow-offloading values saved by offload_guard(). Runs from
+# teardown(); a no-op when nothing was saved, so the 5s sync loop is cheap.
+offload_restore() {
+	[ "$(uci -q get flclash.proxy.offload_saved 2>/dev/null)" = "1" ] || return 0
+	local changed=0 opt val cur
+	for opt in flow_offloading flow_offloading_hw; do
+		val=$(uci -q get "flclash.proxy.saved_$opt" 2>/dev/null)
+		cur=$(uci -q get "firewall.@defaults[0].$opt" 2>/dev/null)
+		if [ -n "$val" ]; then
+			[ "$cur" != "$val" ] && uci -q set "firewall.@defaults[0].$opt=$val" && changed=1
+		else
+			[ -n "$cur" ] && uci -q delete "firewall.@defaults[0].$opt" && changed=1
+		fi
+		uci -q delete "flclash.proxy.saved_$opt" 2>/dev/null
+	done
+	uci -q delete flclash.proxy.offload_saved 2>/dev/null
+	# bridger (IGMP/组播嗅探) was disabled when takeover started; bring it back
+	# only if it was enabled before, never force-enable on users who had it off.
+	if [ "$(uci -q get flclash.proxy.bridger_saved 2>/dev/null)" = "1" ]; then
+		uci -q delete flclash.proxy.bridger_saved 2>/dev/null
+		if [ -x /etc/init.d/bridger ]; then
+			/etc/init.d/bridger enable >/dev/null 2>&1
+			/etc/init.d/bridger start >/dev/null 2>&1
+			logger -t flclash-proxy "bridger restored after proxy stop"
+		fi
+	fi
+	uci -q commit flclash 2>/dev/null
+	if [ "$changed" = "1" ]; then
+		uci -q commit firewall 2>/dev/null
+		/etc/init.d/firewall restart >/dev/null 2>&1
+		logger -t flclash-proxy "flow offloading restored after proxy stop"
 	fi
 	return 0
 }
@@ -723,6 +796,7 @@ offload_guard() {
 teardown() {
 	rules_off
 	dns_off
+	offload_restore
 	set_state off
 	return 0
 }

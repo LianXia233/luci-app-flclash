@@ -29,7 +29,7 @@ flate2 = "1"
 # rustls + webpki-roots (no system CA dependency, no curl binary).
 # Compiled in WSL — ring needs a C cross toolchain that the plain Windows
 # rust-lld setup does not provide.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "stream"] }
 
 [dev-dependencies]
 # Real WebSocket client for the transport integration tests.

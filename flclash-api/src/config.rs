@@ -234,11 +234,73 @@ fn parse_str<'a>(patch: &'a Value, key: &str) -> Option<&'a str> {
     patch.get(key).and_then(|v| v.as_str())
 }
 
+/// Settings patches are rendered into config.yaml line-by-line, so a string
+/// containing a newline would inject arbitrary YAML keys into the core config
+/// (`{"mode":"rule\nallow-lan: true"}`). Validate here instead of trusting the
+/// UI: no control characters anywhere, and enumerated values whitelisted.
+pub(crate) fn validate_patch(patch: &Value) -> Result<(), String> {    fn scan(value: &Value) -> Result<(), String> {
+        match value {
+            Value::String(text) => {
+                if text.chars().any(|c| c.is_control()) {
+                    return Err(format!("设置值包含非法控制字符: {:?}", text));
+                }
+                if text.len() > 2048 {
+                    return Err("设置值过长".into());
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    scan(item)?;
+                }
+            }
+            Value::Object(map) => {
+                for (key, item) in map {
+                    if key.chars().any(|c| c.is_control()) {
+                        return Err("设置键包含非法字符".into());
+                    }
+                    scan(item)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    scan(patch)?;
+
+    if let Some(mode) = patch.get("mode").and_then(|v| v.as_str()) {
+        if !matches!(mode, "rule" | "global" | "direct") {
+            return Err(format!("mode 只能是 rule/global/direct，当前: {}", mode));
+        }
+    }
+    if let Some(level) = patch.get("logLevel").and_then(|v| v.as_str()) {
+        if !matches!(level, "silent" | "error" | "warning" | "info" | "debug") {
+            return Err(format!("logLevel 非法: {}", level));
+        }
+    }
+    for key in ["mixedPort", "socksPort", "httpPort", "redirPort", "tproxyPort"] {
+        if let Some(value) = patch.get(key) {
+            let Some(port) = value.as_i64() else {
+                return Err(format!("{} 必须是整数", key));
+            };
+            if !(0..=65535).contains(&port) {
+                return Err(format!("{} 超出端口范围: {}", key, port));
+            }
+        }
+    }
+    if let Some(path) = patch.get("externalUi").and_then(|v| v.as_str()) {
+        if path.contains("..") {
+            return Err("externalUi 不能包含 ..".into());
+        }
+    }
+    Ok(())
+}
+
 /// PATCHes the running core when reachable; persistence never depends on it.
 pub async fn save_config(
     st: &crate::state::AppState,
     patch: &Value,
 ) -> Result<(), String> {
+    validate_patch(patch)?;
     let mut runtime = serde_json::Map::new();
     let tun_runtime = file_config(&st.config_path()).tun || parse_bool(patch, "tun") == Some(true);
     if let Some(v) = parse_str(patch, "mode") {
@@ -762,13 +824,27 @@ pub fn persist_config(path: &Path, patch: &Value) -> Result<(), String> {
 
 /// Atomically replaces a file (tmp + rename), the pattern that made the old
 /// crash loop survivable: readers never see a half-written config.
+///
+/// The temp name includes the pid and a counter: two concurrent writers used
+/// to share `<file>.yaml.tmp`, so one could rename the other's partial body
+/// into place.
 pub fn write_atomic(path: &Path, data: &[u8]) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {}", parent.display(), e))?;
-    }
-    let tmp = path.with_extension("yaml.tmp");
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {}", parent.display(), e))?;
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| format!("invalid path: {}", path.display()))?;
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = parent.join(format!(".{}.{}.{}.tmp", name, std::process::id(), seq));
     std::fs::write(&tmp, data).map_err(|e| format!("write {}: {}", tmp.display(), e))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("rename {}: {}", path.display(), e))?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("rename {}: {}", path.display(), e));
+    }
     Ok(())
 }
 
@@ -903,5 +979,17 @@ mod tests {
         assert!(cfg.tun);
         assert_eq!(cfg.mode, "rule");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn patch_validation_blocks_yaml_injection() {
+        // A newline in a scalar used to become a new config.yaml line.
+        assert!(validate_patch(&serde_json::json!({"mode": "rule\nallow-lan: true"})).is_err());
+        assert!(validate_patch(&serde_json::json!({"dns": {"nameserver": ["1.1.1.1\nx: y"]}})).is_err());
+        assert!(validate_patch(&serde_json::json!({"mode": "global", "logLevel": "debug"})).is_ok());
+        assert!(validate_patch(&serde_json::json!({"mode": "weird"})).is_err());
+        assert!(validate_patch(&serde_json::json!({"logLevel": "verbose"})).is_err());
+        assert!(validate_patch(&serde_json::json!({"mixedPort": 70000})).is_err());
+        assert!(validate_patch(&serde_json::json!({"mixedPort": 7892})).is_ok());
     }
 }
