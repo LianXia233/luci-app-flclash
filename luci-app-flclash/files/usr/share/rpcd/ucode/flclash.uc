@@ -131,6 +131,10 @@ const methods = {
 			const all = get_all('flclash');
 			const webui = all.webui || {};
 			const main = all.main || {};
+			const api = all.api || {};
+			/* Handed to logged-in LuCI users only; the jump link forwards it to
+			 * the WebUI so the auto-generated API secret needs no retyping. */
+			const secret = (api.secret != null) ? api.secret : '';
 			let port = int(webui.webui_port) || 9098;
 			let path = webui.webui_path || '/flclash/';
 			if (substr(path, 0, 1) != '/')
@@ -142,7 +146,9 @@ const methods = {
 				enabled: state.enabled,
 				webui_port: port,
 				webui_path: path,
-				mixed_port: int(main.mixed_port) || 0
+				mixed_port: int(main.mixed_port) || 0,
+				api_secret: secret,
+				api_auth: (length(secret) > 0)
 			};
 		}
 	},
@@ -161,11 +167,10 @@ const methods = {
 				 * is idempotent and guards against re-entrancy. */
 				rc = system('/usr/libexec/flclash/stop-all.sh >/dev/null 2>&1');
 			} else {
-				/* start/restart: bring up the core first so the API can reach
-				 * its controller, then the backend. Transparent proxy follows
-				 * its own UCI wish and is NOT force-enabled here. */
-				if (action == 'start')
-					system('/etc/init.d/flclash-core start >/dev/null 2>&1');
+				/* start/restart: WebUI backend only. The proxy core is owned by
+				 * the WebUI's core switch (README contract); starting it here
+				 * ran the expensive IPC/TUN initialization while LuCI still
+				 * showed "已停止" and the transparent proxy stayed off. */
 				rc = system('/etc/init.d/flclash-api ' + action);
 			}
 			/* Give procd a moment so the caller reads the fresh state. */

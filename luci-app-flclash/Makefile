@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-flclash
 PKG_VERSION:=1.4.0
-PKG_RELEASE:=1
+PKG_RELEASE:=2
 
 PKG_MAINTAINER:=FlClash WebUI
 PKG_LICENSE:=GPL-3.0-only
@@ -37,7 +37,9 @@ define Package/luci-app-flclash
   TITLE:=FlClash WebUI — mihomo/sing-box single package
   # kernel modules are NOT published in the immortalwrt 25.12 apk feeds, so
   # they must not be hard dependencies (apk would fail to resolve them).
-  DEPENDS:=+luci-base +rpcd +rpcd-mod-ucode
+  # curl is required at runtime: the traffic/log samplers stream the controller
+  # API with `curl -N`, and the online core updater downloads releases with it.
+  DEPENDS:=+luci-base +rpcd +rpcd-mod-ucode +curl
   PKGARCH:=$(ARCH_PACKAGES)
 endef
 
@@ -115,9 +117,27 @@ endef
 define Package/luci-app-flclash/postinst
 #!/bin/sh
 [ -n "$${IPKG_INSTROOT}" ] || {
-	/etc/init.d/flclash-core enable
+	# The proxy core is deliberately NOT boot-managed (the WebUI owns its
+	# switch, see README). Enabling it here on every upgrade silently
+	# contradicted that after the first-boot uci-defaults had disabled it.
 	/etc/init.d/flclash-api enable
 	/etc/init.d/flclash-proxy enable
+	# Upgrade path: installs created before the secret default existed stay
+	# reachable without auth. Generate one once (never rotate an existing key);
+	# LuCI hands it to the WebUI on the jump link.
+	if [ -f /etc/config/flclash ]; then
+		listen="$$(uci -q get flclash.api.listen)"
+		secret="$$(uci -q get flclash.api.secret)"
+		case "$$listen" in
+			127.0.0.1:*|localhost:*|\[::1\]:*) ;;
+			*)
+				if [ -z "$$secret" ]; then
+					secret="$$(head -c 32 /dev/urandom 2>/dev/null | md5sum 2>/dev/null | cut -d' ' -f1)"
+					[ -n "$$secret" ] && uci -q set "flclash.api.secret=$$secret" && uci -q commit flclash
+				fi
+				;;
+		esac
+	fi
 }
 exit 0
 endef

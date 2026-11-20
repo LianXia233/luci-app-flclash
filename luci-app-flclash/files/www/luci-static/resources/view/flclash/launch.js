@@ -75,17 +75,28 @@ return view.extend({
 		var wpath = (state && state.webui_path) || '/flclash/';
 		var target = window.location.protocol + '//' + window.location.hostname + ':' + wport + wpath;
 
+		/* The API secret is auto-generated on first install. Forward it in the
+		 * jump URL only — the visible row stays secret-free. */
+		function webuiTarget(current) {
+			if (!current || !current.api_secret)
+				return target;
+			var sep = target.indexOf('?') === -1 ? '?' : '&';
+			return target + sep + 'secret=' + encodeURIComponent(current.api_secret);
+		}
+
 		jumpBtn.addEventListener('click', function () {
-			callServiceState().then(function (state) {
-				if (!state || !state.running) {
+			callServiceState().then(function (current) {
+				if (!current || !current.running) {
 					/* The backend is down: bring it up first, then jump. The
 					 * proxy core is NOT started here — the user controls it
 					 * from the WebUI's own switch. */
 					return callServiceToggle('start').then(function () {
-						window.open(target, '_blank');
+						return callServiceState().then(function (next) {
+							window.open(webuiTarget(next || current), '_blank');
+						});
 					});
 				}
-				window.open(target, '_blank');
+				window.open(webuiTarget(current), '_blank');
 			});
 		});
 

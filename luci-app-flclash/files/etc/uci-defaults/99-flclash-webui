@@ -1,7 +1,8 @@
 #!/bin/sh
 # First-boot defaults for FlClash WebUI on OpenWrt master / SNAPSHOT.
 # /etc/config/flclash is installed by the flclash-core package.
-# This script only fills missing keys and never writes credentials.
+# Fills missing keys; also creates an API secret when the listener is not
+# loopback-only (see the end of this script).
 
 [ -f /etc/config/flclash ] || touch /etc/config/flclash
 
@@ -23,6 +24,22 @@ uci -q get flclash.webui >/dev/null || uci set flclash.webui=flclash
 uci -q get flclash.webui.enabled >/dev/null || uci set flclash.webui.enabled='1'
 uci -q get flclash.webui.webui_path >/dev/null || uci set flclash.webui.webui_path='/flclash/'
 uci -q get flclash.webui.webui_port >/dev/null || uci set flclash.webui.webui_port='9098'
+
+# The API can rewrite configs, install cores, restore backups and drive the
+# firewall: a LAN-reachable listener without a secret is an unauthenticated
+# root console. Generate one on first install (LuCI passes it to the WebUI on
+# the jump link; a direct visitor is prompted for it).
+listen="$(uci -q get flclash.api.listen)"
+secret="$(uci -q get flclash.api.secret)"
+case "$listen" in
+	127.0.0.1:*|localhost:*|\[::1\]:*) ;;
+	*)
+		if [ -z "$secret" ]; then
+			secret="$(head -c 32 /dev/urandom 2>/dev/null | md5sum 2>/dev/null | cut -d' ' -f1)"
+			[ -n "$secret" ] && uci -q set "flclash.api.secret=$secret"
+		fi
+		;;
+esac
 
 uci commit flclash
 
