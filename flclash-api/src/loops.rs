@@ -300,10 +300,10 @@ fn parse_dns_target(rest: &str) -> Option<(String, String, String)> {
 }
 
 /// The egress path the DNS query itself used, derived from the upstream:
-/// the airport DoH pool runs through the proxy chain ("代理"), the system
+/// DoH resolvers are reached through the proxy chain ("代理"), the system
 /// resolver is neither ("其他"), everything plain goes straight out WAN.
 fn dns_origin(upstream: &str) -> &'static str {
-    if upstream.contains("/dns-query") || upstream.contains(":8443") {
+    if upstream.contains("/dns-query") {
         "代理"
     } else if upstream.starts_with("system(") {
         "其他"
