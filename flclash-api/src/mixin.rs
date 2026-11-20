@@ -132,7 +132,9 @@ pub fn validate(yaml: &str) -> (Vec<String>, Vec<String>) {
     for key in ["port", "socks-port", "mixed-port", "redir-port", "tproxy-port"] {
         if let Some(value) = map.get(key) {
             match value.as_i64() {
-                Some(port) if (1..=65535).contains(&port) => {}
+                // 0 is legal: mihomo treats it as "listener disabled", and
+                // proxy-rules.sh itself rewrites a duplicate `port:` to 0.
+                Some(port) if (0..=65535).contains(&port) => {}
                 Some(port) => errors.push(format!("{} 端口超出范围: {}", key, port)),
                 None => errors.push(format!("{} 必须是整数", key)),
             }
@@ -199,12 +201,20 @@ pub fn validate(yaml: &str) -> (Vec<String>, Vec<String>) {
     }
 
     if let Some(rules) = map.get("rules").and_then(|v| v.as_array()) {
+        // IP rules carry trailing flags (`IP-CIDR,net,GROUP,no-resolve`); the
+        // target is the last *non-flag* segment. Missing targets are grouped
+        // so one bad provider cannot dump 28 identical errors on the user.
+        const RULE_FLAGS: [&str; 2] = ["no-resolve", "no-ech"];
+        let mut missing: Vec<(String, usize)> = Vec::new();
         for (index, rule) in rules.iter().enumerate() {
             let Some(text) = rule.as_str() else {
                 errors.push(format!("rules[{}] 必须是字符串", index));
                 continue;
             };
-            let parts: Vec<&str> = text.split(',').map(|s| s.trim()).collect();
+            let mut parts: Vec<&str> = text.split(',').map(|s| s.trim()).collect();
+            while parts.len() > 2 && RULE_FLAGS.contains(&parts[parts.len() - 1]) {
+                parts.pop();
+            }
             if parts.len() < 2 {
                 errors.push(format!("规则格式错误: {}", text));
                 continue;
@@ -214,8 +224,19 @@ pub fn validate(yaml: &str) -> (Vec<String>, Vec<String>) {
                 || proxy_names.iter().any(|n| n == target)
                 || group_names.iter().any(|n| n == target);
             if !known {
-                errors.push(format!("规则指向不存在的出口「{}」: {}", target, text));
+                match missing.iter_mut().find(|(name, _)| name == target) {
+                    Some(entry) => entry.1 += 1,
+                    None => missing.push((target.to_string(), 1)),
+                }
             }
+        }
+        if !missing.is_empty() {
+            let detail = missing
+                .iter()
+                .map(|(name, count)| format!("{}×{}", name, count))
+                .collect::<Vec<_>>()
+                .join("、");
+            errors.push(format!("规则指向不存在的出口: {}", detail));
         }
     }
     (errors, warnings)
@@ -260,6 +281,41 @@ mod tests {
         deep_merge(&mut base, &overlay);
         assert!(base["tun"].get("mtu").is_none());
         assert_eq!(base["tun"]["stack"], "system");
+    }
+
+    #[test]
+    fn ip_rule_flags_and_zero_port_pass_validation() {
+        let yaml = concat!(
+            "port: 0\n",
+            "proxies:\n  - name: A\n    type: ss\n",
+            "proxy-groups:\n  - name: ONEPIXEL\n    type: select\n    proxies: [A]\n",
+            "rules:\n",
+            "  - IP-CIDR,1.1.1.1/32,ONEPIXEL,no-resolve\n",
+            "  - IP-CIDR6,2001:db8::/32,ONEPIXEL,no-resolve\n",
+            "  - IP-CIDR,2.2.2.2/32,MISSING,no-resolve\n",
+            "  - IP-CIDR,3.3.3.3/32,MISSING,no-resolve\n"
+        );
+        let (errors, _) = validate(yaml);
+        assert!(
+            !errors.iter().any(|e| e.contains("端口超出范围")),
+            "{:?}",
+            errors
+        );
+        assert!(!errors.iter().any(|e| e.contains("no-resolve")), "{:?}", errors);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("规则指向不存在的出口: MISSING×2")),
+            "{:?}",
+            errors
+        );
+        let ok = concat!(
+            "port: 0\n",
+            "proxies:\n  - name: A\n    type: ss\n",
+            "proxy-groups:\n  - name: G\n    type: select\n    proxies: [A]\n",
+            "rules:\n  - IP-CIDR,1.1.1.1/32,G,no-resolve\n"
+        );
+        assert!(validate(ok).0.is_empty(), "{:?}", validate(ok).0);
     }
 
     #[test]

@@ -180,7 +180,11 @@ fn http_client() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     CLIENT.get_or_init(|| {
         reqwest::Client::builder()
-            .user_agent("FlClash-OpenWrt/1.2 (luci-app-flclash)")
+            // Airports key their response off the User-Agent: a meta client gets
+            // the full config (their own DoH servers in dns:), an unknown UA
+            // gets a degraded one with public resolvers — which resolves node
+            // domains to walled IPs and makes every node "timeout".
+            .user_agent("clash.meta/v1.19.0")
             .redirect(reqwest::redirect::Policy::limited(8))
             .local_address(Some(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)))
             .build()
@@ -262,7 +266,7 @@ pub async fn cf_trace_v6(timeout_secs: u64) -> Result<Vec<u8>, String> {
     static CLIENT6: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     let client = CLIENT6.get_or_init(|| {
         reqwest::Client::builder()
-            .user_agent("FlClash-OpenWrt/1.2 (luci-app-flclash)")
+            .user_agent("clash.meta/v1.19.0")
             .redirect(reqwest::redirect::Policy::limited(8))
             // 2606:4700:4700::1111 — Cloudflare anycast v6, stable for years;
             // the cert carries the www.cloudflare.com name so TLS verifies.

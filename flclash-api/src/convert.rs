@@ -1001,8 +1001,49 @@ fn build_node_config(header: &[(&'static str, String)], nodes: Vec<Vec<Kv>>) -> 
     out
 }
 
+/// Surge/QX-style configs say `allowInsecure` / `allow-insecure`; mihomo only
+/// reads `skip-cert-verify`. Without the mapping the node silently enables TLS
+/// verification and fails against relay certificates (e.g. a CName to a CDN
+/// host the cert was never issued for).
+fn map_allow_insecure(line: &str) -> String {
+    let truthy = [
+        "allowInsecure: 1",
+        "allowInsecure: true",
+        "allowInsecure:1",
+        "allowInsecure:true",
+        "allow-insecure: true",
+        "allow-insecure: 1",
+        "allow-insecure:true",
+        "allow-insecure:1",
+        "allowInsecure : true",
+        "allowInsecure : 1",
+    ];
+    let mut out = line.to_string();
+    for pattern in truthy.iter() {
+        if out.contains(pattern) {
+            out = out.replace(pattern, "skip-cert-verify: true");
+        }
+    }
+    let falsy = [
+        "allowInsecure: false",
+        "allowInsecure: 0",
+        "allowInsecure:false",
+        "allowInsecure:0",
+        "allow-insecure: false",
+        "allow-insecure: 0",
+        "allow-insecure:false",
+        "allow-insecure:0",
+    ];
+    for pattern in falsy.iter() {
+        if out.contains(pattern) {
+            out = out.replace(pattern, "skip-cert-verify: false");
+        }
+    }
+    out
+}
+
 fn normalize_yaml_profile(header: &[(&'static str, String)], body: &str) -> Result<String, String> {
-    let mut kept: Vec<&str> = Vec::new();
+    let mut kept: Vec<String> = Vec::new();
     let mut has_proxies = false;
     for line in body.lines() {
         let trimmed = line.trim();
@@ -1019,7 +1060,7 @@ fn normalize_yaml_profile(header: &[(&'static str, String)], body: &str) -> Resu
                 continue;
             }
         }
-        kept.push(line);
+        kept.push(map_allow_insecure(line));
     }
     if !has_proxies {
         return Err("配置缺少 proxies 段,不是有效的 Clash/mihomo YAML".into());
@@ -1027,7 +1068,7 @@ fn normalize_yaml_profile(header: &[(&'static str, String)], body: &str) -> Resu
     let mut out = String::new();
     write_header(&mut out, header);
     out.push('\n');
-    for line in kept {
+    for line in kept.iter() {
         out.push_str(line);
         out.push('\n');
     }
@@ -1129,6 +1170,29 @@ pub async fn fetch_profile(config_path: &Path, url: &str) -> Result<(String, Pro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_allow_insecure_mapped_to_skip_cert_verify() {
+        let yaml = concat!(
+            "port: 7890\n",
+            "proxies:\n",
+            "  - {name: A, type: vmess, server: s.example, port: 443, uuid: u, alterId: 0, cipher: auto, udp: true, tls: true, allowInsecure: 1, servername: cos.example.com}\n",
+            "  - {name: B, type: trojan, server: t.example, port: 443, password: p, allow-insecure: true}\n",
+            "  - {name: C, type: ss, server: c.example, port: 8388, cipher: aes-128-gcm, password: pw, allowInsecure: false}\n",
+            "dns:\n  enable: true\n"
+        );
+        let out = normalize_yaml_profile(&[], yaml).unwrap();
+        assert!(
+            out.matches("skip-cert-verify: true").count() == 2,
+            "{}",
+            out
+        );
+        assert!(out.contains("skip-cert-verify: false"), "{}", out);
+        assert!(!out.contains("allowInsecure"), "{}", out);
+        assert!(!out.contains("allow-insecure"), "{}", out);
+        // The subscription's own dns section must survive conversion.
+        assert!(out.contains("dns:"), "{}", out);
+    }
 
     #[test]
     fn test_b64_variants() {

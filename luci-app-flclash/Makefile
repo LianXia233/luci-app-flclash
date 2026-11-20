@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-flclash
 PKG_VERSION:=1.4.0
-PKG_RELEASE:=4
+PKG_RELEASE:=5
 
 PKG_MAINTAINER:=FlClash WebUI
 PKG_LICENSE:=GPL-3.0-only

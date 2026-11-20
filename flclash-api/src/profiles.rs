@@ -437,6 +437,24 @@ pub async fn reload_core(st: &AppState) {
             let _ = service(st, "start").await;
         }
     }
+
+    // A reload/restart swaps mihomo's fake-ip pool, but dnsmasq keeps serving
+    // the old 198.18.x answers from its cache — LAN clients get RSTs for the
+    // cache lifetime after every profile switch (looks like "switching broke
+    // the network"). Flush both sides.
+    let _ = crate::ctrl::ctrl_req(
+        &st.controller,
+        st.secret.as_deref(),
+        "POST",
+        "/cache/fakeip/flush",
+        None,
+        std::time::Duration::from_secs(5),
+    )
+    .await;
+    let _ = tokio::process::Command::new("/etc/init.d/dnsmasq")
+        .arg("restart")
+        .output()
+        .await;
 }
 
 /// Invokes the core init script (start/stop/restart).
