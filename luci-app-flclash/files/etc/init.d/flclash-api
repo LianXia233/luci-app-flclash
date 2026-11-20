@@ -32,7 +32,9 @@ start_service() {
 		-ui "$ui" \
 		-data "$data" \
 		-init /etc/init.d/flclash-core
-	procd_set_param env FLCLASH_API_SECRET="$secret"
+	# Geo DB refresh downloads cannot reach GitHub directly; route the
+	# controller HTTP client through the local mihomo mixed-port.
+	procd_set_param env FLCLASH_API_SECRET="$secret" HTTPS_PROXY=http://127.0.0.1:7892 HTTP_PROXY=http://127.0.0.1:7892 NO_PROXY=127.0.0.1,localhost,::1
 	procd_set_param stdout 1
 	procd_set_param stderr 1
 	procd_set_param respawn 3600 5 0

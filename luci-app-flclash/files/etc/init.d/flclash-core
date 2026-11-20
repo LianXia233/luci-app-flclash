@@ -80,6 +80,9 @@ start_service() {
 	/usr/libexec/flclash/proxy-rules.sh prepare >/dev/null 2>&1
 
 	procd_open_instance flclash-core
+	# Route controller Geo DB downloads through the local mihomo proxy.
+	# GODEBUG=http2client=0 avoids CDN HTTP/2 handshakes being reset (EOF).
+	procd_set_param env HTTPS_PROXY=http://127.0.0.1:7892 HTTP_PROXY=http://127.0.0.1:7892 NO_PROXY=127.0.0.1,localhost,::1 GODEBUG=http2client=0
 	if [ "$core_type" = "sing-box" ]; then
 		# sing-box uses its own JSON config. Translate the Clash-format
 		# config.yaml on the fly; if the converter is missing or fails, fall
