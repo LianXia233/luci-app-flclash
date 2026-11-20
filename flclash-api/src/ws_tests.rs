@@ -148,6 +148,49 @@ async fn hello_snapshot_subscribe_and_event() {
 }
 
 #[tokio::test]
+async fn a_used_topic_is_seeded_not_resynced_on_first_event() {
+    let st = state(None);
+    // Advance the per-topic counter before the client connects: a long-running
+    // bridge always looks like this. The old code assumed every topic started
+    // at 1, so this first event was flagged as a gap → resync → clear → gap
+    // again, i.e. a full snapshot on every single event.
+    for n in 0..5 {
+        st.bus.publish("logs", "logs.append", json!({"lines": [], "n": n}));
+    }
+    let url = serve(st.clone()).await;
+    let (mut ws, _) = tokio_tungstenite::connect_async(url)
+        .await
+        .expect("connect");
+    let _hello = next_json(&mut ws).await;
+    ws.send(Wire::Text(
+        json!({"type":"hello","protocol":1}).to_string().into(),
+    ))
+    .await
+    .unwrap();
+    let _snapshot = next_type(&mut ws, "snapshot").await;
+    ws.send(Wire::Text(
+        json!({"type":"subscribe","topics":["logs"]})
+            .to_string()
+            .into(),
+    ))
+    .await
+    .unwrap();
+    let _subscribed = next_type(&mut ws, "subscribed").await;
+
+    st.bus.publish(
+        "logs",
+        "logs.append",
+        json!({"lines":[{"time":1,"level":"info","message":"x"}]}),
+    );
+    let frame = next_json(&mut ws).await;
+    assert_eq!(
+        frame["type"], "logs.append",
+        "first event on a used topic must be delivered, not resynced: {}",
+        frame
+    );
+}
+
+#[tokio::test]
 async fn client_commands_sync_and_resume() {
     let st = state(None);
     let url = serve(st.clone()).await;

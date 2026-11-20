@@ -72,6 +72,9 @@ pub struct History {
     pub total_up: f64,
     pub total_dn: f64,
     pub logs: Vec<LogEntry>,
+    /// Live connection count, sampled once per connections poll and reused by
+    /// /status (it used to issue a second /connections request just for this).
+    pub conn_count: usize,
     pub outbound_ip: String,
     pub outbound_ip6: String,
     pub outbound_cc: String,
@@ -214,7 +217,9 @@ pub fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
-/// Scans /proc for a process whose comm is `mihomo`; returns its pid.
+/// Scans /proc for the running proxy core (`mihomo` or `sing-box`) and returns
+/// its pid. Matching only "mihomo" made memory/uptime read 0 forever as soon
+/// as the user switched to sing-box.
 pub fn core_pid() -> u32 {
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return 0;
@@ -226,7 +231,8 @@ pub fn core_pid() -> u32 {
             continue;
         }
         if let Ok(comm) = std::fs::read_to_string(entry.path().join("comm")) {
-            if comm.trim() == "mihomo" {
+            let comm = comm.trim();
+            if comm == "mihomo" || comm == "sing-box" {
                 return name.parse().unwrap_or(0);
             }
         }

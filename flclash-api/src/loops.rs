@@ -9,7 +9,6 @@
 use std::time::Duration;
 use tokio::io::AsyncBufReadExt;
 
-use crate::ctrl::ctrl_json;
 use crate::state::{now_secs, AppState, LogEntry, MAX_HISTORY, MAX_LOGS};
 
 fn controller_url(controller: &str, path: &str) -> String {
@@ -50,11 +49,25 @@ pub async fn sample_proxies(st: std::sync::Arc<AppState>) {
     }
 }
 
-/// `/connections` snapshots (dashboard table + connections page).
+/// `/connections` is the single source for the connection list, the dashboard
+/// counter and the traffic totals. It runs even without WebSocket clients
+/// because /status reads the cached count instead of re-querying the core.
 pub async fn sample_connections(st: std::sync::Arc<AppState>) {
     loop {
-        if st.bus.receivers() > 0 {
-            let payload = crate::api::connections_payload(&st).await;
+        if let Some(raw) = crate::api::connections_snapshot(&st).await {
+            let payload = serde_json::Value::Array(crate::api::connections_from(&raw));
+            let up = raw.get("uploadTotal").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let down = raw
+                .get("downloadTotal")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            let count = payload.as_array().map(|list| list.len()).unwrap_or(0);
+            {
+                let mut hist = st.hist.lock().unwrap();
+                hist.total_up = up;
+                hist.total_dn = down;
+                hist.conn_count = count;
+            }
             st.bus.publish("connections", "connections", payload);
         }
         tokio::time::sleep(Duration::from_millis(1500)).await;
@@ -186,20 +199,6 @@ pub async fn sample_logs(st: std::sync::Arc<AppState>) {
         }
         let _ = child.kill().await;
         tokio::time::sleep(Duration::from_secs(1)).await;
-    }
-}
-
-/// /connections totals for the dashboard counters.
-pub async fn sample_totals(st: std::sync::Arc<AppState>) {
-    loop {
-        if let Ok(value) = ctrl_json(&st, "GET", "/connections", None, Duration::from_secs(5)).await {
-            let up = value.get("uploadTotal").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let down = value.get("downloadTotal").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let mut hist = st.hist.lock().unwrap();
-            hist.total_up = up;
-            hist.total_dn = down;
-        }
-        tokio::time::sleep(Duration::from_secs(3)).await;
     }
 }
 

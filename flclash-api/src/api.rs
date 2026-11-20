@@ -289,19 +289,16 @@ fn rfc3339_to_unix(s: &str) -> Option<i64> {
     Some(days * 86400 + hh * 3600 + mm * 60 + ss - offset_secs)
 }
 
-pub async fn connections_payload(st: &AppState) -> Value {
-    let data = match ctrl_json(
-        st,
-        "GET",
-        "/connections",
-        None,
-        Duration::from_secs(10),
-    )
-    .await
-    {
-        Ok(data) => data,
-        Err(_) => return json!([]),
-    };
+/// Raw controller `/connections` payload (None when the core is down).
+pub async fn connections_snapshot(st: &AppState) -> Option<Value> {
+    ctrl_json(st, "GET", "/connections", None, Duration::from_secs(10))
+        .await
+        .ok()
+}
+
+/// Projects the controller payload into the list the UI renders. Split from
+/// the fetch so one request feeds both the list and the totals sampler.
+pub fn connections_from(data: &Value) -> Vec<Value> {
     let empty = Vec::new();
     let conns = data
         .get("connections")
@@ -313,7 +310,7 @@ pub async fn connections_payload(st: &AppState) -> Value {
         .map(|d| d.as_nanos() as i64)
         .unwrap_or(0);
 
-    let out: Vec<Value> = conns
+    conns
         .iter()
         .map(|c| {
             let start = c.get("start").and_then(|v| v.as_str()).unwrap_or("");
@@ -352,8 +349,14 @@ pub async fn connections_payload(st: &AppState) -> Value {
                     .unwrap_or_default(),
             })
         })
-        .collect();
-    json!(out)
+        .collect()
+}
+
+pub async fn connections_payload(st: &AppState) -> Value {
+    match connections_snapshot(st).await {
+        Some(data) => json!(connections_from(&data)),
+        None => json!([]),
+    }
 }
 
 fn rfc3339_nanos(s: &str) -> Option<i64> {
@@ -427,13 +430,28 @@ pub async fn status_payload(st: &AppState) -> Value {
     let reachable = core_reachable(st).await;
     let mut running = false;
     let mut version = String::new();
-    let mut cfg = file_config(&st.config_path());
+    // config.yaml can be megabytes (a big subscription). Keep the flash read
+    // off the async workers; /status is rebuilt every two seconds.
+    let config_path = st.config_path();
+    let mut cfg = tokio::task::spawn_blocking(move || file_config(&config_path))
+        .await
+        .unwrap_or_default();
     let mut groups_summary = json!({"count": 0, "timeout": 0, "groups": []});
     let mut stats_conns = 0usize;
 
     if reachable {
         running = true;
-        if let Ok(data) = ctrl_json(st, "GET", "/configs", None, Duration::from_secs(5)).await {
+        // Three independent controller reads: run them concurrently. Sequentially
+        // the worst case was 5+5+10+10s per status sample, and this runs every
+        // two seconds; a slow /proxies stalled the whole dashboard behind it.
+        // The connection count is not fetched here: the connections sampler is
+        // its single producer, which removes one /connections request per tick.
+        let (configs, ver, proxies) = tokio::join!(
+            ctrl_json(st, "GET", "/configs", None, Duration::from_secs(5)),
+            ctrl_json(st, "GET", "/version", None, Duration::from_secs(5)),
+            ctrl_json(st, "GET", "/proxies", None, Duration::from_secs(10)),
+        );
+        if let Ok(data) = configs {
             let get_i = |key: &str| data.get(key).and_then(|v| v.as_i64());
             let get_b = |key: &str| data.get(key).and_then(|v| v.as_bool());
             let get_s = |key: &str| data.get(key).and_then(|v| v.as_str()).unwrap_or("");
@@ -464,26 +482,22 @@ pub async fn status_payload(st: &AppState) -> Value {
                 cfg.log_level = get_s("log-level").to_string();
             }
         }
-        if let Ok(data) = ctrl_json(st, "GET", "/version", None, Duration::from_secs(5)).await {
+        if let Ok(data) = ver {
             version = data
                 .get("version")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
         }
-        if let Ok(data) = ctrl_json(st, "GET", "/proxies", None, Duration::from_secs(10)).await {
+        if let Ok(data) = proxies {
             groups_summary = groups_summary_from(&data);
-        }
-        if let Ok(data) = ctrl_json(st, "GET", "/connections", None, Duration::from_secs(10)).await {
-            stats_conns = data
-                .get("connections")
-                .and_then(|v| v.as_array())
-                .map(|a| a.len())
-                .unwrap_or(0);
         }
     }
 
     let hist = st.hist.lock().unwrap();
+    if running {
+        stats_conns = hist.conn_count;
+    }
     let up_rate = hist.up.last().copied().unwrap_or(0.0);
     let down_rate = hist.down.last().copied().unwrap_or(0.0);
     let pid = core_pid();
@@ -746,6 +760,11 @@ pub async fn config_put(State(st): State<Arc<AppState>>, body: Bytes) -> Respons
         Ok(v) => v,
         Err(resp) => return resp,
     };
+    // Client-side mistakes (bad enum, newline injection, port range) are 400s,
+    // not 502s: the old mapping made a rejected save look like a core failure.
+    if let Err(err) = crate::config::validate_patch(&patch) {
+        return fail_json(StatusCode::BAD_REQUEST, &err);
+    }
     match save_config(&st, &patch).await {
         Ok(()) => {
             // Other tabs/config views must see the change without re-polling.
@@ -951,10 +970,18 @@ pub async fn logs(State(st): State<Arc<AppState>>) -> Response {
 
 pub async fn system_proxy(State(st): State<Arc<AppState>>) -> Response {
     let cfg = file_config(&st.config_path());
+    // The controller address is configurable; reporting a hard-coded 9097 made
+    // the read-only summary wrong as soon as external_controller changed.
+    let api_port = st
+        .controller
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.parse::<i64>().ok())
+        .unwrap_or(9097);
     ok_json(json!({
         "backend": "flclash",
         "mixed_port": cfg.mixed_port,
-        "clash_api_port": 9097,
+        "clash_api_port": api_port,
         "tun_name": "",
         "routing_mode": cfg.mode,
         "ipv6_support": cfg.ipv6,
@@ -1359,19 +1386,44 @@ pub async fn static_index() -> Redirect {
 }
 
 pub async fn static_root(State(st): State<Arc<AppState>>) -> Response {
-    serve_file(&st, "index.html")
+    serve_file(&st, "index.html").await
 }
 
 pub async fn static_file(State(st): State<Arc<AppState>>, Path(path): Path<String>) -> Response {
-    serve_file(&st, &path)
+    serve_file(&st, &path).await
 }
 
-fn serve_file(st: &Arc<AppState>, rel: &str) -> Response {
-    if rel.contains("..") {
-        return fail_json(StatusCode::NOT_FOUND, "not found");
+fn not_found() -> Response {
+    (StatusCode::NOT_FOUND, Html("<h1>404</h1>".to_string())).into_response()
+}
+
+/// Serves a file below `ui_dir` and nothing else.
+///
+/// Axum percent-decodes path captures, so `%2F` arrives as a literal `/`:
+/// `Path::join` would then treat the value as absolute and serve any file the
+/// API runs as (root). `%2E%2E` variants defeat the old `contains("..")` check
+/// the same way. The only reliable rule is "the canonical target must stay
+/// inside the canonical UI root".
+///
+/// Async on purpose: a static bundle read is a flash I/O wait, and blocking a
+/// Tokio worker stalls every other request (including the WebSocket pusher).
+async fn serve_file(st: &Arc<AppState>, rel: &str) -> Response {
+    let rel = rel.trim_start_matches('/');
+    if rel.is_empty() || rel.contains('\\') || rel.contains('\0') {
+        return not_found();
     }
-    let target = std::path::Path::new(&st.ui_dir).join(rel);
-    match std::fs::read(&target) {
+    let root = std::path::Path::new(&st.ui_dir);
+    let Ok(root) = tokio::fs::canonicalize(root).await else {
+        return not_found();
+    };
+    let target = root.join(rel);
+    let Ok(target) = tokio::fs::canonicalize(&target).await else {
+        return not_found();
+    };
+    if !target.starts_with(&root) {
+        return not_found();
+    }
+    match tokio::fs::read(&target).await {
         Ok(bytes) => {
             let mime = mime_of(&rel);
             (
@@ -1383,7 +1435,7 @@ fn serve_file(st: &Arc<AppState>, rel: &str) -> Response {
             )
                 .into_response()
         }
-        Err(_) => Html("<h1>404</h1>".to_string()).into_response(),
+        Err(_) => not_found(),
     }
 }
 
@@ -1449,7 +1501,11 @@ pub async fn config_validate(State(st): State<Arc<AppState>>, body: Bytes) -> Re
     let text = if let Some(text) = data.get("text").and_then(|v| v.as_str()) {
         text.to_string()
     } else if let Some(id) = data.get("profileId").and_then(|v| v.as_str()) {
-        match std::fs::read_to_string(st.profiles_dir().join(format!("{}.yaml", id))) {
+        // The id is user input (URL/path segment): never join it unchecked.
+        let Some(path) = profiles::profile_path(&st, id) else {
+            return fail_json(StatusCode::BAD_REQUEST, "非法配置 ID");
+        };
+        match std::fs::read_to_string(&path) {
             Ok(text) => text,
             Err(_) => return fail_json(StatusCode::NOT_FOUND, "配置不存在"),
         }
@@ -1476,7 +1532,9 @@ pub async fn config_validate(State(st): State<Arc<AppState>>, body: Bytes) -> Re
 
 /// GET /profiles/{id}/raw → the stored (converted) profile YAML for editing.
 pub async fn profile_raw(State(st): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
-    let path = st.profiles_dir().join(format!("{}.yaml", id));
+    let Some(path) = profiles::profile_path(&st, &id) else {
+        return fail_json(StatusCode::BAD_REQUEST, "非法配置 ID");
+    };
     match std::fs::read_to_string(&path) {
         Ok(text) => ok_json(json!({"id": id, "text": text})),
         Err(_) => fail_json(StatusCode::NOT_FOUND, "配置不存在"),
@@ -1501,7 +1559,9 @@ pub async fn profile_raw_put(
     if text.len() > 4 << 20 {
         return fail_json(StatusCode::BAD_REQUEST, "配置内容过大");
     }
-    let path = st.profiles_dir().join(format!("{}.yaml", id));
+    let Some(path) = profiles::profile_path(&st, &id) else {
+        return fail_json(StatusCode::BAD_REQUEST, "非法配置 ID");
+    };
     if !path.is_file() {
         return fail_json(StatusCode::NOT_FOUND, "配置不存在");
     }
@@ -1734,5 +1794,35 @@ mod proxy_tests {
         let payload = build_proxies(&map);
         assert_eq!(payload["nodes"][0]["selectable"], false);
         assert_eq!(payload["nodes"][0]["tested"], false);
+    }
+
+    #[tokio::test]
+    async fn static_files_cannot_escape_the_ui_root() {
+        let dir = std::env::temp_dir()
+            .join(format!("flclash-ui-{}", crate::events::now_millis()));
+        std::fs::create_dir_all(dir.join("css")).unwrap();
+        std::fs::write(dir.join("css/app.css"), "body{}").unwrap();
+        let st = AppState::new(
+            "127.0.0.1:9".into(),
+            dir.to_string_lossy().to_string(),
+            dir.to_string_lossy().to_string(),
+            "/bin/true".into(),
+            None,
+        );
+        assert_eq!(
+            serve_file(&st, "css/app.css").await.status(),
+            StatusCode::OK
+        );
+        // axum percent-decodes the wildcard capture, so an absolute path
+        // (`%2Fetc%2Fpasswd`) used to replace the UI root entirely.
+        assert_eq!(
+            serve_file(&st, "/etc/passwd").await.status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            serve_file(&st, "../../etc/passwd").await.status(),
+            StatusCode::NOT_FOUND
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

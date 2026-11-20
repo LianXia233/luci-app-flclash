@@ -52,6 +52,27 @@ fn octal(bytes: &[u8]) -> u64 {
     u64::from_str_radix(&digits, 8).unwrap_or(0)
 }
 
+/// Validates the ustar header checksum: sum of every byte with the checksum
+/// field treated as spaces, accepted as either unsigned or signed. A corrupted
+/// archive used to be parsed anyway, potentially writing shifted bytes into
+/// the data directory.
+fn checksum_ok(header: &[u8]) -> bool {
+    let stored = octal(&header[148..156]);
+    if stored == 0 {
+        // Old writers sometimes leave the field zeroed; the whitelist and the
+        // YAML/JSON validation still apply, so treat it as "unmarked".
+        return true;
+    }
+    let mut unsigned: u64 = 0;
+    let mut signed: i64 = 0;
+    for (index, byte) in header.iter().enumerate() {
+        let value = if (148..156).contains(&index) { b' ' } else { *byte };
+        unsigned += value as u64;
+        signed += value as i8 as i64;
+    }
+    stored == unsigned || (signed > 0 && stored as i64 == signed)
+}
+
 /// A tar numeric field: octal digits padded to the field width, with the last
 /// byte always NUL.
 fn pad_octal(value: u64, width: usize) -> Vec<u8> {
@@ -124,6 +145,9 @@ pub fn unpack(data: &[u8]) -> Result<Vec<(String, Vec<u8>)>, String> {
         if h.iter().all(|b| *b == 0) {
             break;
         }
+        if !checksum_ok(h) {
+            return Err("备份文件头校验和错误".into());
+        }
         let size = octal(&h[124..135]) as usize;
 
 
@@ -178,6 +202,10 @@ pub fn collect(data_dir: &Path) -> Vec<(String, Vec<u8>)> {
                 continue;
             }
             let Some(file_name) = path.file_name().and_then(|v| v.to_str()) else { continue };
+            // Skip write_atomic temp files (".<name>.<pid>.<n>.tmp").
+            if file_name.starts_with('.') {
+                continue;
+            }
             if let Some(data) = read_file(&path) {
                 entries.push((format!("profiles/{}", file_name), data));
             }
@@ -409,5 +437,22 @@ mod tests {
         let err = restore(&st, &bytes).unwrap_err();
         assert!(err.contains("YAML"));
         let _ = std::fs::remove_dir_all("/tmp/flclash-backup-test");
+    }
+
+    #[test]
+    fn rejects_corrupted_header_checksum() {
+        let entries = vec![("config.yaml".to_string(), b"mixed-port: 7892\n".to_vec())];
+        let gz = pack(&entries);
+        let mut dec = GzDecoder::new(&gz[..]);
+        let mut raw = Vec::new();
+        dec.read_to_end(&mut raw).unwrap();
+        // Flip a byte inside the ustar name field: the header checksum no
+        // longer matches, so the archive must be rejected before unpacking.
+        raw[0] ^= 0xff;
+        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(&raw).unwrap();
+        let bad = enc.finish().unwrap();
+        let err = unpack(&bad).unwrap_err();
+        assert!(err.contains("校验和"), "{}", err);
     }
 }
