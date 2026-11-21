@@ -107,21 +107,17 @@ core_type() {
 }
 
 core_alive() {
-	local addr host port
+	local addr port
 	addr=$(uci -q get flclash.main.external_controller 2>/dev/null)
 	[ -n "$addr" ] || addr=127.0.0.1:9097
-	# Strip the port from the right so IPv6 literals ([::1]:9097) survive;
-	# `sed 's/.*://'` swallowed the address itself.
 	port=${addr##*:}
-	host=${addr%:*}
-	case "$host" in
-		''|0.0.0.0|'::'|'[::]') host=127.0.0.1 ;;
-	esac
-	netstat -lnt 2>/dev/null | grep -q "127.0.0.1:$port " && return 0
-	# A wildcard bind (allow-lan / 0.0.0.0) only shows up as 0.0.0.0:<port>.
-	netstat -lnt 2>/dev/null | grep -q "0.0.0.0:$port " && return 0
-	[ "$host" = 127.0.0.1 ] && return 1
-	netstat -lnt 2>/dev/null | grep -q "$host:$port "
+	case "$port" in ''|*[!0-9]*) return 1 ;; esac
+	# Match on the listen port only: 127.0.0.1:9097, the 0.0.0.0:9097 wildcard
+	# and IPv6 binds (rendered by busybox netstat as :::9097 or [::1]:9097)
+	# must all pass. The previous host-side greps missed every IPv6 form and
+	# made sync tear down a healthy takeover every 5s; a host string injected
+	# into grep also distorted the pattern ([::1] parses as a bracket class).
+	netstat -lnt 2>/dev/null | grep -q ":$port "
 }
 
 core_proc() {
@@ -180,7 +176,11 @@ wait_tun() {
 prepare_config() {
 	PREPARE_CHANGED=0
 	[ -f "$CFG" ] || return 0
-	local tmp="$CFG.flclash.tmp"
+	# Per-invocation scratch name: the 5s sync loop, core restarts and the API
+	# can each run prepare_config; a shared fixed temp file let two writers
+	# interleave and publish half of each other's rewrite.
+	local tmp
+	tmp="${CFG}.flclash.tmp.$$"
 
 	if ! grep -q '^dns:' "$CFG"; then
 		cat >> "$CFG" <<EOF
@@ -400,7 +400,10 @@ dns_on() {
 
 dns_off() {
 	local change=0 cur saved saved_servers noresolv filter managed
-	rm -f "$DNSCONF"
+	# Also drop a leftover .new: dnsmasq's conf-dir reads every non-hidden
+	# file, so an interrupted dns_on otherwise keeps pointing dnsmasq at a
+	# possibly dead core listener long after dns_off ran.
+	rm -f "$DNSCONF" "$DNSCONF.new"
 	cur=$(uci -q get dhcp.@dnsmasq[0].server 2>/dev/null)
 	saved=$(uci -q get flclash.proxy.dns_saved 2>/dev/null)
 	managed=$(uci -q get flclash.proxy.dns_filter_managed 2>/dev/null)
