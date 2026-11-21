@@ -887,7 +887,8 @@ nft_lan_ready() {
 nft_output_local() {
 	# Static rules: rebuilding the output chain on every 5s sync was pure
 	# netlink churn. Rebuild only when it is missing or the redir port changed.
-	if nft list chain inet "$TABLE" output_tcp 2>/dev/null | grep -q "redirect to :$REDIR_PORT"; then
+	if nft list chain inet "$TABLE" output_tcp 2>/dev/null | grep -q 'hook output' \
+		&& nft list chain inet "$TABLE" output_tcp 2>/dev/null | grep -q "redirect to :$REDIR_PORT"; then
 		if [ "$IPV6_MODE" != "proxy" ] || nft list chain inet "$TABLE" output_tcp 2>/dev/null | grep -q 'ip6 daddr != @private_v6'; then
 			return 0
 		fi
@@ -899,6 +900,18 @@ table inet $TABLE {
 	chain output_tcp { type nat hook output priority dstnat - 10; policy accept; }
 }
 EOF
+	# The table usually already exists, so the heredoc above is skipped and a
+	# plain `chain output_tcp { ... }` below would create a chain WITHOUT the
+	# nat hook — silently leaving the router's own traffic unproxied. A chain
+	# cannot gain a hook after creation, so recreate it when the hook is gone.
+	if ! nft list chain inet "$TABLE" output_tcp 2>/dev/null | grep -q 'hook output'; then
+		"$NFT" delete chain inet "$TABLE" output_tcp 2>/dev/null
+		"$NFT" -f - <<EOF
+table inet $TABLE {
+	chain output_tcp { type nat hook output priority dstnat - 10; policy accept; }
+}
+EOF
+	fi
 	# `flush` is not a chain-body statement in current nft; flush the chain as
 	# a separate command, then re-add its rules. This only runs when the output
 	# chain is missing/changed, not on the 5s sync path.
