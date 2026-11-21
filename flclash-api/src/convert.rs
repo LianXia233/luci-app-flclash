@@ -356,13 +356,22 @@ fn parse_vmess(raw: &str) -> Result<Vec<Kv>, String> {
         }
     };
 
+    // alterId is emitted as a bare scalar, not through yaml_str: a hostile
+    // subscription putting newlines into the JSON string field would break
+    // out of the node mapping and inject arbitrary top-level keys into the
+    // generated config. Reduce it to the integer mihomo expects instead.
+    let alter_id: i64 = json_str(&data, "aid", "0")
+        .trim()
+        .parse()
+        .unwrap_or(0)
+        .clamp(0, 65535);
     let mut pairs = vec![
         kv("name", yaml_str(&name)),
         kv("type", "vmess"),
         kv("server", yaml_str(&json_str(&data, "add", ""))),
         kv("port", port.to_string()),
         kv("uuid", yaml_str(&json_str(&data, "id", ""))),
-        kv("alterId", json_str(&data, "aid", "0")),
+        kv("alterId", alter_id.to_string()),
         kv("cipher", yaml_str(&{
             let scy = json_str(&data, "scy", "");
             if scy.is_empty() { "auto".to_string() } else { scy }
@@ -1224,6 +1233,27 @@ mod tests {
         let pairs = parse_ss(&format!("ss://{}#node", encoded)).unwrap();
         assert!(pairs.iter().any(|p| p.k == "server" && p.v == "\"5.6.7.8\""));
         assert!(pairs.iter().any(|p| p.k == "password" && p.v == "\"secret\""));
+    }
+
+    #[test]
+    fn vmess_aid_is_reduced_to_an_integer() {
+        // alterId is emitted as a bare scalar; a hostile subscription stuffing
+        // newlines into it used to inject arbitrary top-level YAML keys.
+        let hostile = serde_json::json!({
+            "v": "2", "ps": "node", "add": "1.2.3.4", "port": "443",
+            "id": "b831381d-6324-4d53-ad4f-8cda48b30811",
+            "aid": "0\nrules:\n  - MATCH,INJECT",
+            "net": "tcp", "type": "none", "tls": ""
+        })
+        .to_string();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(hostile);
+        let pairs = parse_vmess(&format!("vmess://{}", encoded)).unwrap();
+        assert_eq!(
+            pairs.iter().find(|p| p.k == "alterId").map(|p| p.v.as_str()),
+            Some("0")
+        );
+        assert!(pairs.iter().all(|p| !p.v.contains("INJECT")));
+        assert!(pairs.iter().all(|p| !p.v.contains('\n')));
     }
 
     #[test]
