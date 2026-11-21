@@ -418,7 +418,14 @@ pub async fn sample_dns_log(st: std::sync::Arc<AppState>) {
             }
         }
         if active != debug_on {
-            let level = if active { "debug" } else { "info" };
+            // Restore the level the user actually configured — a hardcoded
+            // "info" silently overrode warning/error/debug set in settings
+            // whenever the DNS page was closed.
+            let level = if active {
+                "debug".to_string()
+            } else {
+                crate::config::file_config(&st.config_path()).log_level
+            };
             let body = serde_json::json!({ "log-level": level }).to_string();
             let _ = ctrl_json(&st, "PATCH", "/configs", Some(&body), Duration::from_secs(5)).await;
             debug_on = active;
