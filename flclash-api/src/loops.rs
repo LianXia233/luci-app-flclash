@@ -389,7 +389,22 @@ fn refresh_node_domains(st: &AppState) {
     let mut set = st.node_domains.lock().unwrap();
     set.clear();
     for line in text.lines() {
-        let Some(pos) = line.find("server:") else { continue };
+        // Match the `server:` KEY, not any substring: `nameserver:` and
+        // `proxy-server-nameserver:` both contain "server:", which used to
+        // feed DNS-resolver addresses into the node-domain set and mislabel
+        // DNS servers' own queries as 代理 in the log.
+        let mut scan = 0usize;
+        let pos = loop {
+            let found = match line[scan..].find("server:") {
+                Some(p) => scan + p,
+                None => break None,
+            };
+            if found == 0 || line.as_bytes()[found - 1] == b' ' || line.as_bytes()[found - 1] == b'\t' {
+                break Some(found);
+            }
+            scan = found + 1;
+        };
+        let Some(pos) = pos else { continue };
         let rest = line[pos + 7..].trim();
         let end = rest.find(|c| c == ',' || c == '}').unwrap_or(rest.len());
         let server = rest[..end].trim().trim_matches('\'').trim_matches('"').to_string();
