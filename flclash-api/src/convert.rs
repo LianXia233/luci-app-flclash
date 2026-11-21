@@ -964,9 +964,15 @@ fn build_node_config(header: &[(&'static str, String)], nodes: Vec<Vec<Kv>>) -> 
     out.push_str("    - 223.5.5.5\n");
     out.push_str("    - 119.29.29.29\n");
     out.push_str("  nameserver:\n");
-    out.push_str("    - https://223.5.5.5/dns-query\n");
-    out.push_str("    - https://doh.pub/dns-query\n");
-    out.push_str("    - tls://120.53.53.53\n");
+    for v in DEFAULT_DOH {
+        out.push_str(&format!("    - {}\n", v));
+    }
+    // A node-list subscription carries no airport DNS by definition: node
+    // domains resolve through the same domestic DoH/DoT set.
+    out.push_str("  proxy-server-nameserver:\n");
+    for v in DEFAULT_DOH {
+        out.push_str(&format!("    - {}\n", v));
+    }
     out.push_str("\nproxies:\n");
     out.push_str(&proxies);
 
@@ -1051,6 +1057,135 @@ fn map_allow_insecure(line: &str) -> String {
     out
 }
 
+// --- node-domain resolution --------------------------------------------------
+
+/// Domestic DoH/DoT fallback: used as `nameserver`/`proxy-server-nameserver`
+/// when the subscription ships no DNS of its own, so node domains and general
+/// resolution both keep working without an airport-provided resolver.
+const DEFAULT_DOH: [&str; 3] = [
+    "https://223.5.5.5/dns-query",
+    "https://doh.pub/dns-query",
+    "tls://120.53.53.53",
+];
+
+fn is_encrypted_dns(value: &str) -> bool {
+    let v = value.trim().trim_matches('"').trim_matches('\'');
+    v.starts_with("https://") || v.starts_with("tls://") || v.starts_with("quic://") || v.starts_with("h3://")
+}
+
+/// Recognizes plain-IP upstream entries ("223.5.5.5", "1.1.1.1:53",
+/// "[2001:db8::1]:53", with optional "#param" suffix) for the fallback
+/// derivation. Domain-only list entries (e.g. fake-ip-filter items) must not
+/// leak into the resolver list, so bare domains are rejected here.
+fn plain_ip_ns(value: &str) -> bool {
+    let core = value.split('#').next().unwrap_or(value).trim();
+    if core.parse::<std::net::IpAddr>().is_ok() {
+        return true;
+    }
+    if let Some(rest) = core.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            return rest[..end].parse::<std::net::IpAddr>().is_ok();
+        }
+    }
+    if let Some(i) = core.rfind(':') {
+        if !core[..i].contains(':') {
+            return core[..i].parse::<std::net::IpAddr>().is_ok();
+        }
+    }
+    false
+}
+
+/// One additive DNS pass over the kept profile lines:
+///   * airport ships a dns block -> its upstreams (verbatim, including any
+///     skip-cert-verify params and private endpoints) become
+///     `proxy-server-nameserver` when the block does not define one, so the
+///     proxy nodes themselves resolve through the airport's own DoH/DoT
+///     first — the CDN entry IPs are chosen by the same resolver the airport
+///     intends. Encrypted upstreams are preferred; plain-IP entries are the
+///     fallback; domain-only list items are ignored.
+///   * airport ships no dns block at all -> inject the domestic DoH/DoT
+///     default block (nameserver + proxy-server-nameserver).
+/// Flow-style `dns: {...}` blocks have no child indent to anchor on and are
+/// left untouched rather than risk emitting a duplicate root key.
+fn augment_node_dns(kept: &mut Vec<String>) {
+    let start = kept.iter().position(|line| {
+        let at_root = !line.trim().is_empty()
+            && !line.starts_with(' ')
+            && !line.starts_with('\t');
+        at_root && line.trim().split(':').next().map(str::trim) == Some("dns")
+    });
+    let Some(start) = start else {
+        kept.push(String::new());
+        kept.push("dns:".into());
+        kept.push("  enable: true".into());
+        // redir-host keeps the takeover IP-based; see build_node_config().
+        kept.push("  enhanced-mode: redir-host".into());
+        kept.push("  default-nameserver:".into());
+        kept.push("    - 223.5.5.5".into());
+        kept.push("    - 119.29.29.29".into());
+        kept.push("  nameserver:".into());
+        for v in DEFAULT_DOH {
+            kept.push(format!("    - {}", v));
+        }
+        kept.push("  proxy-server-nameserver:".into());
+        for v in DEFAULT_DOH {
+            kept.push(format!("    - {}", v));
+        }
+        return;
+    };
+    let end = kept[start + 1..]
+        .iter()
+        .position(|line| !line.trim().is_empty() && !line.starts_with(' ') && !line.starts_with('\t'))
+        .map(|p| start + 1 + p)
+        .unwrap_or(kept.len());
+    let block = &kept[start..end];
+    let Some(child_indent) = block
+        .iter()
+        .skip(1)
+        .find(|l| !l.trim().is_empty())
+        .map(|l| l.len() - l.trim_start().len())
+    else {
+        return;
+    };
+    let has_psn = block.iter().any(|l| {
+        l.trim().split(':').next().map(str::trim) == Some("proxy-server-nameserver")
+    });
+    if has_psn {
+        return;
+    }
+    let mut entries: Vec<String> = Vec::new();
+    for l in block.iter() {
+        let t = l.trim();
+        if let Some(v) = t.strip_prefix("- ") {
+            if is_encrypted_dns(v) && !entries.iter().any(|e| e == v) {
+                entries.push(v.to_string());
+            }
+        }
+    }
+    if entries.is_empty() {
+        for l in block.iter() {
+            let t = l.trim();
+            if let Some(v) = t.strip_prefix("- ") {
+                if plain_ip_ns(v) && !entries.iter().any(|e| e == v) {
+                    entries.push(v.to_string());
+                }
+            }
+        }
+    }
+    if entries.is_empty() {
+        return;
+    }
+    entries.truncate(6);
+    let mut inject = vec![format!("{}proxy-server-nameserver:", " ".repeat(child_indent))];
+    let list_indent = " ".repeat(child_indent + 2);
+    for v in entries {
+        inject.push(format!("{}- {}", list_indent, v));
+    }
+    for (offset, line) in inject.into_iter().enumerate() {
+        kept.insert(end + offset, line);
+    }
+}
+
 fn normalize_yaml_profile(header: &[(&'static str, String)], body: &str) -> Result<String, String> {
     let mut kept: Vec<String> = Vec::new();
     let mut has_proxies = false;
@@ -1074,6 +1209,7 @@ fn normalize_yaml_profile(header: &[(&'static str, String)], body: &str) -> Resu
     if !has_proxies {
         return Err("配置缺少 proxies 段,不是有效的 Clash/mihomo YAML".into());
     }
+    augment_node_dns(&mut kept);
     let mut out = String::new();
     write_header(&mut out, header);
     out.push('\n');
@@ -1254,6 +1390,82 @@ mod tests {
         );
         assert!(pairs.iter().all(|p| !p.v.contains("INJECT")));
         assert!(pairs.iter().all(|p| !p.v.contains('\n')));
+    }
+
+    #[test]
+    fn airport_dns_becomes_proxy_server_nameserver() {
+        let header = header_map(Path::new("/nonexistent/config.yaml"));
+        let body = concat!(
+            "proxies:\n  - name: a\n    type: ss\n",
+            "dns:\n",
+            "  enable: true\n",
+            "  nameserver:\n",
+            "    - https://doh.airport.example/dns-query\n",
+            "    - 223.5.5.5\n",
+            "  fake-ip-filter:\n",
+            "    - '*.lan'\n",
+        );
+        let yaml = normalize_yaml_profile(&header, body).unwrap();
+        let psn = yaml.split("proxy-server-nameserver:").nth(1).expect("psn injected");
+        // Airport DoH first, verbatim (private endpoints and any
+        // skip-cert-verify params they carry pass through untouched).
+        assert!(psn.contains("https://doh.airport.example/dns-query"));
+        // Generic plain-IP resolvers are not airport-specific upstreams and
+        // stay out of the derived list.
+        assert!(!psn.contains("223.5.5.5"));
+        // fake-ip-filter domains must not leak into the resolver list.
+        assert!(!psn.contains("*.lan"));
+        assert_eq!(yaml.matches("proxy-server-nameserver:").count(), 1);
+    }
+
+    #[test]
+    fn plain_ip_upstreams_derive_proxy_server_nameserver() {
+        let header = header_map(Path::new("/nonexistent/config.yaml"));
+        let body = concat!(
+            "proxies:\n  - name: a\n    type: ss\n",
+            "dns:\n",
+            "  enable: true\n",
+            "  nameserver:\n",
+            "    - 1.2.3.4:5353\n",
+        );
+        let yaml = normalize_yaml_profile(&header, body).unwrap();
+        let psn = yaml.split("proxy-server-nameserver:").nth(1).expect("psn injected");
+        assert!(psn.contains("- 1.2.3.4:5353"));
+    }
+
+    #[test]
+    fn missing_airport_dns_falls_back_to_domestic_doh() {
+        let header = header_map(Path::new("/nonexistent/config.yaml"));
+        let body = "proxies:\n  - name: a\n    type: ss\n";
+        let yaml = normalize_yaml_profile(&header, body).unwrap();
+        assert!(yaml.contains("proxy-server-nameserver:"));
+        assert!(yaml.contains("tls://120.53.53.53"));
+        assert!(yaml.contains("enhanced-mode: redir-host"));
+    }
+
+    #[test]
+    fn existing_proxy_server_nameserver_is_untouched() {
+        let header = header_map(Path::new("/nonexistent/config.yaml"));
+        let body = concat!(
+            "proxies:\n  - name: a\n    type: ss\n",
+            "dns:\n",
+            "  enable: true\n",
+            "  nameserver: [https://doh.airport.example/dns-query]\n",
+            "  proxy-server-nameserver:\n",
+            "    - https://psn.airport.example/dns-query\n",
+        );
+        let yaml = normalize_yaml_profile(&header, body).unwrap();
+        assert_eq!(yaml.matches("proxy-server-nameserver:").count(), 1);
+        assert!(yaml.contains("psn.airport.example"));
+    }
+
+    #[test]
+    fn node_list_config_resolves_nodes_via_domestic_doh() {
+        let header = header_map(Path::new("/nonexistent/config.yaml"));
+        let nodes = vec![parse_ss("ss://YWVzLTI1Ni1nY206cGFzczEyMw==@5.6.7.8:443#n1").unwrap()];
+        let yaml = build_node_config(&header, nodes);
+        assert!(yaml.contains("proxy-server-nameserver:"));
+        assert!(yaml.contains("tls://120.53.53.53"));
     }
 
     #[test]
