@@ -352,6 +352,13 @@ pub async fn serve(socket: WebSocket, st: Arc<AppState>, pre_auth: bool) {
     }
 
     // ---- initial snapshot -------------------------------------------------
+    // Subscribe BEFORE building the snapshot: envelopes published while the
+    // snapshot was being constructed used to land in neither it nor any
+    // subscription, and one-shot events (profiles.changed, task updates,
+    // proxy.select) have no periodic resync to recover them. Anything queued
+    // here is delivered right after the snapshot; re-applying a pre-snapshot
+    // event on top of newer state is a no-op, losing it was not.
+    let mut rx = st.bus.subscribe();
     let snapshot = api::snapshot_payload(&st).await;
     let snapshot_env = Envelope::local("snapshot", "system", snapshot, st.bus.last_sequence());
     if send_frame(&mut sink, &snapshot_env, conn.gzip)
@@ -362,13 +369,14 @@ pub async fn serve(socket: WebSocket, st: Arc<AppState>, pre_auth: bool) {
     }
 
     let clients = st.ws_clients.fetch_add(1, Ordering::SeqCst) + 1;
-    st.bus.publish(
+    // This connection is now subscribed, so its own join lands in `rx`; skip
+    // it during forwarding (every other client still gets it).
+    let self_join = st.bus.publish(
         "system",
         "system.clients",
         json!({"clients": clients, "bootId": st.boot_id}),
     );
 
-    let mut rx = st.bus.subscribe();
     let mut ticker = interval(Duration::from_secs(HEARTBEAT_SECS));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     ticker.tick().await; // consume the immediate first tick
@@ -455,6 +463,7 @@ pub async fn serve(socket: WebSocket, st: Arc<AppState>, pre_auth: bool) {
             event = rx.recv() => {
                 match event {
                     Ok(event) => {
+                        if event.id == self_join.id { continue; }
                         if !conn.subs.contains(event.topic.as_str()) { continue; }
                         // Per-topic gap detection: a lost frame means the
                         // client's incremental view is unusable → snapshot.
