@@ -185,10 +185,29 @@ fn http_client() -> &'static reqwest::Client {
             // gets a degraded one with public resolvers — which resolves node
             // domains to walled IPs and makes every node "timeout".
             .user_agent("clash.meta/v1.19.0")
-            .redirect(reqwest::redirect::Policy::limited(8))
+            .redirect(redirect_policy())
             .local_address(Some(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)))
             .build()
             .expect("reqwest client")
+    })
+}
+
+/// Redirect policy shared by every client: each hop re-passes the same host
+/// checks the initial URL faced. Policy::limited() alone let a hostile
+/// subscription server 302 the fetch at 127.0.0.1:9098/... (or any
+/// cloud-metadata endpoint) and smuggle the response back as profile content.
+pub fn redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() >= 8 {
+            return attempt.error("too many redirects");
+        }
+        let url = attempt.url();
+        let scheme_ok = url.scheme() == "http" || url.scheme() == "https";
+        let host = url.host_str().unwrap_or("");
+        if !scheme_ok || host.is_empty() || crate::profiles::host_blocked(host) {
+            return attempt.error("redirect target is not a public http(s) address");
+        }
+        attempt.follow()
     })
 }
 
@@ -267,7 +286,7 @@ pub async fn cf_trace_v6(timeout_secs: u64) -> Result<Vec<u8>, String> {
     let client = CLIENT6.get_or_init(|| {
         reqwest::Client::builder()
             .user_agent("clash.meta/v1.19.0")
-            .redirect(reqwest::redirect::Policy::limited(8))
+            .redirect(redirect_policy())
             // 2606:4700:4700::1111 — Cloudflare anycast v6, stable for years;
             // the cert carries the www.cloudflare.com name so TLS verifies.
             .resolve(

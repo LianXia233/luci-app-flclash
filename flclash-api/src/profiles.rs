@@ -49,11 +49,37 @@ pub fn save_profiles(st: &AppState, list: &[Profile]) -> Result<(), String> {
     write_atomic(&st.index_path(), &data)
 }
 
-/// Rejects subscription URLs that point at loopback / link-local addresses.
-/// Private LAN hosts stay allowed (self-hosted subscriptions are a real use
-/// case). DNS names that *resolve* to a blocked address are not caught here —
-/// the import runs as the router itself, so this is a guard against
+/// Shared host check for subscription URLs and every redirect hop: blocks
+/// loopback / link-local / multicast / unspecified literals and localhost
+/// names. Private LAN hosts stay allowed (self-hosted subscriptions are a
+/// real use case); DNS names that *resolve* into a blocked range are not
+/// caught — the import runs as the router itself, so this is a guard against
 /// cloud-metadata-style probes, not a full SSRF sandbox.
+pub fn host_blocked(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") || host.to_ascii_lowercase().ends_with(".localhost") {
+        return true;
+    }
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return match ip {
+            std::net::IpAddr::V4(v4) => {
+                v4.is_loopback()
+                    || v4.is_unspecified()
+                    || v4.is_link_local()
+                    || v4.is_broadcast()
+                    || v4.is_multicast()
+            }
+            std::net::IpAddr::V6(v6) => {
+                v6.is_loopback()
+                    || v6.is_unspecified()
+                    || v6.is_multicast()
+                    || (v6.segments()[0] & 0xffc0) == 0xfe80
+            }
+        };
+    }
+    false
+}
+
+/// Rejects subscription URLs that point at loopback / link-local addresses.
 pub fn validate_subscription_url(url: &str) -> Result<(), String> {
     if url.len() > 2048 {
         return Err("订阅地址过长".into());
@@ -79,28 +105,8 @@ pub fn validate_subscription_url(url: &str) -> Result<(), String> {
     if host.is_empty() {
         return Err("订阅地址缺少主机名".into());
     }
-    if host.eq_ignore_ascii_case("localhost") || host.to_ascii_lowercase().ends_with(".localhost") {
-        return Err("不允许订阅 loopback 地址".into());
-    }
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        let blocked = match ip {
-            std::net::IpAddr::V4(v4) => {
-                v4.is_loopback()
-                    || v4.is_unspecified()
-                    || v4.is_link_local()
-                    || v4.is_broadcast()
-                    || v4.is_multicast()
-            }
-            std::net::IpAddr::V6(v6) => {
-                v6.is_loopback()
-                    || v6.is_unspecified()
-                    || v6.is_multicast()
-                    || (v6.segments()[0] & 0xffc0) == 0xfe80
-            }
-        };
-        if blocked {
-            return Err("不允许订阅回环/链路本地地址".into());
-        }
+    if host_blocked(host) {
+        return Err("不允许订阅回环/链路本地地址".into());
     }
     Ok(())
 }
