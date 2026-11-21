@@ -34,23 +34,25 @@ fn read(path: &str) -> String {
 fn redact_value(line: &str) -> String {
     let trimmed = line.trim_start();
     let lower = trimmed.to_ascii_lowercase();
-    const KEYS: [&str; 11] = [
+    // Configs contain both block (`uuid: x`) and flow (`- { name: n, uuid: x }`)
+    // forms. Matching only the line start leaked uuid/url from flow-style
+    // proxy entries, so any line carrying a credential key is replaced whole.
+    const INLINE_KEYS: [&str; 12] = [
         "password:",
         "uuid:",
         "secret:",
+        "token=",
         "token:",
+        "url:",
         "auth:",
         "auth-str:",
         "auth_str:",
         "obfs-password:",
         "private-key:",
-        "url:",
         "subscription-url:",
     ];
-    if KEYS.iter().any(|key| lower.starts_with(key)) {
-        if let Some(pos) = line.find(':') {
-            return format!("{} <redacted>", &line[..pos]);
-        }
+    if INLINE_KEYS.iter().any(|key| lower.contains(key)) {
+        return "<redacted: sensitive line>".to_string();
     }
     // UCI export style: `option secret '...'`
     if lower.starts_with("option secret ") || lower.starts_with("list secret ") {
