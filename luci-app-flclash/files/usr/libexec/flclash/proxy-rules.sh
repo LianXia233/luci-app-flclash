@@ -540,6 +540,19 @@ nft_acl_rules() {
 	for port in $(bypass_ports); do echo "$proto dport $port accept"; done
 }
 
+# Emits bypass lines for the DNS hijack chain: block-mode clients fall through
+# to dnsmasq instead of the core's listener, and destination bypass CIDRs are
+# never hijacked either. (Before this, "block" clients kept losing their DNS.)
+nft_acl_dns_rules() {
+	local mode ip mac cidr
+	mode=$(acl_mode)
+	if [ "$mode" = "block" ]; then
+		for ip in $(acl_ips); do echo "ip saddr $ip accept"; done
+		for mac in $(acl_macs); do echo "ether saddr $mac accept"; done
+	fi
+	for cidr in $(bypass_cidrs); do echo "ip daddr $cidr accept"; done
+}
+
 # Emits the catch-all interception rules, one per allowed client in allow
 # mode (nft cannot OR ip saddr with ether saddr in a single match).
 # `nft_intercept_rules <tcp|udp>` prints full rule lines.
@@ -577,6 +590,7 @@ table inet $TABLE {
 	set private_v4 { type ipv4_addr; flags interval; elements = { $PRIVATE } }
 	chain prerouting_dns {
 		type nat hook prerouting priority dstnat - 10; policy accept;
+		$(nft_acl_dns_rules)
 		$dns_hijack
 	}
 	chain prerouting_tcp {
@@ -684,15 +698,17 @@ ipt_chain() {
 	iptables -w -t nat -A PREROUTING -i "$LAN_IF" -j FLCLASH
 	iptables -w -t mangle -N FLCLASH_MANGLE
 	iptables -w -t mangle -A PREROUTING -i "$LAN_IF" -j FLCLASH_MANGLE
-	[ "$(core_type)" = "sing-box" ] || {
-		iptables -w -t nat -A FLCLASH -p udp --dport 53 -j REDIRECT --to-ports "$DNS_PORT"
-		iptables -w -t nat -A FLCLASH -p tcp --dport 53 -j REDIRECT --to-ports "$DNS_PORT"
-	}
 	for net in 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.0.0.0/24 192.168.0.0/16 224.0.0.0/4 240.0.0.0/4; do
 		iptables -w -t nat -A FLCLASH -d "$net" -j RETURN
 		iptables -w -t mangle -A FLCLASH_MANGLE -d "$net" -j RETURN
 	done
 	ipt_acl_bypass
+	# The DNS hand-off sits behind the ACL bypasses so block-mode clients and
+	# destination bypasses keep their own DNS (mirrors nft_acl_dns_rules).
+	[ "$(core_type)" = "sing-box" ] || {
+		iptables -w -t nat -A FLCLASH -p udp --dport 53 -j REDIRECT --to-ports "$DNS_PORT"
+		iptables -w -t nat -A FLCLASH -p tcp --dport 53 -j REDIRECT --to-ports "$DNS_PORT"
+	}
 	ip rule add fwmark "$FWMARK" table 100 2>/dev/null
 	ip route add local default dev lo table 100 2>/dev/null
 	ipt_intercept
