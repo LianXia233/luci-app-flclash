@@ -1027,7 +1027,17 @@ nft_intercept_rules6() {
 	[ "$listed" = "1" ] || logger -t flclash-proxy "acl_mode=allow has no IPv6 client entry; IPv6 stays direct"
 }
 
+ensure_kernel_modules() {
+	local mod
+	for mod in nft_nat nft_tproxy; do
+		grep -q "^$mod " /proc/modules 2>/dev/null && continue
+		modprobe "$mod" 2>/dev/null && continue
+		logger -t flclash-proxy "ERROR: kernel module $mod is unavailable; REDIRECT/TPROXY cannot work (install kmod-nft-nat / kmod-nft-tproxy)"
+	done
+}
+
 nft_on() {
+	ensure_kernel_modules
 	if ! nft_lan_ready; then
 		nft delete table inet "$TABLE" 2>/dev/null
 		ip rule add fwmark "$FWMARK" table 100 2>/dev/null

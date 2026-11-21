@@ -1,6 +1,6 @@
 [package]
 name = "flclash-api"
-version = "1.4.0"
+version = "1.5.0"
 edition = "2021"
 description = "FlClash WebUI backend bridge (Tokio) for OpenWrt: exposes /flclash/api on top of the local mihomo controller and serves the static WebUI from the same origin."
 

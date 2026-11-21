@@ -1,8 +1,8 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-flclash
-PKG_VERSION:=1.4.0
-PKG_RELEASE:=8
+PKG_VERSION:=1.5.0
+PKG_RELEASE:=1
 
 PKG_MAINTAINER:=FlClash WebUI
 PKG_LICENSE:=GPL-3.0-only
@@ -37,11 +37,13 @@ define Package/luci-app-flclash
   TITLE:=FlClash WebUI — mihomo/sing-box single package
   # Pure fw4 data plane. `curl` is required at runtime: the traffic/log
   # samplers stream the controller API with `curl -N`, and the online core
-  # updater downloads releases with it. kmod-nft-nat/-tproxy/-tun are published
-  # in the 25.12 kmods feed; ip-full provides `ip rule` / `ip -6 rule` and the
-  # policy-routing tables (busybox ip is not sufficient).
-  DEPENDS:=+luci-base +rpcd +rpcd-mod-ucode +ucode +curl \
-           +firewall4 +kmod-nft-nat +kmod-nft-tproxy +kmod-tun +ip-full
+  # updater downloads releases with it. ip-full provides `ip rule` /
+  # `ip -6 rule` and the policy-routing tables (busybox ip is not sufficient).
+  # kmod-nft-nat/-tproxy/-tun are runtime requirements but deliberately NOT
+  # hard dependencies: they are pinned to the exact kernel ABI and a snapshot
+  # device may run a different revision. proxy-rules.sh probes/modprobes them
+  # on start and fails with a readable error instead of breaking apk install.
+  DEPENDS:=+luci-base +rpcd +rpcd-mod-ucode +ucode +curl +firewall4 +ip-full
   PKGARCH:=$(ARCH_PACKAGES)
 endef
 
