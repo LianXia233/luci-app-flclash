@@ -511,6 +511,14 @@ fn persist_dns_uci(patch: &Value) -> Result<(), String> {
     let Some(dns) = patch.get("dns").and_then(|v| v.as_object()) else {
         return Ok(());
     };
+    // Fine on fresh installs and on upgrades from 1.5.3, where the dns
+    // section does not exist yet.
+    if uci_get_key("flclash.dns").is_empty() {
+        uci_set_key("flclash.dns", "flclash")?;
+    }
+    if uci_get_key("flclash.dns.split").is_empty() {
+        uci_set_key("flclash.dns.split", "1")?;
+    }
     let mut changed = false;
     for (patch_key, uci_key) in [
         ("nameserver", "flclash.dns.domestic_dns"),
@@ -640,10 +648,16 @@ fn apply_split_dns(dns: &mut serde_json::Map<String, Value>) {
 
     dns.insert("nameserver".into(), dns_or_default(&domestic, &DOMESTIC_DNS));
     dns.insert("fallback".into(), dns_or_default(&foreign, &FOREIGN_DNS));
-    dns.insert(
-        "direct-nameserver".into(),
-        dns_or_default(&direct, &DOMESTIC_DNS),
-    );
+    // Direct/unknown traffic follows the user's domestic choice; the built-in
+    // list is only the last resort when UCI is empty.
+    if direct.is_empty() {
+        dns.insert(
+            "direct-nameserver".into(),
+            dns_or_default(&domestic, &DOMESTIC_DNS),
+        );
+    } else {
+        dns.insert("direct-nameserver".into(), dns_array_owned(&direct));
+    }
     // Airport-provided node DNS wins; a WebUI override is next, and the
     // domestic default is only a fallback when neither exists.
     if !dns_list_present(dns, "proxy-server-nameserver") {
@@ -1601,5 +1615,16 @@ mod tests {
         assert!(doc["dns"]["nameserver-policy"]["geosite:geolocation-!cn"].is_array());
         assert_eq!(doc["rules"][0], "GEOSITE,cn,DIRECT");
         assert_eq!(doc["rules"].as_array().unwrap().last().unwrap(), "MATCH,节点选择");
+    }
+
+    #[test]
+    fn invariants_create_dns_block_when_subscription_omits_it() {
+        let out = enforce_invariants("proxies: []\nrules:\n  - MATCH,DIRECT\n").unwrap();
+        let doc: Value = serde_yaml::from_str(&out).unwrap();
+        assert_eq!(doc["dns"]["listen"], "0.0.0.0:1053");
+        assert!(!doc["dns"]["nameserver"].as_array().unwrap().is_empty());
+        assert!(!doc["dns"]["fallback"].as_array().unwrap().is_empty());
+        assert!(doc["dns"]["nameserver-policy"]["geosite:cn"].is_array());
+        assert!(doc["dns"]["nameserver-policy"]["geosite:geolocation-!cn"].is_array());
     }
 }
