@@ -23,8 +23,29 @@ window.FlClashConfig = (function () {
   } catch (error) { /* private mode / storage disabled */ }
   if (!secret) secret = window.FLCLASH_SECRET || '';
 
+  /* `?api=` exists for reverse-proxy setups that serve the UI and the API
+   * from a different path/host of the SAME router. Anything pointing at
+   * another host would silently forward every poll — and the X-FlClash-Secret
+   * header and the WS auth frame — to that host, so a crafted link must not
+   * be able to exfiltrate the secret: reject foreign hosts and fall back to
+   * the default base. */
+  function resolveApiBase(candidate) {
+    const fallback = (meta && meta.content) || '/flclash/api';
+    if (!candidate) return fallback;
+    try {
+      const url = new URL(candidate, window.location.href);
+      if (url.host !== window.location.host) {
+        console.warn('flclash: ignoring cross-host ?api= target ' + url.host);
+        return fallback;
+      }
+      return candidate;
+    } catch (error) {
+      return fallback;
+    }
+  }
+
   return {
-    apiBase: params.get('api') || window.FLCLASH_API_BASE || (meta && meta.content) || '/flclash/api',
+    apiBase: resolveApiBase(params.get('api') || window.FLCLASH_API_BASE),
     secret: secret,
     pollInterval: Number(window.FLCLASH_POLL_INTERVAL) || 2000,
     timeout: Number(window.FLCLASH_TIMEOUT) || 12000,
