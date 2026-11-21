@@ -689,7 +689,13 @@ ipt_chain() {
 	ipt_intercept
 	iptables -w -t filter -C INPUT -m mark --mark "$FWMARK" -j ACCEPT 2>/dev/null || \
 		iptables -w -t filter -I INPUT 1 -m mark --mark "$FWMARK" -j ACCEPT
-	[ "$LOCAL_TAKEOVER" = "1" ] && [ "$(core_type)" != "sing-box" ] && ipt_output_local
+	# Not a bare `&&` chain: with local takeover off or under sing-box the last
+	# command evaluates false and callers read the whole chain install as a
+	# failure, flipping DNS off and churning the state machine.
+	if [ "$LOCAL_TAKEOVER" = "1" ] && [ "$(core_type)" != "sing-box" ]; then
+		ipt_output_local || return 1
+	fi
+	return 0
 }
 
 ipt_off() {
@@ -709,8 +715,13 @@ ipt_off() {
 }
 
 ipt_active() {
-	iptables -w -t nat -C FLCLASH -p tcp -j REDIRECT --to-ports "$REDIR_PORT" 2>/dev/null && \
-		iptables -w -t mangle -C FLCLASH_MANGLE -p udp -j TPROXY --on-port "$TPROXY_PORT" --tproxy-mark "$FWMARK" 2>/dev/null
+	# Probe for whatever the intercept rules actually look like: a catch-all in
+	# all/none modes, per-client rules in allow mode. Matching only the
+	# catch-all made allow mode look perpetually inactive, so every 5s sync
+	# tore the chain down, restarted dnsmasq and rebuilt it — forever.
+	iptables -w -t nat -S FLCLASH 2>/dev/null | grep -q -- '-j REDIRECT' || return 1
+	iptables -w -t mangle -S FLCLASH_MANGLE 2>/dev/null | grep -q -- '-j TPROXY' || return 1
+	return 0
 }
 
 ipt_on() {
