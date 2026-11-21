@@ -501,18 +501,27 @@ table inet $TABLE {
 	chain output_tcp { type nat hook output priority dstnat - 10; policy accept; }
 }
 EOF
-	nft add chain inet "$TABLE" output_tcp '{ type nat hook output priority dstnat - 10; policy accept; }' 2>/dev/null
-	nft flush chain inet "$TABLE" output_tcp 2>/dev/null
-	nft add rule inet "$TABLE" output_tcp "meta mark $CORE_MARK accept" 2>/dev/null
-	# Every reply to an inbound connection bypasses REDIRECT, including SSH/LuCI
-	# sessions to a public WAN address. This is stronger than an IP-only guard.
-	nft add rule inet "$TABLE" output_tcp 'ct direction reply accept' 2>/dev/null
-	nft add rule inet "$TABLE" output_tcp 'ip daddr @private_v4 accept' 2>/dev/null
-	nft add rule inet "$TABLE" output_tcp 'ct original ip daddr @private_v4 accept' 2>/dev/null
-	nft add rule inet "$TABLE" output_tcp 'tcp dport 53 accept' 2>/dev/null
-	nft add rule inet "$TABLE" output_tcp "tcp dport $REDIR_PORT accept" 2>/dev/null
-	nft add rule inet "$TABLE" output_tcp "tcp dport $TPROXY_PORT accept" 2>/dev/null
-	nft add rule inet "$TABLE" output_tcp "meta l4proto tcp redirect to :$REDIR_PORT" 2>/dev/null
+	# flush + rebuild in ONE netlink transaction. The previous flush-then-add
+	# sequence ran a zero-rule window every 5s sync in which mihomo's own
+	# replies re-hit the catch-all redirect and locally originated connections
+	# leaked past the exemption rules.
+	"$NFT" -f - <<EOF
+table inet $TABLE {
+	chain output_tcp {
+		flush
+		meta mark $CORE_MARK accept
+		# Every reply to an inbound connection bypasses REDIRECT, including SSH/LuCI
+		# sessions to a public WAN address. This is stronger than an IP-only guard.
+		ct direction reply accept
+		ip daddr @private_v4 accept
+		ct original ip daddr @private_v4 accept
+		tcp dport 53 accept
+		tcp dport $REDIR_PORT accept
+		tcp dport $TPROXY_PORT accept
+		meta l4proto tcp redirect to :$REDIR_PORT
+	}
+}
+EOF
 }
 
 # Emits nft bypass rules for the prerouting chains.
