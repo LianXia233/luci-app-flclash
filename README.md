@@ -24,7 +24,7 @@ FlClash 的 OpenWrt 移植：把 **mihomo 内核**、**Rust IPC host**、**Rust/
 - **订阅导入**：Clash YAML、base64 节点列表，以及分享链接 `ss / ssr / vmess / vless / trojan / hysteria (v1) / hysteria2 / hy2 / tuic / anytls`。
 - **配置管理**：订阅更新、编辑（名称 / URL / 自动更新间隔）、流量与到期展示、一键应用。
 - **代理与连接**：代理组 / 节点测速与切换、连接列表与关闭、规则查看、日志采样。
-- **DNS 进阶**：fake-ip / redir-host / mixed、DoH / DoT / bootstrap、fallback 链、代理节点/直连专用 nameserver、fallback-filter（geoip / ipcidr / domain）、分域名 `nameserver-policy`、DNS 查询与缓存刷新。基础设置页改动不会清空进阶字段。
+- **DNS 进阶**：fake-ip / redir-host / mixed、DoH / DoT / bootstrap、fallback 链、代理节点/直连专用 nameserver、fallback-filter（geoip / ipcidr / domain）、分域名 `nameserver-policy`、DNS 查询与缓存刷新。基础设置页改动不会清空进阶字段。节点域名解析自动适配：订阅下发了 DNS 时优先用机场自己的 DoH/DoT（原样透传，含私有端点与 skip-cert-verify 参数）解析节点域名；未下发时回落国内 DoH/DoT（223.5.5.5 / doh.pub / 120.53.53.53），`mixin.yaml` 仍可覆盖。
 - **访问控制**：局域网客户端全部 / 白名单 / 黑名单（IP·CIDR·MAC），目标网段与端口排除，路由器自身出站接管开关；保存即重建 nft / iptables 规则。
 - **配置混入与校验**：`mixin.yaml` 深合并（映射递归、规则前置、`null` 删键），应用前结构校验（端口/枚举/引用完整性），订阅原始 YAML 可直接编辑并按需重应用。
 - **备份与恢复**：内置快照（配置 + 订阅 + 混入），保留最近 12 份，恢复前自动留底、校验后原子替换；支持下载与上传恢复。
