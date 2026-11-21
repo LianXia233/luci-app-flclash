@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-flclash
-PKG_VERSION:=1.5.0
+PKG_VERSION:=1.5.1
 PKG_RELEASE:=1
 
 PKG_MAINTAINER:=FlClash WebUI
@@ -194,11 +194,11 @@ define Package/luci-app-flclash/postinst
 			inc_added=1
 		fi
 		if [ -n "$$inc" ]; then
-			uci -q set "firewall.$$inc.enabled='1'"
-			uci -q set "firewall.$$inc.type='nftables'"
-			uci -q set "firewall.$$inc.path='/var/run/flclash/fw4-input.nft'"
-			uci -q set "firewall.$$inc.position='chain-prepend'"
-			uci -q set "firewall.$$inc.chain='input'"
+			uci -q set "firewall.$$inc.enabled=1"
+			uci -q set "firewall.$$inc.type=nftables"
+			uci -q set "firewall.$$inc.path=/var/run/flclash/fw4-input.nft"
+			uci -q set "firewall.$$inc.position=chain-prepend"
+			uci -q set "firewall.$$inc.chain=input"
 			uci -q commit firewall 2>/dev/null
 			mkdir -p /var/run/flclash 2>/dev/null
 			chmod 0700 /var/run/flclash 2>/dev/null

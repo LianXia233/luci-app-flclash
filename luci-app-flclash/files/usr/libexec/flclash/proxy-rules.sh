@@ -301,7 +301,7 @@ wait_tun() {
 commit_config() {
 	local tmp="$1"
 	[ -s "$tmp" ] || { rm -f "$tmp"; return 1; }
-	sync
+	command sync
 	mv -f "$tmp" "$CFG" || { rm -f "$tmp"; return 1; }
 	chmod 0600 "$CFG" 2>/dev/null
 	return 0
@@ -753,10 +753,20 @@ fw4_legacy_cleanup() {
 
 fw4_reload() {
 	if command -v fw4 >/dev/null 2>&1; then
-		fw4 reload >/dev/null 2>&1 && return 0
+		if [ -f /var/run/fw4.state ]; then
+			fw4 reload >/dev/null 2>&1 && return 0
+		fi
+		# A missing /var/run/fw4.state makes `fw4 reload` refuse to run even
+		# though table inet fw4 exists. Rebuild once via restart so the include
+		# (and therefore the WAN guard) is actually applied.
+		logger -t flclash-proxy "fw4 state missing or reload failed; running fw4 restart"
+		fw4 restart >/dev/null 2>&1 && return 0
 	fi
-	[ -x /etc/init.d/firewall ] && /etc/init.d/firewall reload >/dev/null 2>&1
-	return 0
+	if [ -x /etc/init.d/firewall ]; then
+		/etc/init.d/firewall restart >/dev/null 2>&1 && return 0
+	fi
+	logger -t flclash-proxy "ERROR: could not reload fw4; WAN proxy guard may be missing"
+	return 1
 }
 
 # Renders the include. Returns 0 when the content changed (caller reloads).
@@ -844,16 +854,25 @@ ipv6_intercept_enabled() {
 	return 0
 }
 
+# BusyBox grep -E rejects a literal `{` in `( {)?`; use fixed strings so both
+# nft print forms (`iifname "br-lan"` and `iifname { "br-lan" }`) match.
+lan_chain_match() {
+	local chain="$1"
+	nft list chain inet "$TABLE" "$chain" 2>/dev/null | grep -Fq "iifname { \"$LAN_IF\"" && return 0
+	nft list chain inet "$TABLE" "$chain" 2>/dev/null | grep -Fq "iifname \"$LAN_IF\"" && return 0
+	return 1
+}
+
 nft_lan_ready() {
 	[ "$(cat "$LAN_SIG" 2>/dev/null)" = "$LAN_SIG_VALUE" ] || return 1
 	if [ "$PROXY_MODE" = "tproxy" ]; then
-		nft list chain inet "$TABLE" prerouting_tcp_tproxy 2>/dev/null | grep -Eq 'iifname( {)? "'$LAN_IF'"' || return 1
+		lan_chain_match prerouting_tcp_tproxy || return 1
 		nft list chain inet "$TABLE" prerouting_tcp_tproxy 2>/dev/null | grep -q 'tproxy ip to 127.0.0.1:'"$TPROXY_PORT" || return 1
 	else
-		nft list chain inet "$TABLE" prerouting_tcp 2>/dev/null | grep -Eq 'iifname( {)? "'$LAN_IF'"' || return 1
+		lan_chain_match prerouting_tcp || return 1
 		nft list chain inet "$TABLE" prerouting_tcp 2>/dev/null | grep -q 'redirect to :'"$REDIR_PORT" || return 1
 	fi
-	nft list chain inet "$TABLE" prerouting_udp 2>/dev/null | grep -Eq 'iifname( {)? "'$LAN_IF'"' || return 1
+	lan_chain_match prerouting_udp || return 1
 	nft list chain inet "$TABLE" prerouting_udp 2>/dev/null | grep -q 'tproxy ip to 127.0.0.1:'"$TPROXY_PORT" || return 1
 	if ipv6_intercept_enabled; then
 		nft list chain inet "$TABLE" prerouting_udp 2>/dev/null | grep -q 'ip6 daddr' || return 1
@@ -880,20 +899,19 @@ table inet $TABLE {
 	chain output_tcp { type nat hook output priority dstnat - 10; policy accept; }
 }
 EOF
-	# flush + rebuild in ONE netlink transaction. The previous flush-then-add
-	# sequence ran a zero-rule window every 5s sync in which mihomo's own
-	# replies re-hit the catch-all redirect and locally originated connections
-	# leaked past the exemption rules.
+	# `flush` is not a chain-body statement in current nft; flush the chain as
+	# a separate command, then re-add its rules. This only runs when the output
+	# chain is missing/changed, not on the 5s sync path.
 	local v6_rules=""
 	if [ "$IPV6_MODE" = "proxy" ]; then
 		v6_rules="ip6 daddr @private_v6 accept
 		ct original ip6 daddr @private_v6 accept
 		ip6 daddr != @private_v6 meta l4proto tcp redirect to :$REDIR_PORT"
 	fi
+	"$NFT" flush chain inet "$TABLE" output_tcp 2>/dev/null
 	"$NFT" -f - <<EOF
 table inet $TABLE {
 	chain output_tcp {
-		flush
 		meta mark $CORE_MARK accept
 		# Every reply to an inbound connection bypasses REDIRECT, including SSH/LuCI
 		# sessions to a public WAN address. This is stronger than an IP-only guard.
@@ -1036,10 +1054,27 @@ ensure_kernel_modules() {
 	done
 }
 
+# `ip rule add` always appends; a rebuild used to leave one duplicate per
+# sync/restart while nft_off removed only one. Clear all copies first so the
+# invariant is exactly one IPv4 (and one IPv6) fwmark rule.
+clear_fwmark_rules() {
+	local n=0
+	while ip rule del fwmark "$FWMARK" table 100 2>/dev/null; do
+		n=$((n + 1))
+		[ "$n" -ge 64 ] && break
+	done
+	n=0
+	while ip -6 rule del fwmark "$FWMARK" table 100 2>/dev/null; do
+		n=$((n + 1))
+		[ "$n" -ge 64 ] && break
+	done
+}
+
 nft_on() {
 	ensure_kernel_modules
 	if ! nft_lan_ready; then
 		nft delete table inet "$TABLE" 2>/dev/null
+		clear_fwmark_rules
 		ip rule add fwmark "$FWMARK" table 100 2>/dev/null
 		ip route add local default dev lo table 100 2>/dev/null
 		[ "$IPV6_MODE" = "proxy" ] && {
@@ -1098,9 +1133,8 @@ EOF
 
 nft_off() {
 	nft delete table inet "$TABLE" 2>/dev/null
-	ip rule del fwmark "$FWMARK" table 100 2>/dev/null
+	clear_fwmark_rules
 	ip route del local default dev lo table 100 2>/dev/null
-	ip -6 rule del fwmark "$FWMARK" table 100 2>/dev/null
 	ip -6 route del local default dev lo table 100 2>/dev/null
 	rm -f "$LAN_SIG"
 	fw4_input_off
@@ -1140,7 +1174,7 @@ offload_guard() {
 	for opt in flow_offloading flow_offloading_hw; do
 		cur=$(uci -q get "firewall.@defaults[0].$opt" 2>/dev/null)
 		if [ -n "$cur" ] && [ "$cur" != "0" ]; then
-			uci -q set "firewall.@defaults[0].$opt='0'" && changed=1
+			uci -q set "firewall.@defaults[0].$opt=0" && changed=1
 		fi
 	done
 	if [ "$changed" = "1" ]; then
@@ -1343,10 +1377,18 @@ case "$1" in
 			LOCKFILE=/var/run/flclash-proxy.lock
 			exec 9>"$LOCKFILE" || exit 1
 			n=0
+			limit=10
+			# A user-initiated start must not silently become a no-op because
+			# the API's 5s reconciler happened to hold the lock.
+			[ "$1" = "start" ] && limit=30
 			while ! flock -n 9; do
 				n=$((n+1))
-				if [ "$n" -ge 10 ]; then
+				if [ "$n" -ge "$limit" ]; then
 					logger -t flclash-proxy "another operation holds $LOCKFILE; skipping $1"
+					if [ "$1" = "start" ]; then
+						echo "another operation holds $LOCKFILE; start aborted" >&2
+						exit 1
+					fi
 					exit 0
 				fi
 				sleep 1

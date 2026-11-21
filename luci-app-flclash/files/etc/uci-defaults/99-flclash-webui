@@ -91,11 +91,11 @@ else
 	inc=flclash
 fi
 if [ -n "$inc" ]; then
-	uci set "firewall.$inc.enabled='1'"
-	uci set "firewall.$inc.type='nftables'"
-	uci set "firewall.$inc.path='/var/run/flclash/fw4-input.nft'"
-	uci set "firewall.$inc.position='chain-prepend'"
-	uci set "firewall.$inc.chain='input'"
+	uci set "firewall.$inc.enabled=1"
+	uci set "firewall.$inc.type=nftables"
+	uci set "firewall.$inc.path=/var/run/flclash/fw4-input.nft"
+	uci set "firewall.$inc.position=chain-prepend"
+	uci set "firewall.$inc.chain=input"
 	uci commit firewall
 	# fw4 warns on a missing include at boot; an empty file is harmless until
 	# proxy-rules renders the real guard.
