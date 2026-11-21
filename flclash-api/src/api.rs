@@ -1735,18 +1735,24 @@ pub async fn backup_create(State(st): State<Arc<AppState>>, body: Bytes) -> Resp
 /// GET /backup/download/{name} → the stored snapshot as a gzip tarball.
 pub async fn backup_download(State(st): State<Arc<AppState>>, Path(name): Path<String>) -> Response {
     match crate::backup::read_snapshot(&st, &name) {
-        Ok(bytes) => (
-            [
-                (axum::http::header::CACHE_CONTROL, "no-store"),
-                (axum::http::header::CONTENT_TYPE, "application/gzip"),
-                (
-                    axum::http::header::CONTENT_DISPOSITION,
-                    &format!("attachment; filename=\"{}\"", name),
-                ),
-            ],
-            bytes,
-        )
-            .into_response(),
+        Ok(bytes) => {
+            // Snapshot names are program-generated, but the path segment is
+            // user-controlled: strip quotes/CR/LF so the header cannot be
+            // broken out of or split.
+            let safe_name = name.replace(['"', '\r', '\n'], "");
+            (
+                [
+                    (axum::http::header::CACHE_CONTROL, "no-store"),
+                    (axum::http::header::CONTENT_TYPE, "application/gzip"),
+                    (
+                        axum::http::header::CONTENT_DISPOSITION,
+                        &format!("attachment; filename=\"{}\"", safe_name),
+                    ),
+                ],
+                bytes,
+            )
+                .into_response()
+        }
         Err(err) => fail_json(StatusCode::NOT_FOUND, &err),
     }
 }
