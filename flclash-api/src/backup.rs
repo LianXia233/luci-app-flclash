@@ -24,7 +24,10 @@ pub const MAX_ENTRY_BYTES: usize = 8 << 20;
 const KEEP_SNAPSHOTS: usize = 12;
 
 /// Files that may be restored. Anything else is rejected by name.
-const ALLOWED: [&str; 4] = ["config.yaml", "profiles.json", "mixin.yaml", "index.json"];
+/// uci-flclash.txt is the UCI section export collected by snapshot(); without
+/// it on this list every real-device snapshot failed to restore, because
+/// collect() always packs the export on hosts where `uci` exists.
+const ALLOWED: [&str; 5] = ["config.yaml", "profiles.json", "mixin.yaml", "index.json", "uci-flclash.txt"];
 const ALLOWED_PREFIXES: [&str; 1] = ["profiles/"];
 
 fn is_allowed(name: &str) -> bool {
@@ -366,9 +369,40 @@ pub fn restore(st: &crate::state::AppState, data: &[u8]) -> Result<Value, String
         restored.push(name.clone());
     }
     let _ = std::fs::remove_dir_all(&staging);
+
+    // Re-import the UCI half of the snapshot (ACL lists, ports, core choice).
+    // Only a genuine flclash export is accepted, and `uci import flclash`
+    // cannot touch any other package regardless of the payload.
+    let mut uci_restored = false;
+    if let Some((_, body)) = entries.iter().find(|(name, _)| name == "uci-flclash.txt") {
+        if body.starts_with(b"package flclash") {
+            let import = std::process::Command::new("uci")
+                .args(["import", "flclash"])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+            if let Ok(mut child) = import {
+                if let Some(stdin) = child.stdin.as_mut() {
+                    let _ = stdin.write_all(body);
+                }
+                let ok = child.wait().map(|s| s.success()).unwrap_or(false);
+                if ok {
+                    let _ = std::process::Command::new("uci")
+                        .args(["commit", "flclash"])
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status();
+                    uci_restored = true;
+                }
+            }
+        }
+    }
+
     Ok(json!({
         "ok": true,
         "files": restored,
+        "uciRestored": uci_restored,
         "bytes": data.len(),
     }))
 }
