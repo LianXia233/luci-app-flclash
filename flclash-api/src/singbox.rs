@@ -611,31 +611,59 @@ fn is_ip(s: &str) -> bool {
     s.parse::<std::net::IpAddr>().is_ok()
 }
 
+/// Splits "host:port" (bracketed IPv6 aware) into (host, port). A bare IPv6
+/// literal without brackets is returned untouched: its colon prefix can never
+/// parse as a port, so the host-side colon test keeps it whole.
+fn split_host_port_str(s: &str) -> (String, Option<u16>) {
+    let s = s.trim();
+    if let Some(rest) = s.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            let host = rest[..end].to_string();
+            let port = rest[end + 1..]
+                .strip_prefix(':')
+                .and_then(|p| p.parse::<u16>().ok());
+            return (host, port);
+        }
+    }
+    if let Some(i) = s.rfind(':') {
+        if !s[..i].contains(':') {
+            if let Ok(port) = s[i + 1..].parse::<u16>() {
+                return (s[..i].to_string(), Some(port));
+            }
+        }
+    }
+    (s.to_string(), None)
+}
+
 /// Parse a Clash DNS address string into sing-box 1.14's typed server object.
-/// 1.14 removed the legacy `address` field in favour of `type` + `server`.
+/// 1.14 removed the legacy `address` field in favour of `type` + `server`
+/// (+ `server_port`): an embedded ":port" used to be left inside `server`,
+/// which sing-box reads as a literal hostname and the upstream never resolves.
 fn dns_server(addr: &str) -> J {
     let addr = addr.trim();
-    if let Some(rest) = addr.strip_prefix("https://") {
-        return json!({"type": "https", "server": rest.split('/').next().unwrap_or(rest)});
+    let (typ, hostpart) = if let Some(rest) = addr.strip_prefix("https://") {
+        ("https", rest.split('/').next().unwrap_or(rest))
+    } else if let Some(rest) = addr.strip_prefix("h3://") {
+        ("h3", rest.split('/').next().unwrap_or(rest))
+    } else if let Some(rest) = addr.strip_prefix("tls://") {
+        ("tls", rest)
+    } else if let Some(rest) = addr.strip_prefix("tcp://") {
+        ("tcp", rest)
+    } else if let Some(rest) = addr.strip_prefix("quic://") {
+        ("quic", rest)
+    } else if let Some(rest) = addr.strip_prefix("udp://") {
+        ("udp", rest)
+    } else {
+        // Bare IP / hostname defaults to UDP. Addresses with an embedded path
+        // (legacy DoH without scheme) are reduced to their host.
+        ("udp", addr.split('/').next().unwrap_or(addr))
+    };
+    let (host, port) = split_host_port_str(hostpart);
+    let mut s = json!({"type": typ, "server": host});
+    if let Some(p) = port {
+        s["server_port"] = json!(p);
     }
-    if let Some(rest) = addr.strip_prefix("h3://") {
-        return json!({"type": "h3", "server": rest.split('/').next().unwrap_or(rest)});
-    }
-    if let Some(rest) = addr.strip_prefix("tls://") {
-        return json!({"type": "tls", "server": rest});
-    }
-    if let Some(rest) = addr.strip_prefix("tcp://") {
-        return json!({"type": "tcp", "server": rest});
-    }
-    if let Some(rest) = addr.strip_prefix("quic://") {
-        return json!({"type": "quic", "server": rest});
-    }
-    if let Some(rest) = addr.strip_prefix("udp://") {
-        return json!({"type": "udp", "server": rest});
-    }
-    // Bare IP / hostname defaults to UDP. Addresses with an embedded path
-    // (legacy DoH without scheme) are reduced to their host.
-    json!({"type": "udp", "server": addr.split('/').next().unwrap_or(addr)})
+    s
 }
 
 fn dns_object(y: &Y, group_names: &[String]) -> Option<J> {
@@ -654,21 +682,55 @@ fn dns_object(y: &Y, group_names: &[String]) -> Option<J> {
     let mut servers: Vec<J> = Vec::new();
     let mut direct_tags: Vec<String> = Vec::new();
     let nameservers = ystrings(dns, "nameserver");
-    // The first plain-IP nameserver is the bootstrap resolver for DoH/DoT hosts.
-    let bootstrap_tag = nameservers
-        .iter()
-        .enumerate()
-        .find(|(_, a)| is_ip(a.trim_start_matches("udp://").trim_start_matches("tls://")))
-        .map(|(i, _)| format!("dns-direct-{}", i))
-        .unwrap_or_else(|| "dns-direct-0".to_string());
+
+    // sing-box resolves the host of every DNS server whose `server` field is a
+    // domain through `domain_resolver`; a hostname bootstrap pointing at
+    // itself can never resolve. Clash's `default-nameserver` is exactly a
+    // plain-IP bootstrap list, so prefer it, then any plain-IP nameserver,
+    // and only inject a well-known IP when the subscription offers neither
+    // (otherwise all-hostname DoH upstreams fail validation at startup).
+    let mut bootstrap_tag = String::new();
+    for (idx, addr) in ystrings(dns, "default-nameserver").iter().enumerate() {
+        let bare = addr.trim().trim_start_matches("udp://").trim_start_matches("tls://");
+        let (host, port) = split_host_port_str(bare);
+        if !is_ip(&host) {
+            continue;
+        }
+        let tag = format!("dns-bootstrap-{}", idx);
+        let mut s = json!({"type": "udp", "server": host});
+        if let Some(p) = port {
+            s["server_port"] = json!(p);
+        }
+        s["tag"] = json!(tag);
+        servers.push(s);
+        if bootstrap_tag.is_empty() {
+            bootstrap_tag = tag;
+        }
+    }
+    if bootstrap_tag.is_empty() {
+        let plain_ip = nameservers.iter().enumerate().find(|(_, a)| {
+            let bare = a.trim().trim_start_matches("udp://").trim_start_matches("tls://");
+            let (host, _) = split_host_port_str(bare);
+            is_ip(&host)
+        });
+        match plain_ip {
+            Some((i, _)) => bootstrap_tag = format!("dns-direct-{}", i),
+            None => {
+                bootstrap_tag = "dns-bootstrap".to_string();
+                let mut s = json!({"type": "udp", "server": "223.5.5.5"});
+                s["tag"] = json!(bootstrap_tag);
+                servers.push(s);
+            }
+        }
+    }
 
     for (idx, addr) in nameservers.into_iter().enumerate() {
         let tag = format!("dns-direct-{}", idx);
         direct_tags.push(tag.clone());
         let mut s = dns_server(&addr);
         s["tag"] = json!(tag);
-        let server_host = s.get("server").and_then(|v| v.as_str()).unwrap_or("");
-        if !is_ip(server_host) && tag != bootstrap_tag {
+        let server_host = s.get("server").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if !is_ip(&server_host) {
             s["domain_resolver"] = json!(bootstrap_tag);
         }
         servers.push(s);
@@ -678,8 +740,8 @@ fn dns_object(y: &Y, group_names: &[String]) -> Option<J> {
         let tag = format!("dns-remote-{}", idx);
         let mut s = dns_server(&addr);
         s["tag"] = json!(tag);
-        let server_host = s.get("server").and_then(|v| v.as_str()).unwrap_or("");
-        if !is_ip(server_host) {
+        let server_host = s.get("server").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if !is_ip(&server_host) {
             s["domain_resolver"] = json!(bootstrap_tag);
         }
         if let Some(d) = &detour {
@@ -849,17 +911,22 @@ pub fn convert(yaml: &str) -> Result<String, String> {
     })];
     // proxy-rules.sh redirects LAN TCP to 7893 and TPROXYs UDP to 7894.
     // Emit matching inbounds so the transparent takeover also works under
-    // sing-box (mihomo exposes redir-port/tproxy-port natively).
+    // sing-box (mihomo exposes redir-port/tproxy-port natively). Both must
+    // listen on the wildcard: prerouting REDIRECT delivers to the incoming
+    // interface's address (192.168.x.1) and TPROXY's transparent socket
+    // lookup needs to match non-loopback original destinations, so a
+    // 127.0.0.1 bind silently refuses every LAN connection. The fw4 WAN
+    // guard keeps the ports LAN-only.
     inbounds.push(json!({
         "type": "redirect",
         "tag": "redir-in",
-        "listen": "127.0.0.1",
+        "listen": "0.0.0.0",
         "listen_port": 7893,
     }));
     inbounds.push(json!({
         "type": "tproxy",
         "tag": "tproxy-in",
-        "listen": "127.0.0.1",
+        "listen": "0.0.0.0",
         "listen_port": 7894,
     }));
     if let Some(tun) = tun_inbound(&doc) {
@@ -956,7 +1023,16 @@ pub fn convert(yaml: &str) -> Result<String, String> {
     if let Some(dns) = dns {
         cfg["dns"] = dns;
         // 1.12+ requires an explicit domain resolver for outbound dialing.
-        cfg["route"]["default_domain_resolver"] = json!("dns-direct-0");
+        // Point it at the first plain-IP server: dns-direct-0 may itself be
+        // a hostname upstream, which would resolve through itself.
+        let resolver = cfg["dns"]["servers"].as_array()
+            .and_then(|servers| {
+                servers.iter()
+                    .find(|s| s.get("server").and_then(|v| v.as_str()).map(|h| is_ip(h)).unwrap_or(false))
+                    .and_then(|s| s.get("tag").and_then(|v| v.as_str()).map(String::from))
+            })
+            .unwrap_or_else(|| "dns-direct-0".to_string());
+        cfg["route"]["default_domain_resolver"] = json!(resolver);
     }
 
     serde_json::to_string_pretty(&cfg).map_err(|e| format!("JSON 序列化失败: {}", e))
@@ -1054,5 +1130,52 @@ rules:
     #[test]
     fn rejects_non_mapping() {
         assert!(convert("- a\n- b\n").is_err());
+    }
+
+    #[test]
+    fn dns_server_splits_embedded_ports() {
+        let s = dns_server("https://dns.example.com:8443/dns-query");
+        assert_eq!(s["server"], "dns.example.com");
+        assert_eq!(s["server_port"], 8443);
+        let s = dns_server("tls://8.8.8.8:853");
+        assert_eq!(s["server"], "8.8.8.8");
+        assert_eq!(s["server_port"], 853);
+        let s = dns_server("223.5.5.5");
+        assert_eq!(s["server"], "223.5.5.5");
+        assert!(s.get("server_port").is_none());
+        // Bare IPv6 without brackets must survive as the host.
+        let s = dns_server("2001:db8::1");
+        assert_eq!(s["server"], "2001:db8::1");
+    }
+
+    #[test]
+    fn transparent_inbounds_listen_on_wildcard() {
+        let json = convert(YAML).unwrap();
+        let v: J = serde_json::from_str(&json).unwrap();
+        let redir = v["inbounds"].as_array().unwrap().iter().find(|i| i["type"] == "redirect").unwrap();
+        assert_eq!(redir["listen"], "0.0.0.0");
+        let tproxy = v["inbounds"].as_array().unwrap().iter().find(|i| i["type"] == "tproxy").unwrap();
+        assert_eq!(tproxy["listen"], "0.0.0.0");
+    }
+
+    #[test]
+    fn all_hostname_upstreams_still_get_a_resolver() {
+        // No plain-IP nameserver and no default-nameserver: the bootstrap
+        // fallback must appear, and every hostname upstream must point at it
+        // (previously dns-direct-0 was final AND its own resolver).
+        let yaml = "mixed-port: 7892\ndns:\n  enable: true\n  enhanced-mode: fake-ip\n  nameserver:\n    - https://doh.example.com/dns-query\n    - https://alt.example.com:5353/dns-query\n";
+        let json = convert(yaml).unwrap();
+        let v: J = serde_json::from_str(&json).unwrap();
+        let servers = v["dns"]["servers"].as_array().unwrap();
+        let bootstrap = servers.iter().find(|s| s["tag"] == "dns-bootstrap").unwrap();
+        assert_eq!(bootstrap["server"], "223.5.5.5");
+        for s in servers.iter().filter(|s| s["tag"] != "dns-bootstrap" && s.get("server").is_some()) {
+            assert_eq!(s["domain_resolver"], "dns-bootstrap");
+        }
+        assert_eq!(v["route"]["default_domain_resolver"], "dns-bootstrap");
+        // A port embedded in the DoH URL lands in server_port, not in server.
+        let alt = servers.iter().find(|s| s["tag"] == "dns-direct-1").unwrap();
+        assert_eq!(alt["server"], "alt.example.com");
+        assert_eq!(alt["server_port"], 5353);
     }
 }
