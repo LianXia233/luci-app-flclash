@@ -4,7 +4,7 @@
 
 **单包 APK · mihomo + sing-box 双内核 · Rust/Tokio API 桥 · HTML5 WebUI**
 
-<a href="https://github.com/LianXia233/luci-app-flclash/releases"><img alt="version" height="20" src="https://img.shields.io/badge/version-1.5.3-0f766e?style=flat-square"></a>
+<a href="https://github.com/LianXia233/luci-app-flclash/releases"><img alt="version" height="20" src="https://img.shields.io/badge/version-1.5.4-0f766e?style=flat-square"></a>
 <a href="LICENSE"><img alt="license" height="20" src="https://img.shields.io/badge/license-GPL--3.0--only-0f766e?style=flat-square"></a>
 <a href="#兼容性与限制"><img alt="arch" height="20" src="https://img.shields.io/badge/arch-aarch64__cortex--a53%20%7C%20x86__64-0891b2?style=flat-square"></a>
 <a href="https://github.com/LianXia233/luci-app-flclash/actions/workflows/build-apk.yml"><img alt="CI" height="20" src="https://img.shields.io/github/actions/workflow/status/LianXia233/luci-app-flclash/build-apk.yml?style=flat-square&label=CI"></a>
@@ -155,9 +155,23 @@ sync() ─────┼─ config.tun.enable=true 且 TUN 在线 ──► TUN
 - **显示对齐**：IP 资料与运行时长统一字号与基线，长名称自动换行不省略（桌面与手机一致）。
 - HTTP(S) 全部为 Rust 原生出站（reqwest + rustls/webpki-roots），客户端强制 IPv4 绑定，确保采样跟随 v4 接管路径。
 
+## DNS 国内外分流
+
+`enforce_invariants` 在**每次订阅导入/更新/启用**后重建 `dns:` 与规则头，用户选择保存在 `flclash.dns` UCI，不会被机场配置覆盖：
+
+| 流量 | 解析 | 规则 |
+| --- | --- | --- |
+| 国内域名（`geosite:cn`、`geosite:private`） | `domestic_dns`（阿里/腾讯 DoH、DNSPod DoT） | `GEOSITE,cn,DIRECT` 置于规则首位，先于订阅中的宽泛代理规则 |
+| 国外域名（`geosite:geolocation-!cn`） | `foreign_dns`（Cloudflare/Google DoH） | 落到订阅的代理组；`MATCH` 为 `DIRECT`/`REJECT` 时改指向手动选择组 |
+| 机场节点域名 | 机场下发的 `proxy-server-nameserver` 优先；未下发才用 `proxy_dns`（默认回退国内列表） | 避免解析节点域名时套代理造成循环 |
+| 未知域名 | 国内 DNS 先解析，`fallback-filter`（`geoip: CN`）判定为境外结果时再走国外 DNS | — |
+| 纯 IP 连接 | — | `GEOIP,CN,DIRECT`、`GEOIP,PRIVATE,DIRECT`（`no-resolve`） |
+
+WebUI「设置」页提供国内 DoH/DoT 预设与自定义文本框，「DNS 进阶」页维护国外 fallback、`direct-nameserver`/`proxy-server-nameserver`、`fallback-filter` 与 `nameserver-policy`；所有字段都会同步回 UCI，重启与订阅更新后保持。`flclash.dns.split=0` 可关闭整套分流，完全采用订阅/自定义 DNS。
+
 ## 配置项
 
-`/etc/config/flclash` 分为 `main`、`proxy`、`api`、`webui` 四段。首次启动时 `99-flclash-webui` 只补齐缺失键，不会覆盖已有配置或写入凭据。
+`/etc/config/flclash` 分为 `main`、`proxy`、`dns`、`api`、`webui` 段。首次启动时 `99-flclash-webui` 只补齐缺失键，不会覆盖已有配置或写入凭据。
 
 <details>
 <summary><b>完整 UCI 配置</b></summary>
@@ -187,6 +201,11 @@ sync() ─────┼─ config.tun.enable=true 且 TUN 在线 ──► TUN
 | `proxy` | `bypass_cidr` / `bypass_port` | 空 | 不接管的目标网段 / 目的端口 |
 | `proxy` | `local_takeover` | `1` | 路由器自身出站是否也送入内核 |
 | `proxy` | `saved_*` / `dns_filter_managed` / `offload_saved` / `bridger_saved` | 空 | 停止接管时恢复 dnsmasq / 硬件卸载 / bridger 原状用 |
+| `dns` | `split` | `1` | 国内外 DNS 分流总开关（`0` 时完全保留订阅/自定义 `dns:` 块） |
+| `dns` | `domestic_dns` | 阿里/腾讯 DoH、DNSPod DoT | 国内域名与直连域名解析，WebUI 预设写回此处 |
+| `dns` | `foreign_dns` | Cloudflare/Google DoH | 国外域名（`geosite:geolocation-!cn`）解析 |
+| `dns` | `bootstrap_dns` | `223.5.5.5`、`119.29.29.29` | 解析 DoH/DoT 主机名 |
+| `dns` | `direct_dns` / `proxy_dns` | 空（回退国内列表） | WebUI 进阶页覆盖 `direct-nameserver` / `proxy-server-nameserver` |
 | `webui` | `enabled` | `1` | WebUI 开关 |
 | `webui` | `webui_path` | `/flclash/` | WebUI 路径 |
 | `webui` | `webui_port` | `9098` | WebUI 端口（与 `api.listen` 一致） |

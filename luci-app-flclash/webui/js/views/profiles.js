@@ -13,6 +13,8 @@
     root.className = 'view page';
     root.innerHTML =
       '<div class="page-toolbar"><div class="grow muted" data-role="summary">—</div>' +
+        '<button class="btn" data-act="update-all" type="button">全部更新</button>' +
+        '<button class="btn" data-act="import-local" type="button">本地导入</button>' +
         '<button class="btn is-primary" data-act="import" type="button">' + icon('plus', 16) + '导入订阅</button></div>' +
       '<div class="profile-list" data-role="list"></div>';
 
@@ -41,11 +43,12 @@
       }
       list.innerHTML = items.map(function (item) {
         const share = Number(item.usedShare) || 0;
+        const isLocal = item.type === 'local' || item.type === 'file';
         return '<div class="profile-item' + (item.active ? ' is-active' : '') + '">' +
           '<div class="profile-main">' +
             '<div class="row"><span class="profile-name">' + ui.esc(item.name) + '</span>' +
               (item.active ? '<span class="chip is-ok"><i class="chip-dot"></i>使用中</span>' : '') +
-              '<span class="chip">' + (item.type === 'file' ? '本地' : '订阅') + '</span>' +
+              '<span class="chip">' + (isLocal ? '本地' : '订阅') + '</span>' +
               (item.interval >= 60 ? '<span class="chip chip-plain">自动 ' + Math.round(item.interval / 60) + ' 分钟</span>' : '') + '</div>' +
             '<div class="profile-meta"><span>更新于 ' + ui.esc(item.updatedAt || '—') + '</span>' +
               (item.expireDays ? '<span>剩余 ' + ui.esc(item.expireDays) + ' 天</span>' : '') +
@@ -55,7 +58,7 @@
               '<svg class="wave" viewBox="0 0 300 12" preserveAspectRatio="none">' + ui.wave(share, 300, 12) + '</svg></div>' +
           '</div>' +
           '<div class="profile-actions">' +
-            '<button class="icon-button" data-update="' + ui.esc(item.id) + '" type="button" title="更新订阅">' + icon('sync', 16) + '</button>' +
+            (isLocal ? '' : '<button class="icon-button" data-update="' + ui.esc(item.id) + '" type="button" title="更新订阅">' + icon('sync', 16) + '</button>') +
             '<button class="icon-button" data-edit="' + ui.esc(item.id) + '" type="button" title="编辑">' + icon('edit', 16) + '</button>' +
             '<button class="icon-button" data-yaml="' + ui.esc(item.id) + '" type="button" title="编辑 YAML">' + icon('file', 16) + '</button>' +
             (item.active ? '' : '<button class="btn" data-apply="' + ui.esc(item.id) + '" type="button">启用</button>') +
@@ -83,6 +86,9 @@
           ui.openSheet('编辑配置',
             '<div class="field"><label>名称</label><input id="edit-name" class="input" type="text" value="' + ui.esc(item.name || '') + '"></div>' +
             '<div class="field"><label>订阅链接</label><input id="edit-url" class="input" type="url" value="' + ui.esc(item.url || '') + '" placeholder="https://…"></div>' +
+            '<div class="field"><label>User-Agent（可选，机场按 UA 下发配置）</label><input id="edit-ua" class="input" type="text" value="' + ui.esc(item.userAgent || '') + '" placeholder="clash.meta/v1.19.0"></div>' +
+            '<div class="field"><label>下载超时（秒）</label><input id="edit-timeout" class="input" type="number" min="5" max="300" value="' + (item.timeout || 45) + '"></div>' +
+            '<div class="field"><label>失败重试次数</label><input id="edit-retry" class="input" type="number" min="0" max="5" value="' + (typeof item.retry === 'number' ? item.retry : 1) + '"></div>' +
             '<div class="field"><label>自动更新(分钟,0 关闭)</label><input id="edit-interval" class="input" type="number" min="0" step="5" value="' + Math.round((item.interval || 0) / 60) + '"></div>' +
             '<p class="sheet-note">自动更新按订阅间隔重新下载并转换;启用中的配置会随后自动重载内核。</p>' +
             '<div class="sheet-actions"><button class="btn" data-cancel type="button">取消</button>' +
@@ -93,7 +99,15 @@
                 const name = ui.$('#edit-name', body).value.trim();
                 const url = ui.$('#edit-url', body).value.trim();
                 const minutes = Number(ui.$('#edit-interval', body).value) || 0;
-                api.editProfile(id, { name: name, url: url, interval: minutes * 60 })
+                const patch = {
+                  name: name,
+                  url: url,
+                  interval: minutes * 60,
+                  userAgent: ui.$('#edit-ua', body).value.trim(),
+                  timeout: Number(ui.$('#edit-timeout', body).value) || 45,
+                  retry: Number(ui.$('#edit-retry', body).value) || 0
+                };
+                api.editProfile(id, patch)
                   .then(function () { helpers.markSaved(); close(); ui.toast('配置已保存', 'ok'); return ctx.reloadProfiles(); })
                   .catch(function (error) { ui.toast('保存失败: ' + error.message, 'error'); });
               });
@@ -173,16 +187,19 @@
       ui.openSheet('导入订阅',
         '<div class="field"><label for="import-url">订阅链接 / 分享链接</label>' +
           '<input id="import-url" class="input" type="url" placeholder="https://… 或 ss:// vmess:// vless:// trojan://" autocomplete="off"></div>' +
+        '<div class="field"><label for="import-ua">User-Agent（可选，机场按 UA 下发配置）</label>' +
+          '<input id="import-ua" class="input" type="text" placeholder="clash.meta/v1.19.0" autocomplete="off"></div>' +
         '<p class="sheet-note">支持 Clash/mihomo YAML、base64 节点列表以及 ss:// ssr:// vmess:// vless:// trojan:// hysteria2:// tuic:// 链接,导入时自动转换为内核配置。</p>' +
         '<div class="sheet-actions"><button class="btn" data-cancel type="button">取消</button>' +
         '<button class="btn is-primary" data-confirm type="button">导入</button></div>',
         function (body, close, helpers) {
           const urlInput = ui.$('#import-url', body);
+          const uaInput = ui.$('#import-ua', body);
           const submit = function () {
             const value = (urlInput.value || '').trim();
             if (!value) { ui.toast('请输入链接', 'error'); urlInput.focus(); return; }
             ui.$('[data-confirm]', body).disabled = true;
-            api.importProfile(value)
+            api.importProfile(value, (uaInput.value || '').trim())
               .then(settle)
               .then(function () {
                 helpers.markSaved();
@@ -201,7 +218,63 @@
         });
     }
 
+    function openImportLocal() {
+      ui.openSheet('本地导入 YAML',
+        '<div class="field"><label for="local-name">名称</label>' +
+          '<input id="local-name" class="input" type="text" placeholder="本地配置" autocomplete="off"></div>' +
+        '<div class="field"><label for="local-text">YAML / 分享链接内容</label>' +
+          '<textarea id="local-text" class="input dns-area editor-area" rows="12" spellcheck="false" placeholder="粘贴 Clash/mihomo YAML 或节点链接列表"></textarea></div>' +
+        '<p class="sheet-note">内容仅保存在路由器本地,不会联网下载;导入后可在列表中启用。</p>' +
+        '<div class="sheet-actions"><button class="btn" data-cancel type="button">取消</button>' +
+        '<button class="btn is-primary" data-confirm type="button">导入</button></div>',
+        function (body, close, helpers) {
+          const nameInput = ui.$('#local-name', body);
+          const textInput = ui.$('#local-text', body);
+          ui.$('[data-cancel]', body).addEventListener('click', close);
+          ui.$('[data-confirm]', body).addEventListener('click', function () {
+            const text = (textInput.value || '').trim();
+            if (!text) { ui.toast('请输入 YAML 内容', 'error'); textInput.focus(); return; }
+            ui.$('[data-confirm]', body).disabled = true;
+            api.importLocalProfile((nameInput.value || '').trim(), text)
+              .then(settle)
+              .then(function () {
+                helpers.markSaved();
+                close();
+                ui.toast('本地配置已导入', 'ok');
+                return ctx.reloadProfiles();
+              })
+              .catch(function (error) {
+                ui.toast('导入失败: ' + error.message, 'error');
+                ui.$('[data-confirm]', body).disabled = false;
+              });
+          });
+        });
+    }
+
+    function updateAll(button) {
+      button.disabled = true;
+      button.classList.add('is-spinning');
+      api.updateAllProfiles()
+        .then(settle)
+        .then(function (task) {
+          const result = (task && task.result) || {};
+          const failed = (result.results || []).filter(function (item) { return !item.ok; }).length;
+          if (typeof result.updated === 'number') {
+            ui.toast(failed
+              ? '更新 ' + (result.updated - failed) + ' 个，失败 ' + failed + ' 个'
+              : '已更新 ' + result.updated + ' 个订阅', failed ? 'error' : 'ok');
+          } else {
+            ui.toast('全部订阅已更新', 'ok');
+          }
+          return ctx.reloadProfiles();
+        })
+        .catch(function (error) { ui.toast('批量更新失败: ' + error.message, 'error'); })
+        .then(function () { button.disabled = false; button.classList.remove('is-spinning'); });
+    }
+
     ui.$('[data-act="import"]', root).addEventListener('click', openImport);
+    ui.$('[data-act="import-local"]', root).addEventListener('click', openImportLocal);
+    ui.$('[data-act="update-all"]', root).addEventListener('click', function () { updateAll(this); });
     api.profiles().then(function (data) { ctx.state.profiles = data; render(); }).catch(function (error) {
       list.innerHTML = ui.empty(error.message, 'info');
     });

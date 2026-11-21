@@ -346,6 +346,21 @@ pub async fn save_config(
     }
     let result = persist_config(&config_path, patch);
     if result.is_ok() {
+        if let Err(err) = persist_dns_uci(patch) {
+            if let Some(previous) = &previous {
+                let _ = write_atomic(&config_path, previous);
+            }
+            return Err(err);
+        }
+        // Re-apply router-owned DNS split/rules after a settings edit so a
+        // basic-page save cannot leave an inconsistent DNS block.
+        if let Ok(text) = std::fs::read_to_string(&config_path) {
+            if let Ok(enforced) = enforce_invariants(&text) {
+                if enforced != text {
+                    let _ = write_atomic(&config_path, enforced.as_bytes());
+                }
+            }
+        }
         if let Err(err) = crate::preflight::validate_config(config_path.clone()).await {
             if let Some(previous) = &previous {
                 let _ = write_atomic(&config_path, previous);
@@ -453,6 +468,68 @@ fn uci_set_key(key: &str, value: &str) -> Result<(), String> {
     }
 }
 
+fn patch_list(value: &Value) -> Vec<String> {
+    match value {
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        Value::String(text) => text
+            .lines()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn uci_set_list_key(key: &str, values: &[String]) -> Result<(), String> {
+    let _ = std::process::Command::new("uci")
+        .args(["-q", "delete", key])
+        .output();
+    for value in values {
+        let out = std::process::Command::new("uci")
+            .args(["add_list", &format!("{key}={value}")])
+            .output()
+            .map_err(|e| format!("uci add_list {key}: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "uci add_list {key}: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// WebUI DNS fields are stored in UCI, not only in the generated config.yaml:
+/// the invariant rebuilds DNS from UCI on every profile apply, so presets and
+/// custom vendors must survive subscription updates.
+fn persist_dns_uci(patch: &Value) -> Result<(), String> {
+    let Some(dns) = patch.get("dns").and_then(|v| v.as_object()) else {
+        return Ok(());
+    };
+    let mut changed = false;
+    for (patch_key, uci_key) in [
+        ("nameserver", "flclash.dns.domestic_dns"),
+        ("fallback", "flclash.dns.foreign_dns"),
+        ("default-nameserver", "flclash.dns.bootstrap_dns"),
+        ("direct-nameserver", "flclash.dns.direct_dns"),
+        ("proxy-server-nameserver", "flclash.dns.proxy_dns"),
+    ] {
+        if let Some(value) = dns.get(patch_key) {
+            uci_set_list_key(uci_key, &patch_list(value))?;
+            changed = true;
+        }
+    }
+    if changed {
+        uci_commit_pkg("flclash")?;
+    }
+    Ok(())
+}
+
 fn uci_commit_pkg(pkg: &str) -> Result<(), String> {
     let out = std::process::Command::new("uci")
         .args(["commit", pkg])
@@ -501,6 +578,209 @@ pub fn runtime_ipv6() -> String {
     }
 }
 
+const DOMESTIC_DNS: [&str; 3] = [
+    "https://223.5.5.5/dns-query",
+    "https://doh.pub/dns-query",
+    "tls://dot.pub",
+];
+const FOREIGN_DNS: [&str; 3] = [
+    "https://1.1.1.1/dns-query",
+    "https://1.0.0.1/dns-query",
+    "https://8.8.8.8/dns-query",
+];
+const BOOTSTRAP_DNS: [&str; 2] = ["223.5.5.5", "119.29.29.29"];
+
+fn dns_array(items: &[&str]) -> Value {
+    Value::Array(items.iter().map(|s| Value::String(s.to_string())).collect())
+}
+
+fn dns_array_owned(items: &[String]) -> Value {
+    Value::Array(items.iter().map(|s| Value::String(s.clone())).collect())
+}
+
+fn dns_or_default(items: &[String], defaults: &[&str]) -> Value {
+    if items.is_empty() {
+        dns_array(defaults)
+    } else {
+        dns_array_owned(items)
+    }
+}
+
+fn dns_list_present(dns: &serde_json::Map<String, Value>, key: &str) -> bool {
+    dns.get(key)
+        .and_then(|v| v.as_array())
+        .map(|items| !items.is_empty())
+        .unwrap_or(false)
+}
+
+fn uci_list_key(key: &str) -> Vec<String> {
+    // `uci get` prints a list as one space-separated line.
+    uci_get_key(key)
+        .split_whitespace()
+        .map(|item| item.trim().to_string())
+        .filter(|item| !item.is_empty())
+        .collect()
+}
+
+/// Split DNS: Chinese domains resolve through domestic DoH/DoT, non-CN
+/// domains through foreign DoH, and node server domains keep the airport's
+/// own DNS when the subscription provided one (falling back to domestic only
+/// when it did not). Unknown domains resolve domestically first and fall back
+/// to foreign when the answer is not a CN address.
+///
+/// Domestic/foreign/bootstrap lists come from `flclash.dns` UCI, so WebUI
+/// presets survive subscription updates. `flclash.dns.split=0` disables the
+/// whole layer and keeps a fully custom DNS block.
+fn apply_split_dns(dns: &mut serde_json::Map<String, Value>) {
+    let domestic = uci_list_key("flclash.dns.domestic_dns");
+    let foreign = uci_list_key("flclash.dns.foreign_dns");
+    let bootstrap = uci_list_key("flclash.dns.bootstrap_dns");
+    let direct = uci_list_key("flclash.dns.direct_dns");
+    let proxy_dns = uci_list_key("flclash.dns.proxy_dns");
+
+    dns.insert("nameserver".into(), dns_or_default(&domestic, &DOMESTIC_DNS));
+    dns.insert("fallback".into(), dns_or_default(&foreign, &FOREIGN_DNS));
+    dns.insert(
+        "direct-nameserver".into(),
+        dns_or_default(&direct, &DOMESTIC_DNS),
+    );
+    // Airport-provided node DNS wins; a WebUI override is next, and the
+    // domestic default is only a fallback when neither exists.
+    if !dns_list_present(dns, "proxy-server-nameserver") {
+        let fallback = if proxy_dns.is_empty() {
+            dns_or_default(&domestic, &DOMESTIC_DNS)
+        } else {
+            dns_array_owned(&proxy_dns)
+        };
+        dns.insert("proxy-server-nameserver".into(), fallback);
+    }
+    if !dns_list_present(dns, "default-nameserver") {
+        dns.insert(
+            "default-nameserver".into(),
+            dns_or_default(&bootstrap, &BOOTSTRAP_DNS),
+        );
+    }
+    let mut fb = dns
+        .get("fallback-filter")
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
+    fb.insert("geoip".into(), Value::Bool(true));
+    fb.insert("geoip-code".into(), Value::String("CN".into()));
+    dns.insert("fallback-filter".into(), Value::Object(fb));
+    let mut policy = dns
+        .get("nameserver-policy")
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
+    policy.insert(
+        "geosite:cn".into(),
+        dns_or_default(&domestic, &DOMESTIC_DNS),
+    );
+    policy.insert(
+        "geosite:private".into(),
+        dns_or_default(&domestic, &DOMESTIC_DNS),
+    );
+    policy.insert(
+        "geosite:geolocation-!cn".into(),
+        dns_or_default(&foreign, &FOREIGN_DNS),
+    );
+    dns.insert("nameserver-policy".into(), Value::Object(policy));
+}
+
+/// Domestic traffic must never be captured by a proxy rule that happened to
+/// come first in the subscription (e.g. a broad geosite before `cn`). Put the
+/// CN domain/IP bypass at the top; foreign traffic keeps falling through to
+/// the subscription's MATCH/selector rules.
+fn ensure_cn_bypass_rules(root: &mut serde_json::Map<String, Value>) {
+    let Some(rules) = root.get_mut("rules").and_then(|v| v.as_array_mut()) else {
+        return;
+    };
+    let cn = "GEOSITE,cn,DIRECT";
+    if rules.first().and_then(|v| v.as_str()) != Some(cn) {
+        rules.retain(|r| r.as_str() != Some(cn));
+        rules.insert(0, Value::String(cn.into()));
+    }
+    if !rules
+        .iter()
+        .any(|r| r.as_str().map(|s| s.starts_with("GEOIP,CN,")).unwrap_or(false))
+    {
+        rules.insert(1.min(rules.len()), Value::String("GEOIP,CN,DIRECT,no-resolve".into()));
+    }
+    if !rules
+        .iter()
+        .any(|r| r.as_str().map(|s| s.starts_with("GEOIP,PRIVATE,")).unwrap_or(false))
+    {
+        rules.insert(1.min(rules.len()), Value::String("GEOIP,PRIVATE,DIRECT,no-resolve".into()));
+    }
+}
+
+/// Pick the subscription's manual selector as the default foreign exit:
+/// prefer the usual 节点选择/Proxy/选择 names, then any non-GLOBAL select,
+/// then the first group. A group name containing a comma cannot be used in a
+/// rule and is skipped.
+fn primary_proxy_group(root: &serde_json::Map<String, Value>) -> Option<String> {
+    let groups = root.get("proxy-groups").and_then(|v| v.as_array())?;
+    let mut first_select = None;
+    let mut first_group = None;
+    for group in groups {
+        let Some(name) = group.get("name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if name == "GLOBAL" || name.contains(',') {
+            continue;
+        }
+        if first_group.is_none() {
+            first_group = Some(name.to_string());
+        }
+        let kind = group.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if kind == "select" {
+            if name.contains("节点选择")
+                || name.contains("选择")
+                || name.contains("代理")
+                || name.to_ascii_lowercase().contains("proxy")
+            {
+                return Some(name.to_string());
+            }
+            if first_select.is_none() {
+                first_select = Some(name.to_string());
+            }
+        }
+    }
+    first_select.or(first_group)
+}
+
+/// Foreign traffic must end at a proxy. If the subscription's MATCH points at
+/// DIRECT (or is missing), retarget it to the manual selector; specific rules
+/// (Google/Telegram/OneDrive/CN) earlier in the list are left untouched.
+fn ensure_foreign_proxy_match(root: &mut serde_json::Map<String, Value>) {
+    let Some(group) = primary_proxy_group(root) else {
+        return;
+    };
+    let Some(rules) = root.get_mut("rules").and_then(|v| v.as_array_mut()) else {
+        return;
+    };
+    let mut match_index = None;
+    for (index, rule) in rules.iter().enumerate() {
+        if let Some(text) = rule.as_str() {
+            if text.starts_with("MATCH,") {
+                match_index = Some(index);
+            }
+        }
+    }
+    let Some(index) = match_index else {
+        rules.push(Value::String(format!("MATCH,{group}")));
+        return;
+    };
+    let target = rules[index]
+        .as_str()
+        .and_then(|text| text.rsplit(',').next())
+        .unwrap_or("");
+    if matches!(target, "DIRECT" | "REJECT" | "REJECT-DROP") {
+        rules[index] = Value::String(format!("MATCH,{group}"));
+    }
+}
+
 /// Final router-owned layer. Runs after the subscription and the user mixin,
 /// so neither can override controller/listener ownership, loop mark, ports,
 /// DNS listener or the TUN switch. serde_yaml also quotes scalars safely.
@@ -535,14 +815,26 @@ pub fn enforce_invariants(yaml: &str) -> Result<String, String> {
     root.remove("authentication");
     root.remove("bind-address");
 
+    // Subscriptions may omit dns: entirely; the split layer still has to be
+    // written so the nft DNS hijack has a listener with the right servers.
+    if !root.contains_key("dns") {
+        root.insert("dns".into(), Value::Object(serde_json::Map::new()));
+    }
     if let Some(dns) = root.get_mut("dns").and_then(|v| v.as_object_mut()) {
         dns.insert("listen".into(), Value::String("0.0.0.0:1053".into()));
         dns.insert("ipv6".into(), Value::Bool(ipv6 != "off"));
+        if uci_get_key("flclash.dns.split") != "0"
+            && uci_get_key("flclash.proxy.split_dns") != "0"
+        {
+            apply_split_dns(dns);
+        }
     }
     if let Some(tun) = root.get_mut("tun").and_then(|v| v.as_object_mut()) {
         tun.insert("enable".into(), Value::Bool(mode == "tun"));
         tun.remove("enabled");
     }
+    ensure_cn_bypass_rules(root);
+    ensure_foreign_proxy_match(root);
     serde_yaml::to_string(&doc).map_err(|e| format!("配置序列化失败: {e}"))
 }
 
@@ -597,7 +889,7 @@ fn render_dns_block(patch: &Value, current: &CoreConfigView) -> Option<String> {
     };
     let filters = list("fake-ip-filter", &["*.lan", "*.local", "+.msftconnecttest.com", "+.msftncsi.com"]);
     let defaults = list("default-nameserver", &["223.5.5.5", "119.29.29.29"]);
-    let nameservers = list("nameserver", &["https://223.5.5.5/dns-query", "https://doh.pub/dns-query", "tls://120.53.53.53"]);
+    let nameservers = list("nameserver", &["https://223.5.5.5/dns-query", "https://doh.pub/dns-query", "tls://dot.pub"]);
     if !filters.is_empty() {
         out.push_str("  fake-ip-filter:\n");
         for item in &filters {
@@ -1289,5 +1581,25 @@ mod tests {
         assert_eq!(doc["routing-mark"], 333);
         assert!(doc.get("listeners").is_none());
         assert_eq!(doc["tun"]["enable"], false, "mode off must disable TUN");
+    }
+
+    #[test]
+    fn invariants_split_dns_and_keep_airport_node_dns() {
+        let out = enforce_invariants(
+            "dns:\n  nameserver: ['https://airport.example/dns-query']\n  proxy-server-nameserver: ['https://airport.example/dns-query']\nproxy-groups:\n  - name: 节点选择\n    type: select\n    proxies: [A]\nproxies:\n  - name: A\n    type: ss\nrules:\n  - MATCH,DIRECT\n",
+        )
+        .unwrap();
+        let doc: Value = serde_yaml::from_str(&out).unwrap();
+        let ns = doc["dns"]["nameserver"].as_array().unwrap();
+        assert!(ns.iter().any(|v| v.as_str() == Some("https://223.5.5.5/dns-query")));
+        // Airport-provided node DNS wins over the domestic default.
+        assert_eq!(
+            doc["dns"]["proxy-server-nameserver"][0],
+            "https://airport.example/dns-query"
+        );
+        assert!(doc["dns"]["nameserver-policy"]["geosite:cn"].is_array());
+        assert!(doc["dns"]["nameserver-policy"]["geosite:geolocation-!cn"].is_array());
+        assert_eq!(doc["rules"][0], "GEOSITE,cn,DIRECT");
+        assert_eq!(doc["rules"].as_array().unwrap().last().unwrap(), "MATCH,节点选择");
     }
 }

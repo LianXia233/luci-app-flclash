@@ -22,7 +22,8 @@
       '<section class="card">' +
         '<div class="card-head"><span class="glyph" data-icon="dns"></span><span class="card-title">服务器分组</span></div>' +
         '<div class="settings-row"><div class="row-copy"><div class="row-title">Fallback 服务器</div>' +
-        '<div class="row-desc">主 nameserver 结果被污染/境外时改用这些；每行一个（DoH/DoT/UDP）</div></div></div>' +
+        '<div class="row-desc">国外域名使用；主 nameserver 结果非 CN 时也回退到这里。每行一个 DoH/DoT</div></div>' +
+        '<select class="select" data-role="fallbackPreset"><option value="">自定义 / 保持</option><option value="cloudflare">Cloudflare DoH/DoT</option><option value="google">Google DoH/DoT</option><option value="quad9">Quad9 DoH/DoT</option><option value="adguard">AdGuard DoH/DoT</option><option value="mixed">Cloudflare + Google</option></select></div>' +
         '<textarea class="input dns-area" data-role="fallback" rows="3" spellcheck="false" placeholder="https://1.1.1.1/dns-query&#10;tls://8.8.4.4"></textarea>' +
         '<div class="settings-row"><div class="row-copy"><div class="row-title">代理节点域名解析</div>' +
         '<div class="row-desc">proxy-server-nameserver：解析机场节点域名，避免循环依赖</div></div></div>' +
@@ -59,6 +60,7 @@
 
     const stateLine = ui.$('[data-role="state"]', root);
     const el = {
+      fallbackPreset: ui.$('[data-role="fallbackPreset"]', root),
       fallback: ui.$('[data-role="fallback"]', root),
       proxyNs: ui.$('[data-role="proxyNs"]', root),
       directNs: ui.$('[data-role="directNs"]', root),
@@ -79,6 +81,18 @@
     }
     bindSwitch(el.ipv6);
     bindSwitch(el.geoip);
+
+    const FOREIGN_PRESETS = {
+      cloudflare: ['https://1.1.1.1/dns-query', 'https://1.0.0.1/dns-query', 'tls://1.1.1.1'],
+      google: ['https://8.8.8.8/dns-query', 'https://8.8.4.4/dns-query', 'tls://8.8.8.8'],
+      quad9: ['https://9.9.9.9/dns-query', 'tls://9.9.9.9'],
+      adguard: ['https://94.140.14.14/dns-query', 'tls://94.140.14.14'],
+      mixed: ['https://1.1.1.1/dns-query', 'https://8.8.8.8/dns-query', 'tls://1.1.1.1']
+    };
+    el.fallbackPreset.addEventListener('change', function () {
+      const preset = FOREIGN_PRESETS[el.fallbackPreset.value];
+      if (preset) el.fallback.value = preset.join('\n');
+    });
 
     api.dnsConfig().then(function (data) {
       const dns = data.dns || {};

@@ -58,6 +58,21 @@ uci -q get flclash.update.channel >/dev/null || uci set flclash.update.channel='
 uci -q get flclash.update.mirror >/dev/null || uci set flclash.update.mirror=''
 uci -q get flclash.update.auto_check >/dev/null || uci set flclash.update.auto_check='0'
 
+# Split DNS defaults (WebUI presets write these lists; the invariant reads them
+# so a subscription update cannot overwrite user choices).
+if ! uci -q get flclash.dns >/dev/null 2>&1; then
+	uci set flclash.dns=flclash
+	uci set flclash.dns.split='1'
+	uci add_list flclash.dns.domestic_dns='https://223.5.5.5/dns-query'
+	uci add_list flclash.dns.domestic_dns='https://doh.pub/dns-query'
+	uci add_list flclash.dns.domestic_dns='tls://dot.pub'
+	uci add_list flclash.dns.foreign_dns='https://1.1.1.1/dns-query'
+	uci add_list flclash.dns.foreign_dns='https://1.0.0.1/dns-query'
+	uci add_list flclash.dns.foreign_dns='https://8.8.8.8/dns-query'
+	uci add_list flclash.dns.bootstrap_dns='223.5.5.5'
+	uci add_list flclash.dns.bootstrap_dns='119.29.29.29'
+fi
+
 # Mode/ipv6 schema: derive once from the legacy switches. `mode` is the single
 # source of truth afterwards (off|redirect|tproxy|tun).
 if ! uci -q get flclash.proxy.mode >/dev/null 2>&1; then

@@ -281,7 +281,7 @@ const methods = {
 				coreRunning: core_running_proc(),
 				coreType: type,
 				coreVersion: core_version(type),
-				apiVersion: '1.5.3',
+				apiVersion: '1.5.4',
 				proxyMode: mode,
 				ipv6Mode: trim(run('uci -q get flclash.proxy.ipv6 2>/dev/null')) || 'proxy',
 				quic: trim(run('uci -q get flclash.proxy.quic 2>/dev/null')) || 'proxy',

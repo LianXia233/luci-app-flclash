@@ -19,6 +19,12 @@
         '<div class="settings-card">' +
           '<div class="settings-row"><div class="row-copy"><div class="row-title">出站模式</div><div class="row-desc">规则 / 全局 / 直连</div></div>' +
             '<select class="select" data-cfg="mode"><option value="rule">规则</option><option value="global">全局</option><option value="direct">直连</option></select></div>' +
+          '<div class="settings-row"><div class="row-copy"><div class="row-title">透明代理模式</div><div class="row-desc">REDIRECT(兼容) / TPROXY / TUN(三层接管)</div></div>' +
+            '<select class="select" data-cfg="proxyMode"><option value="off">关闭</option><option value="redirect">REDIRECT + TPROXY UDP</option><option value="tproxy">TPROXY (TCP+UDP)</option><option value="tun">TUN</option></select></div>' +
+          '<div class="settings-row"><div class="row-copy"><div class="row-title">IPv6 策略</div><div class="row-desc">proxy 双栈代理 / off 阻断防泄漏 / direct 直连</div></div>' +
+            '<select class="select" data-cfg="ipv6Mode"><option value="proxy">proxy</option><option value="off">off</option><option value="direct">direct</option></select></div>' +
+          '<div class="settings-row"><div class="row-copy"><div class="row-title">QUIC / UDP 443</div><div class="row-desc">proxy 代理 / reject 强制回落 TCP / bypass 直连</div></div>' +
+            '<select class="select" data-cfg="quic"><option value="proxy">proxy</option><option value="reject">reject</option><option value="bypass">bypass</option></select></div>' +
           '<div class="settings-row"><div class="row-copy"><div class="row-title">混合端口</div><div class="row-desc">HTTP / SOCKS 共用端口</div></div>' +
             '<input class="input input-num" type="number" min="1" max="65535" data-cfg="mixedPort"></div>' +
           '<div class="settings-row"><div class="row-copy"><div class="row-title">允许局域网连接</div><div class="row-desc">其它设备可经本机代理</div></div>' +
@@ -40,7 +46,8 @@
             '<button class="switch" role="switch" data-cfg="dnsEnable" type="button"><span class="thumb"></span></button></div>' +
           '<div class="settings-row"><div class="row-copy"><div class="row-title">解析增强模式</div><div class="row-desc">fake-ip 快速 / redir-host 真实 / 混合(嗅探)</div></div>' +
             '<select class="select" data-cfg="dnsMode"><option value="fake-ip">fake-ip</option><option value="redir-host">redir-host</option><option value="mixed">混合模式</option></select></div>' +
-          '<div class="settings-row"><div class="row-copy"><div class="row-title">域名解析服务器</div><div class="row-desc">每行一个,支持 udp / DoH(https://) / DoT(tls://)</div></div></div>' +
+          '<div class="settings-row"><div class="row-copy"><div class="row-title">域名解析服务器</div><div class="row-desc">国内域名使用；每行一个，支持 DoH(https://) / DoT(tls://)</div></div>' +
+            '<select class="select" data-cfg="dnsPreset"><option value="">自定义 / 保持</option><option value="ali">阿里 DoH + DoT</option><option value="tencent">腾讯 DoH + DNSPod DoT</option><option value="dnspod">DNSPod DoT</option></select></div>' +
           '<textarea class="input dns-area" data-cfg="dnsNameservers" rows="4" spellcheck="false"></textarea>' +
           '<div class="settings-row"><div class="row-copy"><div class="row-title">默认 DNS(bootstrap)</div><div class="row-desc">用于解析 DoH/DoT 域名,每行一个</div></div></div>' +
           '<textarea class="input dns-area" data-cfg="dnsDefaults" rows="2" spellcheck="false"></textarea>' +
@@ -83,6 +90,9 @@
 
     const controls = {
       mode: ui.$('[data-cfg="mode"]', root),
+      proxyMode: ui.$('[data-cfg="proxyMode"]', root),
+      ipv6Mode: ui.$('[data-cfg="ipv6Mode"]', root),
+      quic: ui.$('[data-cfg="quic"]', root),
       mixedPort: ui.$('[data-cfg="mixedPort"]', root),
       logLevel: ui.$('[data-cfg="logLevel"]', root),
       allowLan: ui.$('[data-cfg="allowLan"]', root),
@@ -90,6 +100,7 @@
       tun: ui.$('[data-cfg="tun"]', root),
       dnsEnable: ui.$('[data-cfg="dnsEnable"]', root),
       dnsMode: ui.$('[data-cfg="dnsMode"]', root),
+      dnsPreset: ui.$('[data-cfg="dnsPreset"]', root),
       dnsNameservers: ui.$('[data-cfg="dnsNameservers"]', root),
       dnsDefaults: ui.$('[data-cfg="dnsDefaults"]', root),
       dnsFakeRange: ui.$('[data-cfg="dnsFakeRange"]', root),
@@ -98,6 +109,26 @@
       proxyLan: ui.$('[data-cfg="proxyLan"]', root),
       coreType: ui.$('[data-cfg="coreType"]', root),
       tunStack: ui.$('[data-cfg="tunStack"]', root)
+    };
+
+    /* Vendor presets are just textarea prefill; the exact servers are
+     * persisted in flclash.dns UCI by the backend, so subscription updates
+     * cannot overwrite them. */
+    const DNS_PRESETS = {
+      ali: [
+        'https://223.5.5.5/dns-query',
+        'https://dns.alidns.com/dns-query',
+        'tls://dns.alidns.com'
+      ],
+      tencent: [
+        'https://doh.pub/dns-query',
+        'https://1.12.12.12/dns-query',
+        'tls://dot.pub'
+      ],
+      dnspod: [
+        'https://doh.pub/dns-query',
+        'tls://dot.pub'
+      ]
     };
 
     /* Installed cores come from the same-origin REST bridge (binary probe +
@@ -125,6 +156,9 @@
       const statusNow = ctx.state.status || {};
       const dns = statusNow.dns || {};
       controls.mode.value = cfgNow.mode || statusNow.mode || 'rule';
+      controls.proxyMode.value = statusNow.proxyMode || cfgNow.proxyMode || 'redirect';
+      controls.ipv6Mode.value = statusNow.ipv6Mode || cfgNow.ipv6Mode || 'proxy';
+      controls.quic.value = statusNow.quic || cfgNow.quic || 'proxy';
       controls.mixedPort.value = cfgNow.mixedPort || statusNow.mixedPort || 7892;
       controls.logLevel.value = cfgNow.logLevel || statusNow.logLevel || 'info';
       ['allowLan', 'ipv6', 'tun'].forEach(function (key) {
@@ -166,6 +200,7 @@
       if (!ctx.api.proxyStatus) return;
       ctx.api.proxyStatus().then(function (data) {
         const on = !!(data && (data.enabled || data.rulesActive));
+        if (data && data.proxyMode) controls.proxyMode.value = data.proxyMode;
         controls.proxyLan.classList.toggle('is-on', on);
         controls.proxyLan.setAttribute('aria-checked', String(on));
         const stateNode = ui.$('[data-role="proxy-state"]', root);
@@ -209,6 +244,25 @@
 
     ['allowLan', 'ipv6', 'tun', 'dnsEnable'].forEach(function (key) {
       controls[key].addEventListener('click', function () { controls[key].classList.toggle('is-on'); });
+    });
+
+    controls.dnsPreset.addEventListener('change', function () {
+      const preset = DNS_PRESETS[controls.dnsPreset.value];
+      if (preset) controls.dnsNameservers.value = preset.join('\n');
+    });
+
+    controls.proxyMode.addEventListener('change', function () {
+      const mode = controls.proxyMode.value;
+      controls.proxyMode.disabled = true;
+      ctx.api.setProxyMode(mode)
+        .then(function () {
+          ui.toast('透明代理模式已切换', 'ok');
+          return fillProxy();
+        })
+        .catch(function (error) { ui.toast('切换失败: ' + error.message, 'error'); })
+        .then(function () {
+          controls.proxyMode.disabled = false;
+        });
     });
 
     controls.proxyLan.addEventListener('click', function () {
@@ -336,6 +390,8 @@
         logLevel: controls.logLevel.value,
         allowLan: controls.allowLan.classList.contains('is-on'),
         ipv6: controls.ipv6.classList.contains('is-on'),
+        ipv6Mode: controls.ipv6Mode.value,
+        quic: controls.quic.value,
         tun: controls.tun.classList.contains('is-on'),
         tunStack: controls.tunStack.value,
         dns: {

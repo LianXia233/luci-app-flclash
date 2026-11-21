@@ -38,6 +38,21 @@ config flclash 'proxy'
 	# Disable flow offloading once per takeover (never re-fight a user choice).
 	option auto_disable_offload '1'
 
+config flclash 'dns'
+	# Split DNS: CN/private -> domestic, geolocation-!cn -> foreign.
+	# Node server domains keep the airport-provided DNS; domestic is only the
+	# fallback when the subscription ships none. Set split=0 for a fully
+	# custom dns: block (advanced users).
+	option split '1'
+	list domestic_dns 'https://223.5.5.5/dns-query'
+	list domestic_dns 'https://doh.pub/dns-query'
+	list domestic_dns 'tls://dot.pub'
+	list foreign_dns 'https://1.1.1.1/dns-query'
+	list foreign_dns 'https://1.0.0.1/dns-query'
+	list foreign_dns 'https://8.8.8.8/dns-query'
+	list bootstrap_dns '223.5.5.5'
+	list bootstrap_dns '119.29.29.29'
+
 config flclash 'api'
 	option enabled '1'
 	option listen '0.0.0.0:9098'

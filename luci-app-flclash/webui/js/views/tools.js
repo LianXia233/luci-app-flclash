@@ -35,6 +35,8 @@
           '<button class="btn" data-act="flush" type="button">清空</button></div>' +
         '<div class="settings-row"><div class="row-copy"><div class="row-title">更新 Geo 数据</div><div class="row-desc">由内核下载最新 GeoIP / GeoSite 数据库</div></div>' +
           '<button class="btn" data-act="geo" type="button">更新</button></div>' +
+        '<div class="settings-row"><div class="row-copy"><div class="row-title">导出诊断</div><div class="row-desc">系统、内核、路由与 DNS 状态快照（自动脱敏）</div></div>' +
+          '<button class="btn" data-act="diagnostics" type="button">导出</button></div>' +
       '</section>' +
       '<section class="card"><div class="card-head"><span class="glyph" data-icon="info"></span><span class="card-title">关于</span></div>' +
         '<div class="kv"><span class="k">应用版本</span><span class="v" data-role="version">—</span></div>' +
@@ -106,6 +108,32 @@
       ctx.api.flushDns()
         .then(function () { ui.toast('DNS 缓存已清空', 'ok'); })
         .catch(function (error) { ui.toast('清空失败: ' + error.message, 'error'); });
+    });
+
+    ui.$('[data-act="diagnostics"]', root).addEventListener('click', function () {
+      const button = this;
+      button.disabled = true;
+      button.textContent = '生成中…';
+      ctx.api.diagnostics().then(function (data) {
+        const text = (data && data.text) || '';
+        if (!text) throw new Error('诊断内容为空');
+        const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+        const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+        const href = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = href;
+        a.download = 'flclash-diagnostics-' + stamp + '.txt';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setTimeout(function () { URL.revokeObjectURL(href); }, 4000);
+        ui.toast('诊断已导出', 'ok');
+      }).catch(function (error) {
+        ui.toast('导出失败: ' + error.message, 'error');
+      }).then(function () {
+        button.disabled = false;
+        button.textContent = '导出';
+      });
     });
 
     return root;
