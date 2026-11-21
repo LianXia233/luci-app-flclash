@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 //! flclash-api (Rust/Tokio): the WebUI backend for luci-app-flclash.
 //!
 //! Drop-in replacement for the Go bridge: same binary name, same CLI flags
@@ -24,6 +25,7 @@ mod api;
 mod backup;
 mod config;
 mod convert;
+mod diagnostics;
 mod core;
 mod coremgmt;
 mod ctrl;
@@ -31,6 +33,7 @@ mod events;
 mod ipinfo;
 mod loops;
 mod mixin;
+mod preflight;
 mod profiles;
 mod singbox;
 mod state;
@@ -78,6 +81,74 @@ pub(crate) fn secret_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+/// Short-lived jump tokens written by the LuCI rpcd object (0600, root only).
+/// They let the WebUI open without the raw API secret ever travelling through
+/// ubus/URLs; the tokens are revoked on reboot and capped by the writer.
+/// Returns false for an empty/missing token file, so a vanished file cannot
+/// turn into "any token is valid".
+pub(crate) fn token_in_text(data: &str, provided: &str) -> bool {
+    if provided.is_empty() {
+        return false;
+    }
+    data.lines().any(|line| {
+        let token = line.trim();
+        token.len() == provided.len() && secret_eq(token.as_bytes(), provided.as_bytes())
+    })
+}
+
+pub(crate) fn jump_token_valid(provided: &str) -> bool {
+    if provided.is_empty() {
+        return false;
+    }
+    let Ok(path) = std::env::var("FLCLASH_JUMP_TOKENS") else {
+        return false;
+    };
+    if path.is_empty() {
+        return false;
+    }
+    let Ok(data) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    token_in_text(&data, provided)
+}
+
+fn api_secret() -> Option<String> {
+    std::env::var("FLCLASH_API_SECRET")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+pub(crate) fn secret_is_valid(value: &str) -> bool {
+    value.len() >= 16 && value.chars().all(|c| c.is_ascii_graphic())
+}
+
+/// `require_secret=1` (default) turns an empty/short secret into a hard
+/// startup failure: this process can rewrite configs, install cores and drive
+/// the firewall, so an unauthenticated listener on 0.0.0.0 is a root console.
+fn enforce_secret(secret: &Option<String>) {
+    let required = std::env::var("FLCLASH_API_REQUIRE_SECRET")
+        .map(|value| value != "0")
+        .unwrap_or(true);
+    if !required {
+        if secret.is_none() {
+            eprintln!("WARNING: FLCLASH_API_REQUIRE_SECRET=0 and no API secret; the control plane is unauthenticated");
+        }
+        return;
+    }
+    let valid = secret
+        .as_deref()
+        .map(secret_is_valid)
+        .unwrap_or(false);
+    if !valid {
+        eprintln!(
+            "FATAL: refusing to start: FLCLASH_API_SECRET is missing or shorter than 16 printable chars. \
+             Generate one with: head -c 32 /dev/urandom | md5sum | cut -d' ' -f1 > /etc/flclash/api.secret && chmod 600 /etc/flclash/api.secret"
+        );
+        std::process::exit(1);
+    }
+}
+
 async fn auth(
     State(st): State<Arc<AppState>>,
     req: Request,
@@ -95,11 +166,13 @@ async fn auth(
                     .and_then(|v| v.to_str().ok())
                     .map(|s| s.trim_start_matches("Bearer ").trim().to_string())
             });
-        if got
+        let allowed = got
             .as_deref()
-            .map(|value| secret_eq(value.as_bytes(), secret.as_bytes()))
-            != Some(true)
-        {
+            .map(|value| {
+                secret_eq(value.as_bytes(), secret.as_bytes()) || jump_token_valid(value)
+            })
+            .unwrap_or(false);
+        if !allowed {
             return (StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"})))
                 .into_response();
         }
@@ -140,15 +213,17 @@ async fn main() {
     let ui_dir = flag_value(&args, "-ui", "/www/flclash");
     let data_dir = flag_value(&args, "-data", "/etc/flclash");
     let init_script = flag_value(&args, "-init", "/etc/init.d/flclash-core");
-    let secret = std::env::var("FLCLASH_API_SECRET")
-        .ok()
-        .filter(|s| !s.is_empty());
+    let secret = api_secret();
+    enforce_secret(&secret);
 
     let st = AppState::new(controller, ui_dir, data_dir, init_script, secret);
 
     eprintln!(
-        "flclash-api listening on {}, controller {}, ui {}",
-        listen, st.controller, st.ui_dir
+        "flclash-api listening on {}, controller {}, ui {} (auth: {})",
+        listen,
+        st.controller,
+        st.ui_dir,
+        if st.secret.is_some() { "secret" } else { "disabled" }
     );
 
     tokio::spawn(loops::sample_status(st.clone()));
@@ -191,8 +266,11 @@ async fn main() {
         .route("/backup/upload", post(api::backup_upload))
         .route("/backup/{name}", delete(api::backup_delete))
         .route("/system/proxy", get(api::system_proxy))
+        .route("/diagnostics", get(api::diagnostics))
         .route("/profiles", get(api::profiles_get))
         .route("/profiles/import", post(api::profiles_import))
+        .route("/profiles/import-local", post(api::profiles_import_local))
+        .route("/profiles/update-all", post(api::profiles_update_all))
         .route("/profiles/{id}/apply", post(api::profiles_apply))
         .route("/profiles/{id}/update", post(api::profiles_update))
         .route(
@@ -203,6 +281,7 @@ async fn main() {
         )
         .route("/service/{action}", post(api::service_action))
         .route("/proxy", get(api::proxy_status))
+        .route("/proxy/mode", axum::routing::put(api::proxy_mode_set))
         .route("/proxy/{action}", post(api::proxy_toggle))
         .route("/proxy/acl", get(api::acl_get).put(api::acl_put))
         .route("/dns/config", get(api::dns_config))
@@ -238,4 +317,35 @@ async fn main() {
         .await
         .expect("failed to bind listen address");
     axum::serve(server, app).await.expect("server error");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn secret_policy_rejects_empty_short_and_control_chars() {
+        assert!(!secret_is_valid(""));
+        assert!(!secret_is_valid("short"));
+        assert!(!secret_is_valid("0123456789abcde\n"));
+        assert!(secret_is_valid("0123456789abcdef"));
+        assert!(secret_is_valid("A_Z-9.~+/=0123456789"));
+    }
+
+    #[test]
+    fn jump_token_file_matches_exact_lines_only() {
+        let file = "aaaa\nbbbb  \ncccc\n";
+        assert!(token_in_text(file, "bbbb"));
+        assert!(token_in_text(file, "cccc"));
+        assert!(!token_in_text(file, ""));
+        assert!(!token_in_text(file, "bbbbbbbb"));
+        assert!(!token_in_text(file, "dddd"));
+    }
+
+    #[test]
+    fn constant_time_compare_is_exact() {
+        assert!(secret_eq(b"abc", b"abc"));
+        assert!(!secret_eq(b"abc", b"abd"));
+        assert!(!secret_eq(b"abc", b"ab"));
+    }
 }

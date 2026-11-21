@@ -87,6 +87,13 @@ case "$CORE" in
 		;;
 esac
 
+# Optional download mirror/prefix (e.g. https://ghproxy.example/). The GitHub
+# API call above is still direct; only the asset (and its .sha256) is proxied.
+MIRROR=$(uci -q get flclash.update.mirror 2>/dev/null)
+case "$MIRROR" in
+	http://*|https://*) ASSET_URL="${MIRROR%/}/$ASSET_URL" ;;
+esac
+
 echo "[update] asset: $ASSET_URL"
 echo "[update] downloading…"
 curl -sSL -m 300 -o /tmp/flclash-core-new.bin "$ASSET_URL" || fail "download failed"
@@ -160,6 +167,13 @@ wait_core_ready() {
 }
 
 echo "[update] installing…"
+# Refuse to stop a working core unless the target filesystem can hold the new
+# binary plus a rollback copy.
+NEED_BYTES=$(wc -c < "$TMP" 2>/dev/null || echo 0)
+AVAIL_KB=$(df -k "$(dirname "$DEST")" 2>/dev/null | awk 'NR==2 {print $4}')
+if [ -n "$AVAIL_KB" ] && [ "$AVAIL_KB" -lt $((NEED_BYTES / 1024 * 2 + 4096)) ] 2>/dev/null; then
+	fail "not enough space on $(dirname "$DEST") for $((NEED_BYTES / 1024)) KiB core + rollback"
+fi
 [ -x "$INIT" ] && "$INIT" stop >/dev/null 2>&1
 sleep 3
 BACKUP=""
@@ -167,7 +181,14 @@ BACKUP=""
 	BACKUP="${DEST}.old-$(date +%s)"
 	cp -a "$DEST" "$BACKUP"
 }
-mv "$TMP" "$DEST" || fail "cannot replace $DEST"
+# /tmp is tmpfs and $DEST is overlay: mv across filesystems degrades to
+# copy+unlink and a power cut leaves a truncated core. Copy to a sibling
+# (same filesystem), sync, then rename atomically.
+NEWDEST="${DEST}.new-$$"
+cp "$TMP" "$NEWDEST" || fail "cannot stage $NEWDEST"
+chmod 755 "$NEWDEST"
+sync
+mv "$NEWDEST" "$DEST" || { rm -f "$NEWDEST"; fail "cannot replace $DEST"; }
 [ -x "$INIT" ] && "$INIT" start >/dev/null 2>&1
 
 if ! wait_core_ready; then
@@ -175,7 +196,8 @@ if ! wait_core_ready; then
 	if [ -n "$BACKUP" ]; then
 		"$INIT" stop >/dev/null 2>&1
 		sleep 1
-		cp -a "$BACKUP" "$DEST"
+		ROLLBACK="${DEST}.rollback-$$"
+		cp -a "$BACKUP" "$ROLLBACK" && sync && mv "$ROLLBACK" "$DEST"
 		[ -n "$OLD_CORE" ] && uci -q set flclash.main.core_type="$OLD_CORE" 2>/dev/null
 		[ -n "$OLD_MODE" ] && uci -q set flclash.main.core_mode="$OLD_MODE" 2>/dev/null
 		uci -q commit flclash 2>/dev/null
@@ -183,6 +205,13 @@ if ! wait_core_ready; then
 	fi
 	fail "new core failed to start"
 fi
+
+# Keep at most the just-replaced binary as a manual rollback; old timestamped
+# copies used to accumulate ~66MB each on flash.
+for old in "$DEST".old-*; do
+	[ -e "$old" ] || continue
+	[ "$old" = "$BACKUP" ] || rm -f "$old"
+done
 
 FINAL=$("$DEST" -v 2>/dev/null | head -n1)
 [ -n "$FINAL" ] || FINAL=$("$DEST" version 2>/dev/null | head -n1)

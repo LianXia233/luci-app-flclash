@@ -190,6 +190,26 @@ fn read_file(path: &Path) -> Option<Vec<u8>> {
     std::fs::read(path).ok()
 }
 
+/// Drops `option secret`/`list secret` from a `uci export` body. The API
+/// secret lives in a 0600 file now; a snapshot taken from an older install
+/// (or restored from one) must not put it back into world-readable UCI.
+fn strip_uci_secret(data: &[u8]) -> Vec<u8> {
+    let text = String::from_utf8_lossy(data);
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("option secret ")
+            || trimmed.starts_with("option secret=")
+            || trimmed.starts_with("list secret ")
+        {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.into_bytes()
+}
+
 /// Collects the whitelisted files that exist under `data_dir`.
 pub fn collect(data_dir: &Path) -> Vec<(String, Vec<u8>)> {
     let mut entries = Vec::new();
@@ -216,7 +236,7 @@ pub fn collect(data_dir: &Path) -> Vec<(String, Vec<u8>)> {
     }
     if let Ok(output) = std::process::Command::new("uci").args(["export", "flclash"]).output() {
         if output.status.success() && !output.stdout.is_empty() {
-            entries.push(("uci-flclash.txt".into(), output.stdout));
+            entries.push(("uci-flclash.txt".into(), strip_uci_secret(&output.stdout)));
         }
     }
     entries
@@ -234,6 +254,11 @@ pub fn snapshot(st: &crate::state::AppState, label: &str, prefix: &str) -> Resul
     }
     let folder = dir(st);
     std::fs::create_dir_all(&folder).map_err(|e| format!("创建备份目录失败: {}", e))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o700));
+    }
     let ts = crate::state::now_secs();
     let safe_label: String = label
         .chars()
@@ -355,6 +380,22 @@ pub fn restore(st: &crate::state::AppState, data: &[u8]) -> Result<Value, String
         std::fs::write(&target, body).map_err(|e| format!("写入失败: {}", e))?;
     }
 
+    // Validate the restored config before it becomes live. The candidate lives
+    // in data_dir so relative rule-provider/Geo paths resolve like the real
+    // config; a failed preflight leaves the current config untouched.
+    let staged_config = staging.join("config.yaml");
+    if staged_config.is_file() {
+        let body = std::fs::read(&staged_config).map_err(|e| format!("读取备份配置失败: {e}"))?;
+        let candidate = std::path::Path::new(&st.data_dir).join("config.yaml.restore-candidate");
+        crate::config::write_atomic(&candidate, &body)?;
+        let check = crate::preflight::validate_config_blocking(&candidate);
+        let _ = std::fs::remove_file(&candidate);
+        if let Err(err) = check {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(format!("备份中的配置预检失败: {err}"));
+        }
+    }
+
     // Move into place file by file; a failure leaves the previous file intact
     // until its own rename succeeds.
     let mut restored = Vec::new();
@@ -376,6 +417,7 @@ pub fn restore(st: &crate::state::AppState, data: &[u8]) -> Result<Value, String
     let mut uci_restored = false;
     if let Some((_, body)) = entries.iter().find(|(name, _)| name == "uci-flclash.txt") {
         if body.starts_with(b"package flclash") {
+            let body = strip_uci_secret(body);
             let import = std::process::Command::new("uci")
                 .args(["import", "flclash"])
                 .stdin(std::process::Stdio::piped())
@@ -384,7 +426,7 @@ pub fn restore(st: &crate::state::AppState, data: &[u8]) -> Result<Value, String
                 .spawn();
             if let Ok(mut child) = import {
                 if let Some(stdin) = child.stdin.as_mut() {
-                    let _ = stdin.write_all(body);
+                    let _ = stdin.write_all(&body);
                 }
                 let ok = child.wait().map(|s| s.success()).unwrap_or(false);
                 if ok {
@@ -471,6 +513,16 @@ mod tests {
         let err = restore(&st, &bytes).unwrap_err();
         assert!(err.contains("YAML"));
         let _ = std::fs::remove_dir_all("/tmp/flclash-backup-test");
+    }
+
+    #[test]
+    fn uci_export_drops_api_secret() {
+        let body = b"package flclash\n\nconfig flclash 'api'\n\toption listen '0.0.0.0:9098'\n\toption secret 'deadbeef'\n\toption secret_file '/etc/flclash/api.secret'\n";
+        let out = String::from_utf8(strip_uci_secret(body)).unwrap();
+        assert!(!out.contains("deadbeef"));
+        assert!(!out.contains("option secret '"));
+        assert!(out.contains("option secret_file"));
+        assert!(out.contains("option listen"));
     }
 
     #[test]

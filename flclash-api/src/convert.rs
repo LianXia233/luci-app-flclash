@@ -12,7 +12,7 @@ use base64::Engine;
 use serde_json::Value;
 use std::path::Path;
 
-use crate::ctrl::{curl_fetch, header_value, percent_decode, percent_decode_plus};
+use crate::ctrl::{header_value, percent_decode, percent_decode_plus};
 
 // ---------------------------------------------------------------- yaml emit
 
@@ -850,7 +850,7 @@ pub fn header_map(config_path: &Path) -> Vec<(&'static str, String)> {
         ("tproxy-port", "7894".into()),
         ("external-controller", "127.0.0.1:9097".into()),
         ("mode", "rule".into()),
-        ("log-level", "info".into()),
+        ("log-level", "warning".into()),
         ("allow-lan", "false".into()),
         ("ipv6", "true".into()),
     ];
@@ -1224,7 +1224,11 @@ fn normalize_yaml_profile(header: &[(&'static str, String)], body: &str) -> Resu
 /// convertSubscription() of the Go bridge.
 pub fn convert_subscription(config_path: &Path, body: &str) -> Result<String, String> {
     let header = header_map(config_path);
-    let text = body.trim();
+    // BOM/CRLF from Windows editors or misconfigured airports must not survive
+    // into the generated config (BOM defeats the top-level key whitelist and
+    // produces duplicate keys; CRLF breaks the shell block editors).
+    let normalized = crate::config::normalize_yaml_text(body);
+    let text = normalized.trim();
     if text.is_empty() {
         return Err("订阅内容为空".into());
     }
@@ -1277,18 +1281,54 @@ pub struct ProfileMeta {
     pub used: i64,
     pub total: i64,
     pub expire: i64,
+    /// Seconds from `Profile-Update-Interval` (hours), 0 when absent.
+    pub update_interval: i64,
 }
 
-/// Downloads a subscription through curl and converts it to mihomo YAML.
-pub async fn fetch_profile(config_path: &Path, url: &str) -> Result<(String, ProfileMeta), String> {
-    let (headers, body) = curl_fetch(url, 45).await?;
+/// Downloads a subscription and converts it to mihomo YAML.
+///
+/// `user_agent` overrides the default clash.meta UA per profile; `timeout` is
+/// in seconds and `retry` is the number of extra attempts on a transport
+/// failure (a 4xx/5xx body still reaches the converter and fails there).
+pub async fn fetch_profile(
+    config_path: &Path,
+    url: &str,
+    user_agent: Option<&str>,
+    timeout: u64,
+    retry: i64,
+) -> Result<(String, ProfileMeta), String> {
+    let mut last_err = String::new();
+    let mut fetched = None;
+    for attempt in 0..=retry.max(0) {
+        match crate::ctrl::curl_fetch_ua(url, timeout.max(5), user_agent).await {
+            Ok(value) => {
+                fetched = Some(value);
+                break;
+            }
+            Err(err) => {
+                last_err = err;
+                if attempt < retry {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+            }
+        }
+    }
+    let (headers, body) = fetched.ok_or(last_err)?;
     if body.is_empty() {
         return Err("下载到的配置为空".into());
     }
     let text = String::from_utf8_lossy(&body).into_owned();
     let yaml = convert_subscription(config_path, &text)?;
 
-    let mut meta = ProfileMeta { proxies: 0, groups: 0, rules: 0, used: 0, total: 0, expire: 0 };
+    let mut meta = ProfileMeta {
+        proxies: 0,
+        groups: 0,
+        rules: 0,
+        used: 0,
+        total: 0,
+        expire: 0,
+        update_interval: 0,
+    };
     if let Some(raw) = header_value(&headers, "subscription-userinfo") {
         for part in raw.split(';') {
             let part = part.trim();
@@ -1302,6 +1342,12 @@ pub async fn fetch_profile(config_path: &Path, url: &str) -> Result<(String, Pro
                     _ => {}
                 }
             }
+        }
+    }
+    if let Some(raw) = header_value(&headers, "profile-update-interval") {
+        if let Ok(hours) = raw.trim().parse::<i64>() {
+            // Spec is hours; clamp to a sane range (5 minutes .. 30 days).
+            meta.update_interval = (hours * 3600).clamp(300, 30 * 86400);
         }
     }
     meta.proxies = count_top_level_list(&yaml, "proxies");

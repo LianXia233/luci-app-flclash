@@ -6,7 +6,8 @@
  *
  * Methods:
  *   system_proxy        (read)  legacy read-only summary for the WebUI
- *   service_state       (read)  { running, enabled } of flclash-core
+ *   service_state       (read)  { running, enabled } of flclash-api
+ *   webui_token         (read)  mint a short-lived jump token for the WebUI
  *   service_toggle      (write) { action: start|stop|restart } via init.d
  *   core_log            (read)  recent mihomo/flclash lines from logread
  *   core_update         (write) spawn core-update.sh with a core argument
@@ -18,6 +19,10 @@
 
 import { readfile, writefile, popen } from 'fs';
 import { cursor } from 'uci';
+
+const JUMP_TOKENS = '/tmp/flclash-jump.tokens';
+const MAX_JUMP_TOKENS = 64;
+const DEFAULT_SECRET_FILE = '/etc/flclash/api.secret';
 
 let uci_ctx = null;
 
@@ -43,6 +48,45 @@ function run(cmd) {
 	return data;
 }
 
+/* The API secret lives in a 0600 file outside UCI. The LuCI jump link must not
+ * receive the raw secret (ubus read ACLs are broader than root), so it gets a
+ * short-lived random token instead. Tokens are appended to a 0600 tmpfs file
+ * read by flclash-api; the file is capped and disappears on reboot. */
+function api_secret_path() {
+	const all = get_all('flclash');
+	const api = all.api || {};
+	return api.secret_file || DEFAULT_SECRET_FILE;
+}
+
+function secret_ready() {
+	const raw = readfile(api_secret_path());
+	return raw != null && length(trim(raw)) >= 16;
+}
+
+function mint_jump_token() {
+	let token = trim(run('head -c 32 /dev/urandom | md5sum | cut -d" " -f1'));
+	if (length(token) < 16)
+		return '';
+
+	let lines = [];
+	const raw = readfile(JUMP_TOKENS);
+	if (raw != null) {
+		for (let line in split(raw, '\n')) {
+			line = trim(line);
+			if (length(line) > 0)
+				push(lines, line);
+		}
+	}
+	let start = (length(lines) >= MAX_JUMP_TOKENS) ? length(lines) - (MAX_JUMP_TOKENS - 1) : 0;
+	let text = '';
+	for (let i = start; i < length(lines); i++)
+		text = text + lines[i] + '\n';
+	text = text + token + '\n';
+	writefile(JUMP_TOKENS, text);
+	system('chmod 600 ' + JUMP_TOKENS);
+	return token;
+}
+
 function core_state() {
 	/* The LuCI switch manages the WebUI backend (flclash-api) only. The
 	 * proxy core is intentionally NOT touched here: the user starts/stops
@@ -54,9 +98,63 @@ function core_state() {
 	return { running, enabled };
 }
 
+function core_running_proc() {
+	const comms = run('cat /proc/[0-9]*/comm 2>/dev/null');
+	for (let name in split(comms, '\n')) {
+		name = trim(name);
+		if (name == 'mihomo' || name == 'sing-box')
+			return true;
+	}
+	return false;
+}
+
+function proxy_mode() {
+	const mode = trim(run('uci -q get flclash.proxy.mode 2>/dev/null'));
+	if (mode == 'off' || mode == 'redirect' || mode == 'tproxy' || mode == 'tun')
+		return mode;
+	const enabled = trim(run('uci -q get flclash.proxy.enabled 2>/dev/null'));
+	return (enabled == '1') ? 'redirect' : 'off';
+}
+
+function active_profile() {
+	const raw = readfile('/etc/flclash/index.json');
+	if (raw == null)
+		return null;
+	let list;
+	try {
+		list = json(raw);
+	} catch (e) {
+		return null;
+	}
+	if (type(list) != 'array')
+		return null;
+	for (let item in list) {
+		if (item != null && item.active)
+			return { id: item.id || '', name: item.name || '', updatedAt: item.updated_at || 0 };
+	}
+	return null;
+}
+
 function update_state() {
 	const raw = readfile('/tmp/flclash-update.state');
 	return (raw == null) ? 'idle' : replace(trim(raw), '\n', '');
+}
+
+/* A second caller used to write `running` even when core-update.sh still held
+ * its mkdir lock and would exit 3, leaving the UI stuck on "running" forever. */
+function updater_pid() {
+	const raw = readfile('/tmp/flclash-core-update.lock/pid');
+	if (raw == null)
+		return '';
+	const pid = trim(raw);
+	return match(pid, /^[0-9]+$/) ? pid : '';
+}
+
+function updater_busy() {
+	const pid = updater_pid();
+	if (length(pid) == 0)
+		return false;
+	return system('kill -0 ' + pid + ' >/dev/null 2>&1') == 0;
 }
 
 function active_core_type() {
@@ -107,26 +205,37 @@ function core_version(type) {
 }
 
 const methods = {
-	system_proxy: {
-		call: function () {
-			const all = get_all('flclash');
-			const main = all.main || {};
-			const webui = all.webui || {};
-			const running_process = (match(run('ps w'), /(mihomo|sing-box|clash)/) != null);
-			return {
-				backend: 'flclash',
-				mixed_port: int(main.mixed_port) || 0,
-				clash_api_port: int(main.clash_api_port) || 0,
-				tun_name: main.tun_name || '',
-				routing_mode: main.routing_mode || '',
-				ipv6_support: (main.ipv6 == '1'),
-				webui_port: int(webui.webui_port) || 9098,
-				running: running_process,
-				read_only: true,
-				source: 'device-uci-ps'
-			};
-		}
-	},
+		system_proxy: {
+			call: function () {
+				const all = get_all('flclash');
+				const main = all.main || {};
+				const webui = all.webui || {};
+				/* Exact comm match: `ps w | grep clash` also matched
+				 * /usr/bin/flclash-api itself and reported the core as running
+				 * forever. /proc/<pid>/comm is the process name, not a path. */
+				let running_process = false;
+				const comms = run('cat /proc/[0-9]*/comm 2>/dev/null');
+				for (let name in split(comms, '\n')) {
+					name = trim(name);
+					if (name == 'mihomo' || name == 'sing-box') {
+						running_process = true;
+						break;
+					}
+				}
+				return {
+					backend: 'flclash',
+					mixed_port: int(main.mixed_port) || 0,
+					clash_api_port: int(main.clash_api_port) || 0,
+					tun_name: main.tun_name || '',
+					routing_mode: main.routing_mode || '',
+					ipv6_support: (main.ipv6 == '1'),
+					webui_port: int(webui.webui_port) || 9098,
+					running: running_process,
+					read_only: true,
+					source: 'device-uci-proc'
+				};
+			}
+		},
 
 	service_state: {
 		call: function () {
@@ -134,10 +243,9 @@ const methods = {
 			const all = get_all('flclash');
 			const webui = all.webui || {};
 			const main = all.main || {};
-			const api = all.api || {};
-			/* Handed to logged-in LuCI users only; the jump link forwards it to
-			 * the WebUI so the auto-generated API secret needs no retyping. */
-			const secret = (api.secret != null) ? api.secret : '';
+			/* Never return the API secret here: this method is polled by the
+			 * LuCI page and readable by every session holding the read ACL.
+			 * The jump button calls `webui_token` for a short-lived token. */
 			let port = int(webui.webui_port) || 9098;
 			let path = webui.webui_path || '/flclash/';
 			if (substr(path, 0, 1) != '/')
@@ -150,8 +258,77 @@ const methods = {
 				webui_port: port,
 				webui_path: path,
 				mixed_port: int(main.mixed_port) || 0,
-				api_secret: secret,
-				api_auth: (length(secret) > 0)
+				api_auth: secret_ready()
+			};
+		}
+	},
+
+	status: {
+		/* Structured status for LuCI and future non-WebUI consumers. Pure
+		 * JSON only; no HTML, no raw secret. */
+		call: function () {
+			const all = get_all('flclash');
+			const main = all.main || {};
+			const api = all.api || {};
+			const proxy = all.proxy || {};
+			const mode = proxy_mode();
+			const type = active_core_type();
+			const api_state = core_state();
+			const profile = active_profile();
+			return {
+				running: api_state.running,
+				enabled: api_state.enabled,
+				coreRunning: core_running_proc(),
+				coreType: type,
+				coreVersion: core_version(type),
+				apiVersion: '1.4.0',
+				proxyMode: mode,
+				ipv6Mode: trim(run('uci -q get flclash.proxy.ipv6 2>/dev/null')) || 'proxy',
+				quic: trim(run('uci -q get flclash.proxy.quic 2>/dev/null')) || 'proxy',
+				takeover: trim(readfile('/tmp/flclash-proxy.state') || 'off'),
+				api: {
+					listen: api.listen || '',
+					auth: secret_ready(),
+					secretRequired: (api.require_secret != '0')
+				},
+				profile: profile,
+				health: {
+					nft: (system('nft list table inet flclash >/dev/null 2>&1') == 0),
+					dns: (system('netstat -lnu 2>/dev/null | grep -q ":1053 "') == 0),
+					offload: trim(run('uci -q get flclash.proxy.offload_disabled_by_us 2>/dev/null')) == '1' ? 'disabled_by_flclash' : 'user',
+					lastError: ''
+				}
+			};
+		}
+	},
+
+	webui_token: {
+		/* Called only by the "open WebUI" action. Returns a random token that
+		 * flclash-api accepts alongside the real secret; the raw secret never
+		 * leaves its 0600 file. Tokens are capped and live in tmpfs. */
+		call: function () {
+			const all = get_all('flclash');
+			const webui = all.webui || {};
+			const main = all.main || {};
+			const api = all.api || {};
+			let port = int(webui.webui_port) || 9098;
+			let path = webui.webui_path || '/flclash/';
+			if (substr(path, 0, 1) != '/')
+				path = '/' + path;
+			if (substr(path, length(path) - 1) != '/')
+				path = path + '/';
+			if (!secret_ready())
+				return { code: 1, error: 'API secret 未配置，请先重启 flclash-api 或运行 uci-defaults' };
+			const token = mint_jump_token();
+			if (length(token) < 16)
+				return { code: 1, error: '无法生成跳转令牌' };
+			return {
+				code: 0,
+				token: token,
+				webui_port: port,
+				webui_path: path,
+				mixed_port: int(main.mixed_port) || 0,
+				listen: api.listen || ''
 			};
 		}
 	},
@@ -204,7 +381,7 @@ const methods = {
 				return { code: 1, error: '未知内核类型' };
 
 			const state = update_state();
-			if (state == 'running')
+			if (state == 'running' || updater_busy())
 				return { code: 1, error: '已有更新任务在执行' };
 
 			system('echo running > /tmp/flclash-update.state; : > /tmp/flclash-update.log');

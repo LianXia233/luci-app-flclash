@@ -3,9 +3,8 @@
     "description": "Control the FlClash core/service and read live system proxy information",
     "read": {
       "ubus": {
-        "flclash": ["system_proxy", "service_state", "core_log", "core_update_status", "core_type"]
-      },
-      "uci": ["flclash"]
+        "flclash": ["system_proxy", "service_state", "status", "webui_token", "core_log", "core_update_status", "core_type"]
+      }
     },
     "write": {
       "ubus": {

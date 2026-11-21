@@ -24,15 +24,42 @@ logger -t flclash-stopall "stopping full stack (backend + core + proxy)"
 /etc/init.d/flclash-api   stop >/dev/null 2>&1
 
 # 2) 彻底清除代理：
-#    stop  = uci_set 0 + teardown -> 删 nft/iptables 拦截规则、fw4 input 规则、DNS 劫持
+#    stop  = uci_set 0 + teardown -> 删 nft 拦截规则、fw4 input 规则、DNS 劫持
 #    purge = 删 mihomo nft table、策略路由(90x/2022)、Meta 网卡等内核残留
 if [ -x "$RULES" ]; then
 	"$RULES" stop  >/dev/null 2>&1
 	"$RULES" purge >/dev/null 2>&1
 fi
 
-# 3) 兜底清理顽固/孤儿进程，确保后端、内核、WebUI 全部退出。
-killall -q flclash-api flclash-core-bridge mihomo sing-box 2>/dev/null
+# 3) 兜底清理顽固/孤儿进程。只杀本插件自己的进程：mihomo/sing-box 可能
+#    属于其它代理插件（Nikki 等），按 argv 中的 IPC socket 识别归属。
+for pid in /proc/[0-9]*; do
+	comm=$(cat "$pid/comm" 2>/dev/null) || continue
+	case "$comm" in
+		flclash-api|flclash-core-br*|flclash-core-bridge)
+			kill "$pid" 2>/dev/null
+			;;
+		mihomo|sing-box)
+			cmd=$(tr '\0' ' ' < "$pid/cmdline" 2>/dev/null)
+			case "$cmd" in
+				*flclash-core.sock*) kill "$pid" 2>/dev/null ;;
+			esac
+			;;
+	esac
+done
+sleep 1
+for pid in /proc/[0-9]*; do
+	comm=$(cat "$pid/comm" 2>/dev/null) || continue
+	case "$comm" in
+		flclash-api|flclash-core-br*|flclash-core-bridge) kill -9 "$pid" 2>/dev/null ;;
+		mihomo|sing-box)
+			cmd=$(tr '\0' ' ' < "$pid/cmdline" 2>/dev/null)
+			case "$cmd" in
+				*flclash-core.sock*) kill -9 "$pid" 2>/dev/null ;;
+			esac
+			;;
+	esac
+done
 
 # 4) 状态归零，让 LuCI/WebUI 显示「已停止」。
 echo off > /tmp/flclash-proxy.state 2>/dev/null

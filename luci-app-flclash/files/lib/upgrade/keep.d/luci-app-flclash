@@ -1,0 +1,7 @@
+# Preserve user profiles, the active config and mixin across sysupgrade.
+# Generated Geo databases are deliberately excluded: they are large and can be
+# downloaded again by the core/updater.
+/etc/flclash/config.yaml
+/etc/flclash/index.json
+/etc/flclash/mixin.yaml
+/etc/flclash/profiles/

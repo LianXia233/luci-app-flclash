@@ -19,6 +19,7 @@
 # fall back to the pragmatic awk converter below on older installs where the
 # binary predates the --singbox-convert flag.
 set -eu
+umask 077
 
 IN="${1:-/etc/flclash/config.yaml}"
 OUT="${2:-/tmp/flclash-singbox.json}"

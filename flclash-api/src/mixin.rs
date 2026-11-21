@@ -20,6 +20,27 @@ pub fn mixin_path(data_dir: &str) -> std::path::PathBuf {
     Path::new(data_dir).join("mixin.yaml")
 }
 
+/// Keys that belong to the router, not to the user's desktop config. They are
+/// removed before merge so an old/hand-edited mixin cannot open the controller
+/// to the LAN, add arbitrary listeners or bypass the mode-owned TUN switch.
+pub const DENY_KEYS: [&str; 7] = [
+    "external-controller",
+    "external_controller",
+    "secret",
+    "listeners",
+    "authentication",
+    "bind-address",
+    "bind_address",
+];
+
+fn strip_denied(doc: &mut Value) {
+    if let Some(map) = doc.as_object_mut() {
+        for key in DENY_KEYS {
+            map.remove(key);
+        }
+    }
+}
+
 pub fn load_mixin(data_dir: &str) -> Result<Option<Value>, String> {
     let path = mixin_path(data_dir);
     let text = match std::fs::read_to_string(&path) {
@@ -41,6 +62,11 @@ pub fn save_mixin(data_dir: &str, text: &str) -> Result<(), String> {
         let doc: Value = serde_yaml::from_str(text).map_err(|e| format!("YAML 语法错误: {}", e))?;
         if !doc.is_object() {
             return Err("顶层必须是映射（例如 mode: rule）".into());
+        }
+        for key in DENY_KEYS {
+            if doc.get(key).is_some() {
+                return Err(format!("mixin 不允许设置 `{key}`（该字段由插件按运行模式管理）"));
+            }
         }
     }
     crate::config::write_atomic(&mixin_path(data_dir), text.as_bytes())
@@ -98,9 +124,11 @@ fn prepend_entries(base_map: &mut serde_json::Map<String, Value>, key: &str, val
 
 /// Applies the stored mixin (if any) to a converted profile YAML.
 pub fn apply_mixin(data_dir: &str, yaml: &str) -> Result<(String, Vec<String>), String> {
-    let Some(mixin) = load_mixin(data_dir)? else {
+    let Some(mut mixin) = load_mixin(data_dir)? else {
         return Ok((yaml.to_string(), Vec::new()));
     };
+    // Silently drop keys owned by the router (old mixins may still carry them).
+    strip_denied(&mut mixin);
     let mut doc: Value = serde_yaml::from_str(yaml).map_err(|e| format!("配置解析失败: {}", e))?;
     let mut touched: Vec<String> = mixin
         .as_object()
@@ -254,6 +282,18 @@ pub fn validate_payload(yaml: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_router_owned_keys() {
+        let dir = std::env::temp_dir().join(format!("flclash-mixin-deny-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.to_string_lossy().to_string();
+        assert!(save_mixin(&path, "external-controller: 0.0.0.0:9097\n").is_err());
+        assert!(save_mixin(&path, "listeners: []\n").is_err());
+        assert!(save_mixin(&path, "secret: ''\n").is_err());
+        assert!(save_mixin(&path, "mode: rule\ndns:\n  ipv6: true\n").is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn merges_maps_and_prepends_rules() {

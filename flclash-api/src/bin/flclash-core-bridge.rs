@@ -27,7 +27,7 @@
 
 use std::collections::HashMap;
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -63,6 +63,166 @@ fn flag_value(args: &[String], name: &str, default: &str) -> String {
 fn has_flag(args: &[String], name: &str) -> bool {
     args.iter()
         .any(|a| a == name || a.as_str() == format!("-{}", name) || a.as_str() == format!("--{}", name))
+}
+
+/// `--validate <config>`: syntax/semantic preflight for the IPC core.
+///
+/// The core has no `-t` (argv[1] is the IPC socket), so we boot a throwaway
+/// instance in a temp home and stop after `config.setup` — the phase that
+/// parses proxies/rules/DNS and starts the controller. Listener.start is never
+/// called, so no proxy port/TUN is created.
+async fn validate_config(core: &str, home: &str, config: &str) -> Result<(), String> {
+    use serde_yaml::{Mapping, Value as YamlValue};
+
+    let text = std::fs::read_to_string(config).map_err(|e| format!("read {config}: {e}"))?;
+    let mut doc: YamlValue =
+        serde_yaml::from_str(&text).map_err(|e| format!("YAML parse: {e}"))?;
+    let map = doc
+        .as_mapping_mut()
+        .ok_or_else(|| "config root must be a mapping".to_string())?;
+
+    let set = |map: &mut Mapping, key: &str, value: YamlValue| {
+        map.insert(YamlValue::String(key.to_string()), value);
+    };
+    // Hold a free loopback port only long enough to pick a number; the core
+    // then binds it itself. This avoids colliding with the live controller.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|listener| listener.local_addr())
+        .map(|addr| addr.port())
+        .map_err(|e| format!("pick controller port: {e}"))?;
+    set(
+        map,
+        "external-controller",
+        YamlValue::String(format!("127.0.0.1:{port}")),
+    );
+    for key in [
+        "port",
+        "socks-port",
+        "mixed-port",
+        "redir-port",
+        "tproxy-port",
+    ] {
+        set(map, key, YamlValue::from(0));
+    }
+    set(map, "allow-lan", YamlValue::Bool(false));
+    map.remove(&YamlValue::String("listeners".into()));
+    map.remove(&YamlValue::String("external-ui".into()));
+    if let Some(tun) = map
+        .get_mut(&YamlValue::String("tun".into()))
+        .and_then(|value| value.as_mapping_mut())
+    {
+        set(tun, "enable", YamlValue::Bool(false));
+        tun.remove(&YamlValue::String("enabled".into()));
+    }
+    if let Some(dns) = map
+        .get_mut(&YamlValue::String("dns".into()))
+        .and_then(|value| value.as_mapping_mut())
+    {
+        // A DNS listener on 1053 would collide with the live core. Port 0 is
+        // accepted by Go's net.Listen and still validates the DNS schema.
+        set(
+            dns,
+            "listen",
+            YamlValue::String("127.0.0.1:0".to_string()),
+        );
+    }
+    let sanitized = serde_yaml::to_string(&doc).map_err(|e| format!("serialize: {e}"))?;
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dir = std::path::PathBuf::from(format!("/tmp/flclash-validate-{}-{stamp}", std::process::id()));
+    std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
+    // Providers/rule-providers/GeoDB use paths relative to the real home.
+    // Symlinking them keeps the temp home cheap (no 30MB copies).
+    if let Ok(entries) = std::fs::read_dir(home) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str == "config.yaml"
+                || name_str.ends_with(".log")
+                || name_str == "cache.db"
+                || name_str == "config.yaml.candidate"
+                || name_str == "config.yaml.last-good"
+            {
+                continue;
+            }
+            let _ = std::os::unix::fs::symlink(entry.path(), dir.join(&name));
+        }
+    }
+    let tmp_config = dir.join("config.yaml");
+    std::fs::write(&tmp_config, sanitized).map_err(|e| format!("write candidate: {e}"))?;
+
+    let socket = dir.join("ipc.sock");
+    let listener = UnixListener::bind(&socket).map_err(|e| format!("bind ipc: {e}"))?;
+    let mut child = Command::new(core)
+        .arg(&socket)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("spawn core {core}: {e}"))?;
+
+    let result = async {
+        let (stream, _) = tokio::time::timeout(Duration::from_secs(15), listener.accept())
+            .await
+            .map_err(|_| "core did not connect within 15s".to_string())?
+            .map_err(|e| format!("accept: {e}"))?;
+        let (reader, writer) = stream.into_split();
+        let mut writer = Writer::Unix(writer);
+        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let reader_pending = pending.clone();
+        let reader_task = tokio::spawn(async move {
+            reader_loop(Reader::Unix(reader), reader_pending, false).await;
+        });
+        let call_result = async {
+            call(
+                &mut writer,
+                &pending,
+                "1",
+                "core.init",
+                serde_json::json!({
+                    "home-dir": dir.to_string_lossy(),
+                    "version": 1,
+                }),
+                Duration::from_secs(30),
+            )
+            .await?;
+            call(
+                &mut writer,
+                &pending,
+                "2",
+                "config.setup",
+                serde_json::json!({
+                    "selected-map": {},
+                    "options": {
+                        "test-url": "https://www.gstatic.com/generate_204",
+                        "skip-cert-verify": false,
+                        "delay-test-timeout": 5000,
+                        "mitm-capture": false
+                    }
+                }),
+                Duration::from_secs(60),
+            )
+            .await?;
+            Ok::<(), String>(())
+        }
+        .await;
+        reader_task.abort();
+        call_result
+    }
+    .await;
+
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+    let _ = std::fs::remove_dir_all(&dir);
+    result
 }
 
 fn log(msg: &str) {
@@ -329,6 +489,31 @@ async fn run_once(
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
     let args: Vec<String> = env::args().collect();
+
+    // Offline preflight: `flclash-core-bridge --validate <config> [-core bin]
+    // [-home-dir dir]`. Exits 0 when the core accepts the config, non-zero
+    // with the error on stderr.
+    if args.len() >= 3 && (args[1] == "--validate" || args[1] == "-validate") {
+        let config = args[2].clone();
+        let core = flag_value(&args, "-core", "/usr/bin/mihomo");
+        let default_home = PathBuf::from(&config)
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_string_lossy()
+            .into_owned();
+        let home = flag_value(&args, "-home-dir", &default_home);
+        match validate_config(&core, &home, &config).await {
+            Ok(()) => {
+                eprintln!("[flclash-bridge] validate ok: {config}");
+                std::process::exit(0);
+            }
+            Err(err) => {
+                eprintln!("[flclash-bridge] validate failed: {err}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     let socket = flag_value(&args, "-socket", "/tmp/flclash-core.sock");
     let core = flag_value(&args, "-core", "/usr/bin/mihomo");
     let home_dir = flag_value(&args, "-home-dir", "/etc/flclash");

@@ -117,6 +117,10 @@ window.FlClashAPI = (function () {
     proxyToggle: function (action) {
       return live('proxyToggle', { path: '/proxy/' + encodeURIComponent(action), method: 'POST' });
     },
+    setProxyMode: function (mode) {
+      return live('proxyMode', { path: '/proxy/mode', method: 'PUT' }, { mode: mode });
+    },
+    diagnostics: function () { return live('diagnostics', '/diagnostics'); },
     dnsResolve: function (name, type) {
       if (cfg.mock && mock && typeof mock.dnsResolve === 'function') {
         return mock.dnsResolve(name, type);
@@ -160,8 +164,16 @@ window.FlClashAPI = (function () {
       return live('coreSwitch', { path: '/core/switch', method: 'POST' }, { core: core });
     },
 
-    importProfile: function (profileUrl) {
-      return live('importProfile', { path: '/profiles/import', method: 'POST' }, { url: profileUrl });
+    importProfile: function (profileUrl, userAgent) {
+      const body = { url: profileUrl };
+      if (userAgent) body.userAgent = userAgent;
+      return live('importProfile', { path: '/profiles/import', method: 'POST' }, body);
+    },
+    importLocalProfile: function (name, text) {
+      return live('importLocalProfile', { path: '/profiles/import-local', method: 'POST' }, { name: name, text: text });
+    },
+    updateAllProfiles: function () {
+      return live('updateAllProfiles', { path: '/profiles/update-all', method: 'POST' });
     },
     updateProfile: function (id) {
       return live('updateProfile', { path: '/profiles/' + encodeURIComponent(id) + '/update', method: 'POST' });

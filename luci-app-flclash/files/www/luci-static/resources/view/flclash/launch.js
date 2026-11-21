@@ -31,6 +31,7 @@ function ubusCall(object, method, params) {
 }
 var callServiceState = function () { return ubusCall('flclash', 'service_state'); };
 var callServiceToggle = function (action) { return ubusCall('flclash', 'service_toggle', { action: action }); };
+var callWebuiToken = function () { return ubusCall('flclash', 'webui_token'); };
 var callCoreLog = function () { return ubusCall('flclash', 'core_log'); };
 var callCoreUpdate = function () { return ubusCall('flclash', 'core_update'); };
 var callCoreUpdateStatus = function () { return ubusCall('flclash', 'core_update_status'); };
@@ -75,29 +76,36 @@ return view.extend({
 		var wpath = (state && state.webui_path) || '/flclash/';
 		var target = window.location.protocol + '//' + window.location.hostname + ':' + wport + wpath;
 
-		/* The API secret is auto-generated on first install. Forward it in the
-		 * jump URL only — the visible row stays secret-free. */
-		function webuiTarget(current) {
-			if (!current || !current.api_secret)
-				return target;
-			var sep = target.indexOf('?') === -1 ? '?' : '&';
-			return target + sep + 'secret=' + encodeURIComponent(current.api_secret);
+		/* The API secret stays in a 0600 root-only file. The jump action asks
+		 * rpcd for a short-lived token instead, so no read-ACL session ever
+		 * sees the long-term credential. */
+		function openWebui(current) {
+			return L.resolveDefault(callWebuiToken(), null).then(function (minted) {
+				var port = (minted && minted.webui_port) || wport;
+				var path = (minted && minted.webui_path) || wpath;
+				var base = window.location.protocol + '//' + window.location.hostname + ':' + port + path;
+				var url = base;
+				if (minted && minted.code === 0 && minted.token)
+					url = base + (base.indexOf('?') === -1 ? '?' : '&') + 'secret=' + encodeURIComponent(minted.token);
+				else if (minted && minted.error)
+					ui.addNotification(null, E('p', {}, _(minted.error)), 'warning');
+				window.open(url, '_blank');
+			});
 		}
 
 		jumpBtn.addEventListener('click', function () {
+			jumpBtn.disabled = true;
 			callServiceState().then(function (current) {
 				if (!current || !current.running) {
 					/* The backend is down: bring it up first, then jump. The
 					 * proxy core is NOT started here — the user controls it
 					 * from the WebUI's own switch. */
 					return callServiceToggle('start').then(function () {
-						return callServiceState().then(function (next) {
-							window.open(webuiTarget(next || current), '_blank');
-						});
+						return openWebui(current);
 					});
 				}
-				window.open(webuiTarget(current), '_blank');
-			});
+				return openWebui(current);
+			}).finally(function () { jumpBtn.disabled = false; });
 		});
 
 		toggleBtn.addEventListener('click', function () {

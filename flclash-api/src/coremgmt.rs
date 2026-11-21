@@ -76,12 +76,27 @@ fn uci(args: &[&str]) -> Result<(), String> {
 }
 
 pub fn info() -> Value {
+    let mirror = std::process::Command::new("uci")
+        .args(["-q", "get", "flclash.update.mirror"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    let channel = std::process::Command::new("uci")
+        .args(["-q", "get", "flclash.update.channel"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "stable".into());
     json!({
         "active": active(),
         "mihomo_installed": installed("mihomo"),
         "singbox_installed": installed("sing-box"),
         "mihomo_version": version("mihomo"),
         "singbox_version": version("sing-box"),
+        "mirror": mirror,
+        "channel": channel,
     })
 }
 
@@ -110,7 +125,7 @@ pub async fn switch(st: &crate::state::AppState, core: &str) -> Result<Value, St
             .map_err(|e| format!("读取 config.yaml 失败: {e}"))?;
         match crate::singbox::convert(&yaml) {
             Ok(json_text) => {
-                std::fs::write(SINGBOX_JSON, json_text)
+                crate::config::write_atomic(std::path::Path::new(SINGBOX_JSON), json_text.as_bytes())
                     .map_err(|e| format!("写入 sing-box 配置失败: {e}"))?;
                 converted = true;
             }
@@ -134,6 +149,15 @@ pub fn update_start(core: &str) -> Result<Value, String> {
     let state = std::fs::read_to_string(UPDATE_STATE).unwrap_or_default();
     if state.trim() == "running" {
         return Err("已有更新正在进行".into());
+    }
+    // The shell updater owns a mkdir lock; do not write `running` when it is
+    // still held (it would exit 3 and leave the UI stuck on running forever).
+    if let Ok(raw) = std::fs::read_to_string("/tmp/flclash-core-update.lock/pid") {
+        if let Ok(pid) = raw.trim().parse::<u32>() {
+            if std::path::Path::new(&format!("/proc/{pid}")).exists() {
+                return Err("已有更新正在进行".into());
+            }
+        }
     }
     // The shell updater owns done/failed, but somebody has to publish "running"
     // for the WebUI path (the LuCI path does it in ucode). Without this the

@@ -15,6 +15,9 @@ START=95
 STOP=05
 USE_PROCD=1
 
+# Generated configs contain proxy credentials; never publish them 0644.
+umask 077
+
 get_option() {
 	local section="$1" option="$2" default="$3" value
 	config_get value "$section" "$option"
@@ -30,7 +33,7 @@ ensure_config() {
 	port="$(get_option main mixed_port 7892)"
 	controller="$(get_option main external_controller 127.0.0.1:9097)"
 	mode="$(get_option main mode rule)"
-	level="$(get_option main log_level info)"
+	level="$(get_option main log_level warning)"
 
 	mkdir -p "$(dirname "$file")"
 	cat > "$file" <<EOF
@@ -82,7 +85,14 @@ start_service() {
 	procd_open_instance flclash-core
 	# Route controller Geo DB downloads through the local mihomo proxy.
 	# GODEBUG=http2client=0 avoids CDN HTTP/2 handshakes being reset (EOF).
-	procd_set_param env HTTPS_PROXY=http://127.0.0.1:7892 HTTP_PROXY=http://127.0.0.1:7892 NO_PROXY=127.0.0.1,localhost,::1 GODEBUG=http2client=0
+	# GOMEMLIMIT is a soft cap for the Go runtime; on 256MB routers the default
+	# heap growth can otherwise end in the OOM killer taking down dnsmasq.
+	local mem_kb mem_limit
+	mem_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null)
+	[ -n "$mem_kb" ] || mem_kb=262144
+	mem_limit=$((mem_kb * 40 / 100 / 1024))
+	[ "$mem_limit" -ge 64 ] || mem_limit=64
+	procd_set_param env GOMEMLIMIT="${mem_limit}MiB" GOGC=50 HTTPS_PROXY=http://127.0.0.1:7892 HTTP_PROXY=http://127.0.0.1:7892 NO_PROXY=127.0.0.1,localhost,::1 GODEBUG=http2client=0
 	if [ "$core_type" = "sing-box" ]; then
 		# sing-box uses its own JSON config. Translate the Clash-format
 		# config.yaml on the fly; if the converter is missing or fails, fall
@@ -92,7 +102,7 @@ start_service() {
 			&& /usr/libexec/flclash/singbox-convert.sh "$config_file" "$sb_config" >/dev/null 2>&1 \
 			&& [ -s "$sb_config" ]; then
 			config_file=$sb_config
-			chmod 0644 "$config_file" 2>/dev/null
+			chmod 0600 "$config_file" 2>/dev/null
 		fi
 		# Legacy rule-set download_detour is emitted by default; allow it on
 		# sing-box 1.14+ until the converter moves to the new syntax.

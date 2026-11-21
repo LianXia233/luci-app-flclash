@@ -68,30 +68,31 @@ fn json_arr(items: &[String]) -> Value {
     Value::Array(items.iter().map(|s| Value::String(s.clone())).collect())
 }
 
-/// Split `key: value` where the key may be quoted and contain ':' itself
-/// (e.g. `'geosite:cn':`). Falls back to the first colon otherwise.
-fn split_yaml_kv(line: &str) -> Option<(String, &str)> {
-    let t = line.trim();
-    let first = t.chars().next()?;
-    if first == '\'' || first == '"' {
-        let end = t[1..].find(first)? + 1;
-        let key = t[1..end].to_string();
-        let rest = t[end + 1..].trim_start();
-        let value = rest.strip_prefix(':')?.trim();
-        return Some((key, value));
-    }
-    let (k, v) = t.split_once(':')?;
-    Some((k.trim().to_string(), v.trim()))
+/// Normalises text coming from subscriptions/editors before it reaches any
+/// parser: a UTF-8 BOM on the first key would otherwise defeat the top-level
+/// key whitelist (and produce a duplicate `mixed-port`), while CRLF breaks the
+/// shell-side `grep '^dns:'` / `awk` block editors.
+pub fn normalize_yaml_text(text: &str) -> String {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
-fn unquote(s: &str) -> String {
-    let t = s.trim();
-    if (t.starts_with('\'') && t.ends_with('\'') && t.len() >= 2)
-        || (t.starts_with('"') && t.ends_with('"') && t.len() >= 2)
-    {
-        t[1..t.len() - 1].to_string()
-    } else {
-        t.to_string()
+/// Copies keys that exist in `old` but not in `new` into `new`. Used after a
+/// block edit so unknown DNS/TUN keys (hosts, fake-ip-filter-mode,
+/// route-address, interface-name, …) survive a settings save.
+fn merge_missing(new: &mut Value, old: &Value) {
+    match (new, old) {
+        (Value::Object(new_map), Value::Object(old_map)) => {
+            for (key, old_value) in old_map {
+                match new_map.get_mut(key) {
+                    Some(new_value) => merge_missing(new_value, old_value),
+                    None => {
+                        new_map.insert(key.clone(), old_value.clone());
+                    }
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -101,119 +102,112 @@ fn yaml_bool(v: bool) -> &'static str {
 
 /// Reads the scalar view of config.yaml without the controller — the
 /// fallback that keeps the settings page operable while the core is stopped.
+fn get_bool(value: Option<&Value>) -> Option<bool> {
+    value.and_then(|v| v.as_bool())
+}
+
+fn list_of(value: Option<&Value>) -> Vec<String> {
+    match value {
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.trim().to_string()))
+            .filter(|s| !s.is_empty())
+            .collect(),
+        Some(Value::String(text)) => text
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Reads the scalar view of config.yaml without the controller — the
+/// fallback that keeps the settings page operable while the core is stopped.
+/// YAML-aware on purpose: line matching broke on CRLF, BOM, quoted
+/// `nameserver-policy` keys and flow-style blocks.
 pub fn file_config(path: &Path) -> CoreConfigView {
     let mut cfg = CoreConfigView {
         mode: "rule".into(),
-        log_level: "info".into(),
+        log_level: "warning".into(),
         tun_stack: "mixed".into(),
         ..Default::default()
     };
-    let Ok(data) = std::fs::read_to_string(path) else {
+    let Ok(raw) = std::fs::read_to_string(path) else {
         return cfg;
     };
-    let mut in_tun = false;
-    let mut in_dns = false;
-    let mut in_sniffer = false;
+    let data = normalize_yaml_text(&raw);
+    let Ok(doc) = serde_yaml::from_str::<Value>(&data) else {
+        return cfg;
+    };
+    let Some(root) = doc.as_object() else {
+        return cfg;
+    };
+
+    cfg.port = root.get("port").and_then(|v| v.as_i64()).unwrap_or(0);
+    cfg.socks_port = root.get("socks-port").and_then(|v| v.as_i64()).unwrap_or(0);
+    cfg.mixed_port = root.get("mixed-port").and_then(|v| v.as_i64()).unwrap_or(0);
+    if let Some(v) = root.get("mode").and_then(|v| v.as_str()) {
+        cfg.mode = v.to_string();
+    }
+    if let Some(v) = root.get("log-level").and_then(|v| v.as_str()) {
+        cfg.log_level = v.to_string();
+    }
+    cfg.allow_lan = get_bool(root.get("allow-lan")).unwrap_or(false);
+    cfg.ipv6 = get_bool(root.get("ipv6")).unwrap_or(false);
+
     let mut sniffer_enabled = false;
-    let mut dns_key = String::new();
-    for line in data.lines() {
-        let trimmed = line.trim();
-        let at_root = !trimmed.is_empty()
-            && !line.starts_with(' ')
-            && !line.starts_with('\t')
-            && trimmed.contains(':');
-        if at_root {
-            let (key, value) = trimmed.split_once(':').unwrap();
-            let value = value.trim();
-            in_tun = key == "tun";
-            in_dns = key == "dns";
-            in_sniffer = key == "sniffer";
-            dns_key.clear();
-            match key {
-                "port" => cfg.port = value.parse().unwrap_or(0),
-                "socks-port" => cfg.socks_port = value.parse().unwrap_or(0),
-                "mixed-port" => cfg.mixed_port = value.parse().unwrap_or(0),
-                "mode" => cfg.mode = value.to_string(),
-                "log-level" => cfg.log_level = value.to_string(),
-                "allow-lan" => cfg.allow_lan = value == "true",
-                "ipv6" => cfg.ipv6 = value == "true",
-                _ => {}
-            }
-            continue;
-        }
-        if in_tun {
-            if let Some(rest) = trimmed.strip_prefix("enable:") {
-                cfg.tun = rest.trim() == "true";
-            } else if let Some(rest) = trimmed.strip_prefix("stack:") {
-                let stack = rest.trim();
-                if matches!(stack, "gvisor" | "system" | "mixed") {
-                    cfg.tun_stack = stack.to_string();
-                }
-            }
-            continue;
-        }
-        if in_sniffer {
-            if let Some(rest) = trimmed.strip_prefix("enable:") {
-                if rest.trim() == "true" {
-                    sniffer_enabled = true;
-                }
-            }
-            continue;
-        }
-        if in_dns {
-            let indent = line.len() - line.trim_start().len();
-            if trimmed.starts_with("- ") {
-                let item = unquote(&trimmed[2..]);
-                match dns_key.as_str() {
-                    "nameserver" => cfg.dns_nameservers.push(item),
-                    "default-nameserver" => cfg.dns_default_nameservers.push(item),
-                    "fake-ip-filter" => cfg.dns_fake_ip_filter.push(item),
-                    "fallback" => cfg.dns_fallback.push(item),
-                    "proxy-server-nameserver" => cfg.dns_proxy_server_ns.push(item),
-                    "direct-nameserver" => cfg.dns_direct_ns.push(item),
-                    "ipcidr" => cfg.dns_fb_ipcidr.push(item),
-                    "domain" => cfg.dns_fb_domain.push(item),
-                    _ => {
-                        // list items under a nameserver-policy domain key
-                        if dns_key == "nameserver-policy" {
-                            if let Some(last) = cfg.dns_ns_policy.last_mut() {
-                                last.1.push(item);
-                            }
-                        }
-                    }
-                }
-                continue;
-            }
-            if let Some((key, value)) = split_yaml_kv(trimmed) {
-                if dns_key == "fallback-filter" && indent >= 4 {
-                    match key.as_str() {
-                        "geoip" => cfg.dns_fb_geoip = Some(value == "true"),
-                        "geoip-code" => cfg.dns_fb_geoip_code = value.to_string(),
-                        "ipcidr" | "domain" => dns_key = key,
-                        _ => {}
-                    }
-                    continue;
-                }
-                if dns_key == "nameserver-policy" && indent >= 4 {
-                    let servers = if value.is_empty() {
-                        Vec::new()
-                    } else {
-                        vec![unquote(value)]
-                    };
-                    cfg.dns_ns_policy.push((key, servers));
-                    continue;
-                }
-                match key.as_str() {
-                    "enable" => cfg.dns_enable = value == "true",
-                    "enhanced-mode" => cfg.dns_mode = value.to_string(),
-                    "fake-ip-range" => cfg.dns_fake_ip_range = value.to_string(),
-                    "ipv6" => cfg.dns_ipv6 = Some(value == "true"),
-                    _ => {}
-                }
-                dns_key = key;
+    if let Some(sniffer) = root.get("sniffer").and_then(|v| v.as_object()) {
+        sniffer_enabled = get_bool(sniffer.get("enable")).unwrap_or(false);
+    }
+
+    if let Some(tun) = root.get("tun").and_then(|v| v.as_object()) {
+        cfg.tun = get_bool(tun.get("enable"))
+            .or_else(|| get_bool(tun.get("enabled")))
+            .unwrap_or(false);
+        if let Some(stack) = tun.get("stack").and_then(|v| v.as_str()) {
+            if matches!(stack, "gvisor" | "system" | "mixed") {
+                cfg.tun_stack = stack.to_string();
             }
         }
     }
+
+    if let Some(dns) = root.get("dns").and_then(|v| v.as_object()) {
+        cfg.dns_enable = get_bool(dns.get("enable"))
+            .or_else(|| get_bool(dns.get("enabled")))
+            .unwrap_or(false);
+        if let Some(v) = dns.get("enhanced-mode").and_then(|v| v.as_str()) {
+            cfg.dns_mode = v.to_string();
+        }
+        if let Some(v) = dns.get("fake-ip-range").and_then(|v| v.as_str()) {
+            cfg.dns_fake_ip_range = v.to_string();
+        }
+        cfg.dns_nameservers = list_of(dns.get("nameserver"));
+        cfg.dns_default_nameservers = list_of(dns.get("default-nameserver"));
+        cfg.dns_fake_ip_filter = list_of(dns.get("fake-ip-filter"));
+        cfg.dns_fallback = list_of(dns.get("fallback"));
+        cfg.dns_proxy_server_ns = list_of(dns.get("proxy-server-nameserver"));
+        cfg.dns_direct_ns = list_of(dns.get("direct-nameserver"));
+        cfg.dns_ipv6 = get_bool(dns.get("ipv6"));
+
+        if let Some(fb) = dns.get("fallback-filter").and_then(|v| v.as_object()) {
+            cfg.dns_fb_geoip = get_bool(fb.get("geoip"));
+            cfg.dns_fb_geoip_code = fb
+                .get("geoip-code")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            cfg.dns_fb_ipcidr = list_of(fb.get("ipcidr"));
+            cfg.dns_fb_domain = list_of(fb.get("domain"));
+        }
+
+        if let Some(policy) = dns.get("nameserver-policy").and_then(|v| v.as_object()) {
+            for (domain, servers) in policy {
+                cfg.dns_ns_policy.push((domain.clone(), list_of(Some(servers))));
+            }
+        }
+    }
+
     // A sniffer block combined with fake-ip is how persisted "mixed" mode
     // is represented; surface it back to the UI as mixed, not raw fake-ip.
     if sniffer_enabled && cfg.dns_mode == "fake-ip" {
@@ -277,6 +271,21 @@ pub(crate) fn validate_patch(patch: &Value) -> Result<(), String> {    fn scan(v
             return Err(format!("logLevel 非法: {}", level));
         }
     }
+    if let Some(mode) = patch.get("proxyMode").and_then(|v| v.as_str()) {
+        if !matches!(mode, "off" | "redirect" | "tproxy" | "tun") {
+            return Err(format!("proxyMode 非法: {}", mode));
+        }
+    }
+    if let Some(mode) = patch.get("ipv6Mode").and_then(|v| v.as_str()) {
+        if !matches!(mode, "proxy" | "off" | "direct") {
+            return Err(format!("ipv6Mode 非法: {}", mode));
+        }
+    }
+    if let Some(mode) = patch.get("quic").and_then(|v| v.as_str()) {
+        if !matches!(mode, "proxy" | "reject" | "bypass") {
+            return Err(format!("quic 非法: {}", mode));
+        }
+    }
     for key in ["mixedPort", "socksPort", "httpPort", "redirPort", "tproxyPort"] {
         if let Some(value) = patch.get(key) {
             let Some(port) = value.as_i64() else {
@@ -326,7 +335,25 @@ pub async fn save_config(
     }
     // tun is NOT runtime-patched: taking over the router needs the full
     // auto-route/auto-redirect block, which only a config reload applies.
-    if !runtime.is_empty() && !tun_runtime {
+    //
+    // Persist + preflight BEFORE any runtime PATCH: a rejected config must
+    // leave both the file and the running core untouched.
+    let config_path = st.config_path();
+    let previous = std::fs::read(&config_path).ok();
+    if let Some(previous) = &previous {
+        let last_good = config_path.with_file_name("config.yaml.last-good");
+        let _ = write_atomic(&last_good, previous);
+    }
+    let result = persist_config(&config_path, patch);
+    if result.is_ok() {
+        if let Err(err) = crate::preflight::validate_config(config_path.clone()).await {
+            if let Some(previous) = &previous {
+                let _ = write_atomic(&config_path, previous);
+            }
+            return Err(format!("配置预检失败: {err}"));
+        }
+    }
+    if result.is_ok() && !runtime.is_empty() && !tun_runtime {
         // Failure is deliberately non-fatal: a stopped core must not turn
         // "save settings" into an error (connection refused must not leak).
         let body = serde_json::to_string(&Value::Object(runtime)).unwrap_or_default();
@@ -340,7 +367,6 @@ pub async fn save_config(
         )
         .await;
     }
-    let result = persist_config(&st.config_path(), patch);
     // dns, tun and tunStack patches only take effect from the startup config
     // file, so a stopped core is left alone but a live one is reloaded.
     // mode is included because sing-box has no runtime mode switch: its
@@ -363,19 +389,161 @@ pub async fn save_config(
         }
     }
     if result.is_ok() {
+        let mut proxy_touched = false;
+        let mut mode: Option<String> = parse_str(patch, "proxyMode").map(|s| s.to_string());
         if let Some(enabled) = parse_bool(patch, "proxyLan") {
-            let action = if enabled { "start" } else { "stop" };
+            mode = Some(if enabled { "redirect".into() } else { "off".into() });
+        }
+        if let Some(ipv6) = parse_str(patch, "ipv6Mode") {
+            uci_set_key("flclash.proxy.ipv6", ipv6)?;
+            proxy_touched = true;
+        }
+        if let Some(quic) = parse_str(patch, "quic") {
+            uci_set_key("flclash.proxy.quic", quic)?;
+            proxy_touched = true;
+        }
+        if let Some(mode) = &mode {
+            uci_set_key("flclash.proxy.mode", mode)?;
+            uci_set_key(
+                "flclash.proxy.enabled",
+                if mode == "off" { "0" } else { "1" },
+            )?;
+            proxy_touched = true;
+        }
+        if proxy_touched {
+            uci_commit_pkg("flclash")?;
+        }
+        if let Some(mode) = &mode {
+            let action = if mode == "off" { "stop" } else { "start" };
             let output = tokio::process::Command::new("/usr/libexec/flclash/proxy-rules.sh")
                 .arg(action)
                 .output()
                 .await
                 .map_err(|e| format!("proxy-rules.sh {}: {}", action, e))?;
             if !output.status.success() {
-                return Err(format!("透明代理{}失败", if enabled { "启用" } else { "关闭" }));
+                return Err(format!(
+                    "透明代理{}失败",
+                    if mode == "off" { "关闭" } else { "启用" }
+                ));
             }
+        } else if proxy_touched && uci_get_key("flclash.proxy.mode") != "off" {
+            // IPv6/QUIC change on a live proxy: rebuild rules, do not start a
+            // stopped core as a side effect.
+            let _ = tokio::process::Command::new("/usr/libexec/flclash/proxy-rules.sh")
+                .arg("sync")
+                .output()
+                .await;
         }
     }
     result
+}
+
+fn uci_set_key(key: &str, value: &str) -> Result<(), String> {
+    let out = std::process::Command::new("uci")
+        .args(["set", &format!("{key}={value}")])
+        .output()
+        .map_err(|e| format!("uci set {key}: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "uci set {key}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
+    }
+}
+
+fn uci_commit_pkg(pkg: &str) -> Result<(), String> {
+    let out = std::process::Command::new("uci")
+        .args(["commit", pkg])
+        .output()
+        .map_err(|e| format!("uci commit {pkg}: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "uci commit {pkg}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
+    }
+}
+
+fn uci_get_key(key: &str) -> String {
+    std::process::Command::new("uci")
+        .args(["-q", "get", key])
+        .output()
+        .ok()
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
+pub fn runtime_mode() -> String {
+    let mode = uci_get_key("flclash.proxy.mode");
+    if matches!(mode.as_str(), "off" | "redirect" | "tproxy" | "tun") {
+        return mode;
+    }
+    if uci_get_key("flclash.proxy.enabled") == "1" {
+        "redirect".into()
+    } else {
+        "off".into()
+    }
+}
+
+pub fn runtime_ipv6() -> String {
+    let mode = uci_get_key("flclash.proxy.ipv6");
+    if matches!(mode.as_str(), "proxy" | "off" | "direct") {
+        return mode;
+    }
+    if uci_get_key("flclash.proxy.filter_aaaa") == "1" {
+        "off".into()
+    } else {
+        "proxy".into()
+    }
+}
+
+/// Final router-owned layer. Runs after the subscription and the user mixin,
+/// so neither can override controller/listener ownership, loop mark, ports,
+/// DNS listener or the TUN switch. serde_yaml also quotes scalars safely.
+pub fn enforce_invariants(yaml: &str) -> Result<String, String> {
+    let mut doc: Value = serde_yaml::from_str(yaml).map_err(|e| format!("配置解析失败: {e}"))?;
+    let root = doc
+        .as_object_mut()
+        .ok_or_else(|| "配置顶层必须是映射".to_string())?;
+    let mode = runtime_mode();
+    let ipv6 = runtime_ipv6();
+
+    let controller = {
+        let value = uci_get_key("flclash.main.external_controller");
+        if value.is_empty() {
+            "127.0.0.1:9097".to_string()
+        } else {
+            value
+        }
+    };
+    root.insert("external-controller".into(), Value::String(controller));
+    root.insert("routing-mark".into(), Value::from(333));
+    root.insert("allow-lan".into(), Value::Bool(mode != "off"));
+    root.insert("ipv6".into(), Value::Bool(ipv6 != "off"));
+    if let Ok(port) = uci_get_key("flclash.main.mixed_port").parse::<i64>() {
+        if port > 0 {
+            root.insert("mixed-port".into(), Value::from(port));
+        }
+    }
+    // Client-only inbound set: custom `listeners` could open arbitrary ports
+    // outside the fw4 guard.
+    root.remove("listeners");
+    root.remove("authentication");
+    root.remove("bind-address");
+
+    if let Some(dns) = root.get_mut("dns").and_then(|v| v.as_object_mut()) {
+        dns.insert("listen".into(), Value::String("0.0.0.0:1053".into()));
+        dns.insert("ipv6".into(), Value::Bool(ipv6 != "off"));
+    }
+    if let Some(tun) = root.get_mut("tun").and_then(|v| v.as_object_mut()) {
+        tun.insert("enable".into(), Value::Bool(mode == "tun"));
+        tun.remove("enabled");
+    }
+    serde_yaml::to_string(&doc).map_err(|e| format!("配置序列化失败: {e}"))
 }
 
 /// Renders the dns: block from a patch object (UI field names accepted).
@@ -627,7 +795,8 @@ fn render_sniffer_block(patch: &Value) -> Option<String> {
 /// Mirrors a settings patch into config.yaml. Top-level scalar keys are
 /// line-edited in place; tun, dns and sniffer are block-edited.
 pub fn persist_config(path: &Path, patch: &Value) -> Result<(), String> {
-    let data = std::fs::read_to_string(path).map_err(|e| format!("read config: {}", e))?;
+    let raw = std::fs::read_to_string(path).map_err(|e| format!("read config: {}", e))?;
+    let data = normalize_yaml_text(&raw);
     let current = file_config(path);
     let dns_block = render_dns_block(patch, &current);
     let tun_block = render_tun_block(patch);
@@ -766,10 +935,20 @@ pub fn persist_config(path: &Path, patch: &Value) -> Result<(), String> {
             }
             if in_tun {
                 if line.starts_with(' ') || line.starts_with('\t') {
-                    if let Some(rest) = trimmed.strip_prefix("enable:") {
-                        let _ = rest;
-                        out.push(format!("  enable: {}", yaml_bool(tun.unwrap())));
-                        continue;
+                    // Only rewrite `enable` when the patch actually carries a
+                    // `tun` value. Calling tun.unwrap() unconditionally made
+                    // every patch without `tun` (e.g. {"mode":"global"})
+                    // panic on a config that already had a tun: block.
+                    if trimmed.strip_prefix("enable:").is_some() {
+                        if let Some(enabled) = tun {
+                            let indent = line.len() - line.trim_start().len();
+                            out.push(format!(
+                                "{}enable: {}",
+                                " ".repeat(indent),
+                                yaml_bool(enabled)
+                            ));
+                            continue;
+                        }
                     }
                 } else {
                     in_tun = false;
@@ -818,7 +997,28 @@ pub fn persist_config(path: &Path, patch: &Value) -> Result<(), String> {
         }
     }
 
-    let final_text = format!("{}\n", out.join("\n"));
+    let mut final_text = format!("{}\n", out.join("\n"));
+    // The line-based DNS/TUN renderers only know their modelled keys. Before
+    // publishing, merge every unknown key from the previous document back in
+    // (hosts, fake-ip-filter-mode, respect-rules, route-address,
+    // interface-name, …), and let serde_yaml quote scalars safely (#, ', ::1).
+    if dns_block.is_some() || tun_block.is_some() || sniffer_block.is_some() {
+        if let (Ok(mut new_doc), Ok(old_doc)) = (
+            serde_yaml::from_str::<Value>(&final_text),
+            serde_yaml::from_str::<Value>(&data),
+        ) {
+            for key in ["dns", "tun", "sniffer"] {
+                if let (Some(new_value), Some(old_value)) =
+                    (new_doc.get_mut(key), old_doc.get(key))
+                {
+                    merge_missing(new_value, old_value);
+                }
+            }
+            if let Ok(serialized) = serde_yaml::to_string(&new_doc) {
+                final_text = serialized;
+            }
+        }
+    }
     write_atomic(path, final_text.as_bytes())
 }
 
@@ -840,7 +1040,28 @@ pub fn write_atomic(path: &Path, data: &[u8]) -> Result<(), String> {
         .ok_or_else(|| format!("invalid path: {}", path.display()))?;
     let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
     let tmp = parent.join(format!(".{}.{}.{}.tmp", name, std::process::id(), seq));
-    std::fs::write(&tmp, data).map_err(|e| format!("write {}: {}", tmp.display(), e))?;
+    // 0600 on purpose: config.yaml, profiles, mixin and backups all carry
+    // subscription credentials or the API secret-adjacent material. OpenWrt's
+    // default umask is 022, so a plain fs::write would publish them world-wide.
+    {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&tmp)
+            .map_err(|e| format!("write {}: {}", tmp.display(), e))?;
+        use std::io::Write;
+        file.write_all(data)
+            .map_err(|e| format!("write {}: {}", tmp.display(), e))?;
+        // fsync before rename: a power cut must not leave a zero-length file
+        // where the live config used to be.
+        file.sync_all()
+            .map_err(|e| format!("fsync {}: {}", tmp.display(), e))?;
+    }
     if let Err(e) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(format!("rename {}: {}", path.display(), e));
@@ -917,8 +1138,8 @@ mod tests {
         assert!(text.contains("auto-route: true"));
         assert!(text.contains("auto-redirect: true"));
         assert!(text.contains("route-exclude-address:"));
-        assert!(text.contains("    - 192.168.0.0/16"));
-        assert!(text.contains("    - fc00::/7"));
+        assert!(text.contains("192.168.0.0/16"));
+        assert!(text.contains("fc00::/7"));
         assert!(text.contains("dns-hijack:"));
         assert!(text.contains("proxies:"));
         std::fs::remove_dir_all(&dir).ok();
@@ -991,5 +1212,82 @@ mod tests {
         assert!(validate_patch(&serde_json::json!({"logLevel": "verbose"})).is_err());
         assert!(validate_patch(&serde_json::json!({"mixedPort": 70000})).is_err());
         assert!(validate_patch(&serde_json::json!({"mixedPort": 7892})).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_writes_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("flclash-mode-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("secret.yaml");
+        write_atomic(&path, b"a: 1\n").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "credentials must not be world-readable");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn patch_without_tun_does_not_panic_on_tun_block() {
+        let dir = std::env::temp_dir().join(format!("flclash-tun-panic-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.yaml");
+        std::fs::write(
+            &path,
+            "mode: rule\ntun:\n  enable: false\n  interface-name: mytun\n",
+        )
+        .unwrap();
+        // Before the fix this hit tun.unwrap() with None and, with
+        // panic=abort, killed the whole API process.
+        persist_config(&path, &serde_json::json!({"mode": "global"})).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("mode: global"));
+        assert!(text.contains("interface-name: mytun"));
+        assert!(text.contains("enable: false"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dns_save_preserves_unknown_keys() {
+        let dir = std::env::temp_dir().join(format!("flclash-dns-keep-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.yaml");
+        std::fs::write(
+            &path,
+            "mixed-port: 7892\ndns:\n  enable: true\n  enhanced-mode: fake-ip\n  hosts:\n    router.lan: 192.168.1.1\n  fake-ip-filter-mode: blacklist\n  nameserver:\n    - 223.5.5.5\n",
+        )
+        .unwrap();
+        persist_config(
+            &path,
+            &serde_json::json!({"dns": {"enable": true, "enhanced-mode": "fake-ip", "nameserver": ["1.1.1.1"]}}),
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("hosts:"));
+        assert!(text.contains("router.lan"));
+        assert!(text.contains("fake-ip-filter-mode"));
+        assert!(text.contains("1.1.1.1"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn normalize_strips_bom_and_crlf() {
+        let text = normalize_yaml_text("\u{feff}mixed-port: 7892\r\ndns:\r\n  enable: true\r\n");
+        assert!(text.starts_with("mixed-port: 7892\n"));
+        assert!(!text.contains('\r'));
+        assert!(!text.contains('\u{feff}'));
+    }
+
+    #[test]
+    fn invariants_override_subscription_control_plane() {
+        let out = enforce_invariants(
+            "external-controller: 0.0.0.0:9097\nrouting-mark: 1\nlisteners:\n  - type: socks\n    port: 1080\ntun:\n  enable: true\n",
+        )
+        .unwrap();
+        let doc: Value = serde_yaml::from_str(&out).unwrap();
+        assert_eq!(doc["external-controller"], "127.0.0.1:9097");
+        assert_eq!(doc["routing-mark"], 333);
+        assert!(doc.get("listeners").is_none());
+        assert_eq!(doc["tun"]["enable"], false, "mode off must disable TUN");
     }
 }

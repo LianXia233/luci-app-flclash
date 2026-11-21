@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
 use crate::config::write_atomic;
-use crate::convert::{count_top_level_list, fetch_profile};
+use crate::convert::{convert_subscription, count_top_level_list, fetch_profile};
 use crate::state::{human_age, human_bytes, now_secs, AppState};
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -29,6 +29,17 @@ pub struct Profile {
     pub total: i64,
     #[serde(default)]
     pub expire: i64,
+    /// Subscription request options (FlClash-compatible).
+    #[serde(default)]
+    pub user_agent: String,
+    #[serde(default)]
+    pub timeout: i64,
+    #[serde(default)]
+    pub retry: i64,
+    #[serde(default)]
+    pub last_error: String,
+    #[serde(default)]
+    pub last_success: i64,
     #[serde(default)]
     pub active: bool,
 }
@@ -43,6 +54,14 @@ pub fn load_profiles(st: &AppState) -> Vec<Profile> {
 pub fn save_profiles(st: &AppState, list: &[Profile]) -> Result<(), String> {
     std::fs::create_dir_all(st.profiles_dir())
         .map_err(|e| format!("mkdir profiles: {}", e))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(
+            st.profiles_dir(),
+            std::fs::Permissions::from_mode(0o700),
+        );
+    }
     let data = serde_json::to_vec_pretty(list).map_err(|e| e.to_string())?;
     // Atomic: a power cut mid-write must not leave an unparseable index (which
     // load_profiles would silently treat as "no profiles").
@@ -202,6 +221,11 @@ pub fn profile_payload(st: &AppState, item: &Profile) -> Value {
         "url": item.url,
         "updatedAt": human_age(item.updated_at),
         "interval": item.interval,
+        "userAgent": item.user_agent,
+        "timeout": item.timeout,
+        "retry": item.retry,
+        "lastError": item.last_error,
+        "lastSuccess": item.last_success,
         "active": item.active,
         "expireDays": expire_days,
         "usedShare": used_share,
@@ -234,9 +258,13 @@ fn name_from_url(url: &str) -> String {
 
 /// Downloads (via curl) and stores a new profile. The stored file is always
 /// converted YAML, never the raw subscription body.
-pub async fn import_profile(st: &AppState, url: &str) -> Result<Profile, String> {
+pub async fn import_profile(
+    st: &AppState,
+    url: &str,
+    user_agent: Option<&str>,
+) -> Result<Profile, String> {
     validate_subscription_url(url)?;
-    let (yaml, meta) = fetch_profile(&st.config_path(), url).await?;
+    let (yaml, meta) = fetch_profile(&st.config_path(), url, user_agent, 45, 1).await?;
     let id = format!("p{}", std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -253,10 +281,15 @@ pub async fn import_profile(st: &AppState, url: &str) -> Result<Profile, String>
         ptype: "url".into(),
         url: url.to_string(),
         updated_at: now_secs(),
-        interval: 0,
+        interval: meta.update_interval,
         used: meta.used,
         total: meta.total,
         expire: meta.expire,
+        user_agent: user_agent.unwrap_or("").to_string(),
+        timeout: 45,
+        retry: 1,
+        last_error: String::new(),
+        last_success: now_secs(),
         active: false,
     };
     let mut list = load_profiles(st);
@@ -281,7 +314,32 @@ pub async fn update_profile(st: &AppState, id: &str) -> Result<Value, String> {
         return Err("该配置不是订阅,无法在线更新".into());
     }
     validate_subscription_url(&target.url)?;
-    let (yaml, meta) = fetch_profile(&st.config_path(), &target.url).await?;
+    let ua = if target.user_agent.trim().is_empty() {
+        None
+    } else {
+        Some(target.user_agent.as_str())
+    };
+    let timeout = if target.timeout >= 5 {
+        target.timeout as u64
+    } else {
+        45
+    };
+    let retry = if target.retry >= 0 { target.retry } else { 1 };
+    let fetched = fetch_profile(&st.config_path(), &target.url, ua, timeout, retry).await;
+    let (yaml, meta) = match fetched {
+        Ok(value) => value,
+        Err(err) => {
+            // Keep the old body and record the failure for the UI/cron.
+            let mut list = load_profiles(st);
+            for item in list.iter_mut() {
+                if item.id == id {
+                    item.last_error = err.clone();
+                }
+            }
+            let _ = save_profiles(st, &list);
+            return Err(err);
+        }
+    };
     write_atomic(&profile_file(st, id), yaml.as_bytes())
         .map_err(|e| format!("write profile: {}", e))?;
 
@@ -293,16 +351,88 @@ pub async fn update_profile(st: &AppState, id: &str) -> Result<Value, String> {
             item.used = meta.used;
             item.total = meta.total;
             item.expire = meta.expire;
+            if meta.update_interval > 0 {
+                item.interval = meta.update_interval;
+            }
+            item.last_error.clear();
+            item.last_success = now_secs();
             was_active = item.active;
         }
     }
     save_profiles(st, &list)?;
 
     if was_active {
-        write_atomic(&st.config_path(), yaml.as_bytes())?;
-        crate::profiles::reload_core(st).await;
+        // Route through the same candidate + preflight + atomic rename path as
+        // a manual apply; a bad subscription must not overwrite a working one.
+        apply_profile(st, id).await?;
     }
     Ok(json!({"id": id, "updatedAt": now_secs(), "used": meta.used, "total": meta.total, "expire": meta.expire}))
+}
+
+/// Stores a user-provided YAML/share-link body as a local profile (no URL).
+pub fn import_local(st: &AppState, name: &str, text: &str) -> Result<Profile, String> {
+    if text.trim().is_empty() {
+        return Err("配置内容为空".into());
+    }
+    if text.len() > 4 << 20 {
+        return Err("配置内容过大".into());
+    }
+    let yaml = convert_subscription(&st.config_path(), text)?;
+    let (errors, _) = crate::mixin::validate(&yaml);
+    if !errors.is_empty() {
+        return Err(format!("配置校验失败: {}", errors.join("；")));
+    }
+    let id = format!(
+        "p{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    std::fs::create_dir_all(st.profiles_dir())
+        .map_err(|e| format!("mkdir profiles: {}", e))?;
+    write_atomic(&profile_file(st, &id), yaml.as_bytes())?;
+    let item = Profile {
+        id: id.clone(),
+        name: if name.trim().is_empty() {
+            "本地配置".to_string()
+        } else {
+            name.trim().to_string()
+        },
+        ptype: "local".into(),
+        url: String::new(),
+        updated_at: now_secs(),
+        interval: 0,
+        user_agent: String::new(),
+        timeout: 45,
+        retry: 1,
+        last_error: String::new(),
+        last_success: now_secs(),
+        ..Default::default()
+    };
+    let mut list = load_profiles(st);
+    list.push(item.clone());
+    save_profiles(st, &list)?;
+    Ok(item)
+}
+
+/// Updates every URL profile sequentially and reports per-profile results.
+pub async fn update_all(st: &AppState) -> Value {
+    let list = load_profiles(st);
+    let mut results = Vec::new();
+    for item in list {
+        if item.url.is_empty() {
+            continue;
+        }
+        let outcome = update_profile(st, &item.id).await;
+        results.push(serde_json::json!({
+            "id": item.id,
+            "name": item.name,
+            "ok": outcome.is_ok(),
+            "error": outcome.err().unwrap_or_default(),
+        }));
+    }
+    serde_json::json!({"updated": results.len(), "results": results})
 }
 
 /// Edits profile metadata (name / url / auto-update interval in seconds).
@@ -334,6 +464,18 @@ pub fn patch_profile(st: &AppState, id: &str, patch: &Value) -> Result<(), Strin
             if let Some(v) = patch.get("interval").and_then(|v| v.as_i64()) {
                 item.interval = v.max(0);
             }
+            if let Some(v) = patch.get("userAgent").and_then(|v| v.as_str()) {
+                if v.len() > 512 || v.chars().any(|c| c.is_control()) {
+                    return Err("User-Agent 非法".into());
+                }
+                item.user_agent = v.trim().to_string();
+            }
+            if let Some(v) = patch.get("timeout").and_then(|v| v.as_i64()) {
+                item.timeout = v.clamp(5, 300);
+            }
+            if let Some(v) = patch.get("retry").and_then(|v| v.as_i64()) {
+                item.retry = v.clamp(0, 5);
+            }
         }
     }
     if !found {
@@ -357,11 +499,29 @@ pub async fn apply_profile(st: &AppState, id: &str) -> Result<(), String> {
     // and the atomic write, so the running config always includes it.
     let (final_yaml, touched) = crate::mixin::apply_mixin(&st.data_dir, &converted)
         .map_err(|e| format!("应用失败: {}", e))?;
+    // Router-owned invariants win over subscription and user mixin.
+    let final_yaml = crate::config::enforce_invariants(&final_yaml)
+        .map_err(|e| format!("应用失败: {e}"))?;
     let (errors, _warnings) = crate::mixin::validate(&final_yaml);
     if !errors.is_empty() {
         return Err(format!("配置校验失败: {}", errors.join("；")));
     }
-    write_atomic(&st.config_path(), final_yaml.as_bytes())?;
+
+    // Never replace the live config until the core itself accepts the
+    // candidate. The bundled IPC core has no `-t`, so preflight drives the
+    // bridge's core.init/config.setup against a sanitised copy.
+    let config_path = st.config_path();
+    let candidate = config_path.with_file_name("config.yaml.candidate");
+    let last_good = config_path.with_file_name("config.yaml.last-good");
+    crate::config::write_atomic(&candidate, final_yaml.as_bytes())?;
+    if let Err(err) = crate::preflight::validate_config(candidate.clone()).await {
+        let _ = std::fs::remove_file(&candidate);
+        return Err(format!("配置预检失败: {err}"));
+    }
+    if let Ok(previous) = std::fs::read(&config_path) {
+        let _ = crate::config::write_atomic(&last_good, &previous);
+    }
+    std::fs::rename(&candidate, &config_path).map_err(|e| format!("应用配置失败: {e}"))?;
     if !touched.is_empty() {
         st.bus.publish(
             "system",
@@ -393,6 +553,40 @@ pub fn delete_profile(st: &AppState, id: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Waits for the controller to answer, then rolls back to
+/// `config.yaml.last-good` if the freshly applied config never comes up.
+/// The preflight rejects most bad configs, but a runtime-only failure (port
+/// already in use, provider download, TUN permission) still needs a safety net.
+async fn ensure_core(st: &AppState) {
+    if wait_core(st, 15).await {
+        return;
+    }
+    let config_path = st.config_path();
+    let last_good = config_path.with_file_name("config.yaml.last-good");
+    if !last_good.is_file() {
+        return;
+    }
+    let Ok(previous) = std::fs::read(&last_good) else {
+        return;
+    };
+    if crate::config::write_atomic(&config_path, &previous).is_err() {
+        return;
+    }
+    eprintln!("flclash: new config did not come up; rolled back to config.yaml.last-good");
+    let _ = service(st, "restart").await;
+    let _ = wait_core(st, 10).await;
+}
+
+async fn wait_core(st: &AppState, seconds: u64) -> bool {
+    for _ in 0..seconds * 2 {
+        if crate::ctrl::core_reachable(st).await {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    false
+}
+
 /// Applies config.yaml to a running core, or starts the core. This is why
 /// "启用配置" works while the proxy is stopped.
 pub async fn reload_core(st: &AppState) {
@@ -403,7 +597,11 @@ pub async fn reload_core(st: &AppState) {
     let cfg_path = st.config_path();
     if let Ok(yaml) = std::fs::read_to_string(&cfg_path) {
         if let Ok(json) = crate::singbox::convert(&yaml) {
-            let _ = std::fs::write("/tmp/flclash-singbox.json", json);
+            // Contains node credentials: 0600, atomic (write_atomic default).
+            let _ = crate::config::write_atomic(
+                std::path::Path::new("/tmp/flclash-singbox.json"),
+                json.as_bytes(),
+            );
         }
     }
 
@@ -411,6 +609,7 @@ pub async fn reload_core(st: &AppState) {
         // The native IPC core can drop TUN on controller PATCH/PUT updates.
         // Re-run listener.start with the complete config instead.
         let _ = service(st, "restart").await;
+        ensure_core(st).await;
         return;
     }
 
@@ -443,6 +642,7 @@ pub async fn reload_core(st: &AppState) {
             let _ = service(st, "start").await;
         }
     }
+    ensure_core(st).await;
 
     // A reload/restart swaps mihomo's fake-ip pool, but dnsmasq keeps serving
     // the old 198.18.x answers from its cache — LAN clients get RSTs for the

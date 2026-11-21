@@ -141,15 +141,14 @@ pub async fn ws_handler(
     let pre_auth = match &st.secret {
         None => true,
         Some(secret) => {
+            let valid = |value: &str| {
+                crate::secret_eq(value.as_bytes(), secret.as_bytes())
+                    || crate::jump_token_valid(value)
+            };
             let provided = header_secret(&headers);
             let query_secret = query.get("secret");
-            provided
-                .as_deref()
-                .map(|v| crate::secret_eq(v.as_bytes(), secret.as_bytes()))
-                == Some(true)
-                || query_secret
-                    .map(|v| crate::secret_eq(v.as_bytes(), secret.as_bytes()))
-                    == Some(true)
+            provided.as_deref().map(valid) == Some(true)
+                || query_secret.map(|v| valid(v)) == Some(true)
         }
     };
     ws.max_message_size(MAX_CLIENT_MESSAGE)
@@ -273,8 +272,11 @@ pub async fn serve(socket: WebSocket, st: Arc<AppState>, pre_auth: bool) {
                 let provided = msg.get("secret").and_then(|v| v.as_str()).unwrap_or("");
                 match &st.secret {
                     None => authed = true,
-                    Some(secret) if crate::secret_eq(provided.as_bytes(), secret.as_bytes()) => {
-                        authed = true
+                    Some(secret)
+                        if crate::secret_eq(provided.as_bytes(), secret.as_bytes())
+                            || crate::jump_token_valid(provided) =>
+                    {
+                        authed = true;
                     }
                     Some(_) => {
                         close(&mut sink, 4401, "unauthorized").await;

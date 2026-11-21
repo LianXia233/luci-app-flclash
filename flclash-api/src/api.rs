@@ -497,6 +497,39 @@ fn proxy_wish() -> bool {
         .unwrap_or(false)
 }
 
+fn uci_value(key: &str) -> String {
+    std::process::Command::new("uci")
+        .args(["-q", "get", key])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
+fn proxy_mode() -> String {
+    let mode = uci_value("flclash.proxy.mode");
+    if matches!(mode.as_str(), "off" | "redirect" | "tproxy" | "tun") {
+        return mode;
+    }
+    if proxy_wish() {
+        "redirect".into()
+    } else {
+        "off".into()
+    }
+}
+
+fn ipv6_mode() -> String {
+    let mode = uci_value("flclash.proxy.ipv6");
+    if matches!(mode.as_str(), "proxy" | "off" | "direct") {
+        return mode;
+    }
+    if uci_value("flclash.proxy.filter_aaaa") == "1" {
+        "off".into()
+    } else {
+        "proxy".into()
+    }
+}
+
 fn proxy_enabled() -> bool {
     matches!(proxy_state().as_str(), "on" | "tun")
 }
@@ -611,6 +644,19 @@ pub async fn status_payload(st: &AppState) -> Value {
         "fake-ip-range": if cfg.dns_fake_ip_range.is_empty() { "198.18.0.1/16" } else { cfg.dns_fake_ip_range.as_str() },
         "fake-ip-filter": cfg.dns_fake_ip_filter,
     });
+    let quic_mode = {
+        let q = uci_value("flclash.proxy.quic");
+        if q.is_empty() {
+            "proxy".to_string()
+        } else {
+            q
+        }
+    };
+    let offload_state = if uci_value("flclash.proxy.offload_disabled_by_us") == "1" {
+        "disabled_by_flclash"
+    } else {
+        "user"
+    };
 
     json!({
         "running": running,
@@ -631,6 +677,10 @@ pub async fn status_payload(st: &AppState) -> Value {
         "httpPort": cfg.port,
         "systemProxy": proxy_enabled(),
         "proxyLan": proxy_wish(),
+        "proxyMode": proxy_mode(),
+        "ipv6Mode": ipv6_mode(),
+        "quic": quic_mode,
+        "offload": offload_state,
         "takeoverState": proxy_state(),
         "tun": cfg.tun,
         "tunStack": cfg.tun_stack,
@@ -1078,6 +1128,20 @@ pub async fn system_proxy(State(st): State<Arc<AppState>>) -> Response {
     }))
 }
 
+/// GET /diagnostics — redacted text bundle for issue reports.
+pub async fn diagnostics(State(st): State<Arc<AppState>>) -> Response {
+    let st_bg = st.clone();
+    match tokio::task::spawn_blocking(move || crate::diagnostics::generate(&st_bg)).await {
+        Ok(text) => ok_json(json!({
+            "ok": true,
+            "redacted": true,
+            "generatedAt": crate::events::now_millis(),
+            "text": text,
+        })),
+        Err(err) => fail_json(StatusCode::INTERNAL_SERVER_ERROR, &format!("诊断生成失败: {err}")),
+    }
+}
+
 pub async fn profiles_get(State(st): State<Arc<AppState>>) -> Response {
     ok_json(profiles::list_payload(&st))
 }
@@ -1091,6 +1155,16 @@ pub async fn profiles_import(State(st): State<Arc<AppState>>, body: Bytes) -> Re
     if url.is_empty() {
         return fail_json(StatusCode::BAD_REQUEST, "url is required");
     }
+    let agent = data
+        .get("userAgent")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if agent.len() > 512 || agent.chars().any(|c| c.is_control()) {
+        return fail_json(StatusCode::BAD_REQUEST, "userAgent 非法");
+    }
+    let agent = if agent.is_empty() { None } else { Some(agent) };
     // Long operation: answer immediately with a task id, stream progress and
     // the final result on the `tasks` topic (survives a client disconnect).
     let handle = st.tasks.begin("profile.import", "导入订阅", None);
@@ -1098,7 +1172,7 @@ pub async fn profiles_import(State(st): State<Arc<AppState>>, body: Bytes) -> Re
     handle.progress(5.0, "下载订阅");
     let st_bg = st.clone();
     tokio::spawn(async move {
-        match profiles::import_profile(&st_bg, &url).await {
+        match profiles::import_profile(&st_bg, &url, agent.as_deref()).await {
             Ok(item) => {
                 let payload = profiles::profile_payload(&st_bg, &item);
                 st_bg
@@ -1109,6 +1183,58 @@ pub async fn profiles_import(State(st): State<Arc<AppState>>, body: Bytes) -> Re
             }
             Err(err) => handle.fail(&err),
         }
+    });
+    accepted(task_id)
+}
+
+/// POST /profiles/import-local {name?,text} — a local YAML/share-link body.
+pub async fn profiles_import_local(State(st): State<Arc<AppState>>, body: Bytes) -> Response {
+    let data = match body_json(&body).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let name = data.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let text = data.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    if text.trim().is_empty() {
+        return fail_json(StatusCode::BAD_REQUEST, "text is required");
+    }
+    let handle = st.tasks.begin("profile.import", "导入本地配置", None);
+    let task_id = handle.id().to_string();
+    let st_bg = st.clone();
+    tokio::spawn(async move {
+        let result = tokio::task::spawn_blocking({
+            let st_bg = st_bg.clone();
+            move || profiles::import_local(&st_bg, &name, &text)
+        })
+        .await;
+        match result {
+            Ok(Ok(item)) => {
+                let payload = profiles::profile_payload(&st_bg, &item);
+                st_bg
+                    .bus
+                    .publish("profiles", "profiles.changed", profiles::list_payload(&st_bg));
+                crate::loops::refresh_snapshot(&st_bg).await;
+                handle.succeed(json!({"profile": payload}));
+            }
+            Ok(Err(err)) => handle.fail(&err),
+            Err(err) => handle.fail(&format!("导入任务失败: {err}")),
+        }
+    });
+    accepted(task_id)
+}
+
+/// POST /profiles/update-all — refresh every URL profile sequentially.
+pub async fn profiles_update_all(State(st): State<Arc<AppState>>) -> Response {
+    let handle = st.tasks.begin("profile.update", "批量更新订阅", None);
+    let task_id = handle.id().to_string();
+    let st_bg = st.clone();
+    tokio::spawn(async move {
+        let result = profiles::update_all(&st_bg).await;
+        st_bg
+            .bus
+            .publish("profiles", "profiles.changed", profiles::list_payload(&st_bg));
+        crate::loops::refresh_snapshot(&st_bg).await;
+        handle.succeed(result);
     });
     accepted(task_id)
 }
@@ -1208,7 +1334,9 @@ pub async fn service_action(
 /// DNS hijack handled by /usr/libexec/flclash/proxy-rules.sh. Never touches
 /// the router's own outbound path, so the management plane stays alive.
 pub async fn proxy_status(State(st): State<Arc<AppState>>) -> Response {
-    let enabled = proxy_wish();
+    let proxy_mode_value = proxy_mode();
+    let ipv6_value = ipv6_mode();
+    let enabled = proxy_mode_value != "off";
     let state = proxy_state();
     let cfg = file_config(&st.config_path());
     let core_running = core_reachable(&st).await;
@@ -1218,19 +1346,9 @@ pub async fn proxy_status(State(st): State<Arc<AppState>>) -> Response {
         .ok()
         .and_then(|o| {
             let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            if s == "nftables" || s == "iptables" { Some(s) } else { None }
+            (s == "nftables").then_some(s)
         })
-        .unwrap_or_else(|| {
-            // Fallback detection mirrors proxy-rules.sh when the helper is
-            // not installed (e.g. local dev): presence of fw4 selects nft.
-            if std::path::Path::new("/sbin/fw4").exists()
-                || std::path::Path::new("/usr/sbin/fw4").exists()
-            {
-                "nftables".to_string()
-            } else {
-                "iptables".to_string()
-            }
-        });
+        .unwrap_or_else(|| "nftables".to_string());
     let rules = std::process::Command::new("/usr/libexec/flclash/proxy-rules.sh")
         .arg("status")
         .output()
@@ -1251,6 +1369,8 @@ pub async fn proxy_status(State(st): State<Arc<AppState>>) -> Response {
     ok_json(json!({
         "enabled": enabled,
         "proxyWish": enabled,
+        "proxyMode": proxy_mode_value,
+        "ipv6Mode": ipv6_value,
         "takeover": state.clone(),
         "coreRunning": core_running,
         "mode": cfg.mode,
@@ -1269,12 +1389,15 @@ pub async fn proxy_toggle(
     State(_st): State<Arc<AppState>>,
     Path(action): Path<String>,
 ) -> Response {
-    if !matches!(action.as_str(), "start" | "stop") {
+    if !matches!(action.as_str(), "start" | "stop" | "restart") {
         return fail_json(StatusCode::BAD_REQUEST, "action must be start or stop");
     }
     let script = "/usr/libexec/flclash/proxy-rules.sh";
+    // The state machine has no `restart` verb; start re-reads the current mode
+    // and converges, which is the same semantics for this endpoint.
+    let script_action = if action == "restart" { "start" } else { action.as_str() };
     let output = tokio::process::Command::new(script)
-        .arg(&action)
+        .arg(script_action)
         .output()
         .await;
     match output {
@@ -1289,6 +1412,59 @@ pub async fn proxy_toggle(
             String::from_utf8_lossy(&out.stderr).trim()
         )),
         Err(err) => bad_gateway(&format!("proxy-rules.sh: {}", err)),
+    }
+}
+
+/// PUT /proxy/mode {mode}: off|redirect|tproxy|tun. Mode is the single source
+/// of truth; stop() also disables a previously active TUN.
+pub async fn proxy_mode_set(State(st): State<Arc<AppState>>, body: Bytes) -> Response {
+    let data = match body_json(&body).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let mode = data.get("mode").and_then(|v| v.as_str()).unwrap_or("");
+    if !matches!(mode, "off" | "redirect" | "tproxy" | "tun") {
+        return fail_json(StatusCode::BAD_REQUEST, "mode must be off|redirect|tproxy|tun");
+    }
+    for (key, value) in [
+        ("flclash.proxy.mode", mode),
+        ("flclash.proxy.enabled", if mode == "off" { "0" } else { "1" }),
+    ] {
+        let out = tokio::process::Command::new("uci")
+            .args(["set", &format!("{key}={value}")])
+            .output()
+            .await;
+        if !matches!(&out, Ok(o) if o.status.success()) {
+            return bad_gateway(&format!("uci set {key} failed"));
+        }
+    }
+    let commit = tokio::process::Command::new("uci")
+        .args(["commit", "flclash"])
+        .output()
+        .await;
+    if !matches!(&commit, Ok(o) if o.status.success()) {
+        return bad_gateway("uci commit flclash failed");
+    }
+    let action = if mode == "off" { "stop" } else { "start" };
+    let output = tokio::process::Command::new("/usr/libexec/flclash/proxy-rules.sh")
+        .arg(action)
+        .output()
+        .await;
+    match output {
+        Ok(out) if out.status.success() => {
+            st.bus.publish(
+                "system",
+                "system.proxy",
+                json!({"mode": mode, "takeover": proxy_state()}),
+            );
+            crate::loops::refresh_snapshot(&st).await;
+            ok_json(json!({"ok": true, "mode": mode, "takeover": proxy_state()}))
+        }
+        Ok(out) => bad_gateway(&format!(
+            "proxy-rules.sh {action}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )),
+        Err(err) => bad_gateway(&format!("proxy-rules.sh: {err}")),
     }
 }
 
@@ -1316,6 +1492,24 @@ pub async fn core_update(State(_st): State<Arc<AppState>>, body: Bytes) -> Respo
         Err(resp) => return resp,
     };
     let core = data.get("core").and_then(|v| v.as_str()).unwrap_or("");
+    if let Some(mirror) = data.get("mirror").and_then(|v| v.as_str()) {
+        let mirror = mirror.trim();
+        if !mirror.is_empty()
+            && (!(mirror.starts_with("http://") || mirror.starts_with("https://"))
+                || mirror.chars().any(|c| c.is_control()))
+        {
+            return fail_json(StatusCode::BAD_REQUEST, "mirror 必须是 http(s):// 前缀");
+        }
+        let set = std::process::Command::new("uci")
+            .args(["set", &format!("flclash.update.mirror={mirror}")])
+            .status();
+        if !matches!(set, Ok(status) if status.success()) {
+            return fail_json(StatusCode::INTERNAL_SERVER_ERROR, "写入 mirror 失败");
+        }
+        let _ = std::process::Command::new("uci")
+            .args(["commit", "flclash"])
+            .status();
+    }
     match crate::coremgmt::update_start(core) {
         Ok(value) => ok_json(value),
         Err(err) => fail_json(StatusCode::BAD_REQUEST, &err),
@@ -1669,13 +1863,28 @@ pub async fn profile_raw_put(
         )
             .into_response();
     }
+    // Core-level preflight before touching the stored profile. The structural
+    // validator above only checks ports/names/references, not mihomo's schema.
+    let candidate = st.profiles_dir().join(format!(".{}.candidate", id));
+    if let Err(err) = crate::config::write_atomic(&candidate, text.as_bytes()) {
+        return fail_json(StatusCode::INTERNAL_SERVER_ERROR, &err);
+    }
+    if let Err(err) = crate::preflight::validate_config(candidate.clone()).await {
+        let _ = std::fs::remove_file(&candidate);
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({"error": "配置预检失败", "detail": err})),
+        )
+            .into_response();
+    }
     // Keep the previous body recoverable before overwriting.
     if let Ok(previous) = std::fs::read(&path) {
         let backup = st.profiles_dir().join(format!("{}.yaml.bak", id));
         let _ = crate::config::write_atomic(&backup, &previous);
     }
-    if let Err(err) = crate::config::write_atomic(&path, text.as_bytes()) {
-        return fail_json(StatusCode::INTERNAL_SERVER_ERROR, &err);
+    if let Err(err) = std::fs::rename(&candidate, &path) {
+        let _ = std::fs::remove_file(&candidate);
+        return fail_json(StatusCode::INTERNAL_SERVER_ERROR, &format!("写入配置失败: {err}"));
     }
     let active = crate::profiles::load_profiles(&st)
         .iter()

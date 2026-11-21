@@ -8,17 +8,22 @@ config flclash 'main'
 	option ipv6 '0'
 	option mixed_port '7892'
 	option mode 'rule'
-	option log_level 'info'
+	option log_level 'warning'
 	option tun_enabled '0'
 	option core_type 'mihomo'
 	option core_mode 'ipc'
 
 config flclash 'proxy'
 	option enabled '0'
+	# Single source of truth: off | redirect | tproxy | tun.
+	option mode 'off'
 	option backend ''
 	option lan_if ''
 	# Avoid silent IPv6 bypass on IPv4-only REDIRECT/TPROXY deployments.
-	option filter_aaaa '1'
+	# ipv6: proxy (dual-stack), off (block/filter AAAA), direct (no interception)
+	option ipv6 'proxy'
+	option filter_aaaa '0'
+	option quic 'proxy'
 	# LAN ACL (Nikki-style). mode: all | allow | block
 	# allow: only listed clients are proxied; block: listed clients bypass.
 	option acl_mode 'all'
@@ -30,15 +35,28 @@ config flclash 'proxy'
 	# list bypass_port '25'
 	# Take over the router's own outbound traffic (mihomo only).
 	option local_takeover '1'
+	# Disable flow offloading once per takeover (never re-fight a user choice).
+	option auto_disable_offload '1'
 
 config flclash 'api'
 	option enabled '1'
 	option listen '0.0.0.0:9098'
 	option ui_dir '/www/flclash'
 	option data_dir '/etc/flclash'
-	option secret ''
+	# The API secret is never stored in UCI (world-readable). It lives in a
+	# 0600 file owned by root; `api.require_secret=1` makes an empty/short
+	# secret a hard startup failure instead of an unauthenticated root console.
+	option secret_file '/etc/flclash/api.secret'
+	option require_secret '1'
 
 config flclash 'webui'
 	option enabled '1'
 	option webui_path '/flclash/'
 	option webui_port '9098'
+
+config flclash 'update'
+	# stable | alpha (advisory; the script currently tracks the latest release)
+	option channel 'stable'
+	# Optional asset mirror prefix, e.g. https://ghproxy.example/
+	option mirror ''
+	option auto_check '0'

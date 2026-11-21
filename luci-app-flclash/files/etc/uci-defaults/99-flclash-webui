@@ -1,10 +1,12 @@
 #!/bin/sh
 # First-boot defaults for FlClash WebUI on OpenWrt master / SNAPSHOT.
-# /etc/config/flclash is installed by the flclash-core package.
-# Fills missing keys; also creates an API secret when the listener is not
-# loopback-only (see the end of this script).
+# /etc/config/flclash is installed by the package.
+#
+# Credentials: the API secret is kept in a 0600 root-only file, never in UCI.
+# Legacy installs that still carry `flclash.api.secret` are migrated once.
 
 [ -f /etc/config/flclash ] || touch /etc/config/flclash
+umask 077
 
 uci -q get flclash.main >/dev/null || uci set flclash.main=flclash
 uci -q get flclash.main.enabled >/dev/null || uci set flclash.main.enabled='1'
@@ -19,29 +21,89 @@ uci -q get flclash.api.enabled >/dev/null || uci set flclash.api.enabled='1'
 uci -q get flclash.api.listen >/dev/null || uci set flclash.api.listen='0.0.0.0:9098'
 uci -q get flclash.api.ui_dir >/dev/null || uci set flclash.api.ui_dir='/www/flclash'
 uci -q get flclash.api.data_dir >/dev/null || uci set flclash.api.data_dir='/etc/flclash'
+uci -q get flclash.api.secret_file >/dev/null || uci set flclash.api.secret_file='/etc/flclash/api.secret'
+uci -q get flclash.api.require_secret >/dev/null || uci set flclash.api.require_secret='1'
 
 uci -q get flclash.webui >/dev/null || uci set flclash.webui=flclash
 uci -q get flclash.webui.enabled >/dev/null || uci set flclash.webui.enabled='1'
 uci -q get flclash.webui.webui_path >/dev/null || uci set flclash.webui.webui_path='/flclash/'
 uci -q get flclash.webui.webui_port >/dev/null || uci set flclash.webui.webui_port='9098'
 
-# The API can rewrite configs, install cores, restore backups and drive the
-# firewall: a LAN-reachable listener without a secret is an unauthenticated
-# root console. Generate one on first install (LuCI passes it to the WebUI on
-# the jump link; a direct visitor is prompted for it).
-listen="$(uci -q get flclash.api.listen)"
-secret="$(uci -q get flclash.api.secret)"
-case "$listen" in
-	127.0.0.1:*|localhost:*|\[::1\]:*) ;;
-	*)
-		if [ -z "$secret" ]; then
-			secret="$(head -c 32 /dev/urandom 2>/dev/null | md5sum 2>/dev/null | cut -d' ' -f1)"
-			[ -n "$secret" ] && uci -q set "flclash.api.secret=$secret"
-		fi
-		;;
-esac
+secret_file="$(uci -q get flclash.api.secret_file)"
+[ -n "$secret_file" ] || secret_file=/etc/flclash/api.secret
+legacy="$(uci -q get flclash.api.secret)"
+
+mkdir -p "$(dirname "$secret_file")" /etc/flclash 2>/dev/null
+chmod 0700 /etc/flclash 2>/dev/null
+
+secret=""
+[ -r "$secret_file" ] && secret="$(head -n 1 "$secret_file" 2>/dev/null | tr -d '\r\n')"
+if [ -z "$secret" ] && [ -n "$legacy" ]; then
+	secret="$legacy"
+fi
+if [ -z "$secret" ]; then
+	secret="$(head -c 32 /dev/urandom 2>/dev/null | md5sum 2>/dev/null | cut -d' ' -f1)"
+fi
+if [ -n "$secret" ]; then
+	printf '%s\n' "$secret" > "$secret_file"
+	chmod 0600 "$secret_file" 2>/dev/null
+fi
+
+# Never leave the secret in UCI (0644 by default).
+uci -q delete flclash.api.secret 2>/dev/null
+uci -q set flclash.api.secret_file="$secret_file"
+uci -q set flclash.api.require_secret='1'
+uci -q get flclash.update >/dev/null || uci set flclash.update=flclash
+uci -q get flclash.update.channel >/dev/null || uci set flclash.update.channel='stable'
+uci -q get flclash.update.mirror >/dev/null || uci set flclash.update.mirror=''
+uci -q get flclash.update.auto_check >/dev/null || uci set flclash.update.auto_check='0'
+
+# Mode/ipv6 schema: derive once from the legacy switches. `mode` is the single
+# source of truth afterwards (off|redirect|tproxy|tun).
+if ! uci -q get flclash.proxy.mode >/dev/null 2>&1; then
+	if [ "$(uci -q get flclash.main.tun_enabled)" = "1" ]; then
+		uci set flclash.proxy.mode='tun'
+	elif [ "$(uci -q get flclash.proxy.enabled)" = "1" ]; then
+		uci set flclash.proxy.mode='redirect'
+	else
+		uci set flclash.proxy.mode='off'
+	fi
+fi
+if ! uci -q get flclash.proxy.ipv6 >/dev/null 2>&1; then
+	if [ "$(uci -q get flclash.proxy.filter_aaaa)" = "1" ]; then
+		uci set flclash.proxy.ipv6='off'
+	else
+		uci set flclash.proxy.ipv6='proxy'
+	fi
+fi
+uci -q get flclash.proxy.quic >/dev/null 2>&1 || uci set flclash.proxy.quic='proxy'
 
 uci commit flclash
+chmod 0600 /etc/config/flclash 2>/dev/null
+
+# Persistent fw4 hook: proxy-rules.sh renders /var/run/flclash/fw4-input.nft
+# and fw4 replays it on every reload, so a firewall restart cannot silently
+# drop the WAN guard or the DNAT/mark accepts.
+if uci -q get firewall.flclash >/dev/null 2>&1; then
+	inc=flclash
+else
+	uci set firewall.flclash=include
+	inc=flclash
+fi
+if [ -n "$inc" ]; then
+	uci set "firewall.$inc.enabled='1'"
+	uci set "firewall.$inc.type='nftables'"
+	uci set "firewall.$inc.path='/var/run/flclash/fw4-input.nft'"
+	uci set "firewall.$inc.position='chain-prepend'"
+	uci set "firewall.$inc.chain='input'"
+	uci commit firewall
+	# fw4 warns on a missing include at boot; an empty file is harmless until
+	# proxy-rules renders the real guard.
+	mkdir -p /var/run/flclash 2>/dev/null
+	chmod 0700 /var/run/flclash 2>/dev/null
+	: > /var/run/flclash/fw4-input.nft 2>/dev/null
+	chmod 0600 /var/run/flclash/fw4-input.nft 2>/dev/null
+fi
 
 # Only the WebUI backend and the takeover-state reconciler live in the boot
 # sequence. The proxy core is deliberately NOT auto-started: the user turns
@@ -49,6 +111,7 @@ uci commit flclash
 # WebUI starts it as part of arming the rules).
 [ -x /etc/init.d/flclash-api ] && /etc/init.d/flclash-api enable >/dev/null 2>&1
 [ -x /etc/init.d/flclash-proxy ] && /etc/init.d/flclash-proxy enable >/dev/null 2>&1
+[ -x /etc/init.d/flclash-watchdog ] && /etc/init.d/flclash-watchdog enable >/dev/null 2>&1
 [ -x /etc/init.d/flclash-core ] && /etc/init.d/flclash-core disable >/dev/null 2>&1
 
 exit 0

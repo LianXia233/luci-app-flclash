@@ -218,12 +218,18 @@ pub const MAX_FETCH_BYTES: usize = 8 << 20;
 /// Fetches a URL natively (TLS via rustls/webpki-roots) and returns
 /// (headers, body). Never fails on non-2xx: callers inspect the payload
 /// themselves (the profile converter looks at content-type headers).
-pub async fn curl_fetch(url: &str, timeout_secs: u64) -> Result<(Vec<String>, Vec<u8>), String> {
+pub async fn curl_fetch_ua(
+    url: &str,
+    timeout_secs: u64,
+    user_agent: Option<&str>,
+) -> Result<(Vec<String>, Vec<u8>), String> {
     use futures_util::StreamExt;
 
-    let resp = http_client()
-        .get(url)
-        .timeout(Duration::from_secs(timeout_secs))
+    let mut request = http_client().get(url).timeout(Duration::from_secs(timeout_secs));
+    if let Some(agent) = user_agent {
+        request = request.header(reqwest::header::USER_AGENT, agent);
+    }
+    let resp = request
         .send()
         .await
         .map_err(|e| format!("fetch {}: {}", url, e))?;
@@ -256,6 +262,11 @@ pub async fn curl_fetch(url: &str, timeout_secs: u64) -> Result<(Vec<String>, Ve
         body.extend_from_slice(&chunk);
     }
     Ok((headers, body))
+}
+
+/// Backwards-compatible wrapper with the built-in clash.meta UA.
+pub async fn curl_fetch(url: &str, timeout_secs: u64) -> Result<(Vec<String>, Vec<u8>), String> {
+    curl_fetch_ua(url, timeout_secs, None).await
 }
 
 /// Extracts a header value (case-insensitive) from curl-dumped header lines.

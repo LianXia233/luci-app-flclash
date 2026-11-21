@@ -1,40 +1,101 @@
 #!/bin/sh /etc/rc.common
 # FlClash WebUI API bridge (static Rust/Tokio, musl).
+#
+# Security invariants:
+#   * the API secret lives in a 0600 root-only file, never in UCI;
+#   * a non-empty, sufficiently long secret is a hard startup requirement
+#     (`flclash.api.require_secret=1`): an unauthenticated LAN listener would
+#     be a root console (it can rewrite configs, install cores, restore
+#     backups and drive the firewall).
+#
+# Legacy installs kept `flclash.api.secret` in UCI. It is migrated here once,
+# so an upgrade does not lose the existing WebUI session.
 
 START=96
 STOP=04
 USE_PROCD=1
 
+DEFAULT_SECRET_FILE=/etc/flclash/api.secret
+DEFAULT_DATA_DIR=/etc/flclash
+JUMP_TOKENS=/tmp/flclash-jump.tokens
+
+valid_secret() {
+	local value="$1"
+	[ "${#value}" -ge 16 ] || return 1
+	case "$value" in
+		*[!A-Za-z0-9._~+/=-]*) return 1 ;;
+	esac
+	return 0
+}
+
+read_secret_file() {
+	local file="$1"
+	[ -r "$file" ] || return 1
+	head -n 1 "$file" 2>/dev/null | tr -d '\r\n'
+}
+
+harden_data_dir() {
+	local dir="$1" file
+	[ -n "$dir" ] || return 0
+	mkdir -p "$dir" 2>/dev/null || return 0
+	chmod 0700 "$dir" 2>/dev/null
+	for file in "$dir/config.yaml" "$dir/mixin.yaml" "$dir/index.json" "$dir/api.secret"; do
+		[ -f "$file" ] && chmod 0600 "$file" 2>/dev/null
+	done
+	for file in "$dir"/profiles/*.yaml; do
+		[ -f "$file" ] && chmod 0600 "$file" 2>/dev/null
+	done
+	return 0
+}
+
 start_service() {
 	config_load flclash
 
-	local enabled listen controller ui data secret
+	local enabled listen controller ui data secret_file require_secret legacy secret
 	config_get_bool enabled api enabled 1
 	[ "$enabled" = "1" ] || return 0
 
 	config_get listen api listen '0.0.0.0:9098'
 	config_get controller main external_controller '127.0.0.1:9097'
 	config_get ui api ui_dir '/www/flclash'
-	config_get data api data_dir '/etc/flclash'
-	config_get secret api secret ''
+	config_get data api data_dir "$DEFAULT_DATA_DIR"
+	config_get secret_file api secret_file "$DEFAULT_SECRET_FILE"
+	config_get_bool require_secret api require_secret 1
+	config_get legacy api secret ''
 
-	# The API can rewrite configs, install cores, restore backups and drive the
-	# firewall. A LAN-reachable listener with an empty secret is therefore an
-	# unauthenticated root console; at least make the exposure visible.
-	case "$listen" in
-		127.0.0.1:*|localhost:*|\[::1\]:*) ;;
-		*)
-			[ -n "$secret" ] || logger -t flclash-api \
-				"WARNING: $listen is reachable from the LAN without flclash.api.secret (unauthenticated control of the proxy)"
-			;;
-	esac
+	# One-time migration: UCI secret -> 0600 file. Never write it back.
+	if [ -z "$secret_file" ]; then
+		secret_file="$DEFAULT_SECRET_FILE"
+	fi
+	secret="$(read_secret_file "$secret_file" 2>/dev/null)"
+	if [ -z "$secret" ] && [ -n "$legacy" ]; then
+		secret="$legacy"
+		umask 077
+		mkdir -p "$(dirname "$secret_file")" 2>/dev/null
+		printf '%s\n' "$secret" > "$secret_file" 2>/dev/null
+		chmod 0600 "$secret_file" 2>/dev/null
+		uci -q delete flclash.api.secret 2>/dev/null
+		uci -q set flclash.api.secret_file="$secret_file" 2>/dev/null
+		uci -q commit flclash 2>/dev/null
+		logger -t flclash-api "migrated API secret from UCI to $secret_file (0600)"
+	fi
+
+	if [ "$require_secret" = "1" ] && ! valid_secret "$secret"; then
+		logger -t flclash-api "ERROR: refusing to start: flclash.api secret is empty or shorter than 16 chars (file $secret_file). Set one with: uci set flclash.api.secret_file=... or run /etc/uci-defaults/99-flclash-webui"
+		return 1
+	fi
+	if [ "$require_secret" != "1" ] && [ -z "$secret" ]; then
+		logger -t flclash-api "WARNING: api.require_secret=0 and no secret; $listen is an unauthenticated control plane"
+	fi
 
 	[ -x /usr/bin/flclash-api ] || {
 		logger -t flclash-api "bridge binary missing: /usr/bin/flclash-api"
 		return 1
 	}
 
-	mkdir -p "$data"
+	harden_data_dir "$data"
+	umask 077
+	mkdir -p "$data" 2>/dev/null
 
 	procd_open_instance flclash-api
 	procd_set_param command /usr/bin/flclash-api \
@@ -43,12 +104,22 @@ start_service() {
 		-ui "$ui" \
 		-data "$data" \
 		-init /etc/init.d/flclash-core
-	# Geo DB refresh downloads cannot reach GitHub directly; route the
-	# controller HTTP client through the local mihomo mixed-port.
-	procd_set_param env FLCLASH_API_SECRET="$secret" HTTPS_PROXY=http://127.0.0.1:7892 HTTP_PROXY=http://127.0.0.1:7892 NO_PROXY=127.0.0.1,localhost,::1
+	# FLCLASH_API_SECRET authenticates LAN clients. FLCLASH_JUMP_TOKENS is a
+	# 0600 file of short-lived jump tokens written by the LuCI rpcd object, so
+	# the raw secret never has to travel through ubus/URLs.
+	procd_set_param env \
+		FLCLASH_API_SECRET="$secret" \
+		FLCLASH_API_REQUIRE_SECRET="$require_secret" \
+		FLCLASH_JUMP_TOKENS="$JUMP_TOKENS" \
+		HTTPS_PROXY=http://127.0.0.1:7892 \
+		HTTP_PROXY=http://127.0.0.1:7892 \
+		NO_PROXY=127.0.0.1,localhost,::1
 	procd_set_param stdout 1
 	procd_set_param stderr 1
 	procd_set_param respawn 3600 5 0
+	# WebSocket clients + curl stream children: the default 1024 soft limit is
+	# easy to exhaust on a busy dashboard.
+	procd_set_param limits nofile="4096 8192"
 	procd_close_instance
 }
 

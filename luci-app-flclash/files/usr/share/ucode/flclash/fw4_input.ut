@@ -1,0 +1,18 @@
+#!/usr/bin/utpl -S
+{#
+  fw4 input include: WAN proxy-port guard + accept rules.
+
+  Rendered by proxy-rules.sh with FLCLASH_* variables and loaded through
+  `config include` (chain-prepend input). Keep this file rule-only: fw4 wraps
+  it inside `chain input { ... }`.
+-#}
+{%-
+	const lan = getenv('FLCLASH_LAN_NFT') || '"br-lan"';
+	const ports = getenv('FLCLASH_PORTS') || '7892, 7893, 7894, 1053, 9098';
+	const redir = getenv('FLCLASH_REDIR_PORT') || '7893';
+	const dns = getenv('FLCLASH_DNS_PORT') || '1053';
+	const mark = getenv('FLCLASH_FWMARK') || '0x162';
+-%}
+meta mark {{ mark }} accept comment "FlClash TPROXY Accept"
+iifname { {{ lan }} } ct status dnat meta l4proto { tcp, udp } th dport { {{ redir }}, {{ dns }} } accept comment "FlClash Redirect Accept"
+iifname != { {{ lan }} } iifname != "lo" meta l4proto { tcp, udp } th dport { {{ ports }} } reject comment "FlClash WAN Proxy Guard"
