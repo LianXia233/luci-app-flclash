@@ -335,7 +335,7 @@
           const remote = item.vehicleType === 'HTTP';
           return '<div class="settings-row"><div class="row-copy">' +
             '<div class="row-title is-file">' + ui.esc(name) + '</div>' +
-            '<div class="row-desc">' + (item.count != null ? item.count + ' 个节点' : ui.esc(item.type || '-')) +
+            '<div class="row-desc">' + (item.count != null ? ui.esc(item.count) + ' 个节点' : ui.esc(item.type || '-')) +
             (item.updatedAt ? ' · ' + ui.esc(String(item.updatedAt).slice(0, 10)) : '') + '</div></div>' +
             (remote
               ? '<button class="btn" data-ppupdate="' + ui.esc(name) + '" type="button">' + icon('refresh', 15) + '更新</button>'

@@ -157,8 +157,13 @@ window.FlClashUI = (function () {
     /* Deliberately NOT closing on backdrop/outside click. */
     backdrop.onclick = null;
 
-    body.addEventListener('input', function () { sheetDirty = true; }, true);
-    body.addEventListener('change', function () { sheetDirty = true; }, true);
+    /* The dirty-markers must be installed once: #sheet-body is a permanent
+     * node, so re-adding them per openSheet accumulated listeners forever. */
+    if (!body.dataset.dirtyWired) {
+      body.dataset.dirtyWired = '1';
+      body.addEventListener('input', function () { sheetDirty = true; }, true);
+      body.addEventListener('change', function () { sheetDirty = true; }, true);
+    }
     removeUnsavedBar(body);
 
     if (typeof bind === 'function') bind(body, requestSheetClose, {

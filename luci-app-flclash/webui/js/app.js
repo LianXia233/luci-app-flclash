@@ -297,8 +297,8 @@
     const on = system ? !!status.systemProxy : !!status.tun;
     return '<section class="card takeover-tile" data-role="takeover-' + kind + '">' +
       '<span class="tile-icon' + (on ? ' is-on' : '') + '" data-role="icon" data-icon="' + (system ? 'shuffle' : 'shield') + '"></span>' +
-      '<span class="tile-copy"><span class="tile-title">' + (system ? '系统代理' : '虚拟网卡') + '</span>' +
-        '<span class="tile-sub" data-role="sub">' + (system ? '端口 ' + (status.mixedPort || '—') : (on ? '已接管全局流量' : '未启用')) + '</span></span>' +
+        '<span class="tile-copy"><span class="tile-title">' + (system ? '系统代理' : '虚拟网卡') + '</span>' +
+        '<span class="tile-sub" data-role="sub">' + (system ? '端口 ' + ui.esc(status.mixedPort || '—') : (on ? '已接管全局流量' : '未启用')) + '</span></span>' +
       ui.switchHtml(kind, on, system ? '系统代理' : '虚拟网卡') +
     '</section>';
   }
@@ -313,8 +313,8 @@
       '<div class="ip-figure" data-role="lan-ip">' + ui.esc(status.localIp || '—') + '</div>' +
       '<div class="sub-switch">' +
         '<span class="tile-icon' + (on ? ' is-on' : '') + '" data-icon="wifi"></span>' +
-        '<span class="tile-copy"><span class="tile-title">局域网代理</span>' +
-          '<span class="tile-sub">' + (on ? '端口 ' + (status.mixedPort || '—') : '已关闭') + '</span></span>' +
+          '<span class="tile-copy"><span class="tile-title">局域网代理</span>' +
+          '<span class="tile-sub">' + (on ? '端口 ' + ui.esc(status.mixedPort || '—') : '已关闭') + '</span></span>' +
         ui.switchHtml('allowLan', on, '局域网代理') +
       '</div>' +
     '</section>';
@@ -387,8 +387,8 @@
       ui.head('策略组', {
         glyph: 'layers',
         chevron: true,
-        end: '<span class="chip">' + (info.count || 0) + '</span>' +
-          (info.timeout ? '<span class="chip is-warn">' + info.timeout + ' 超时</span>' : '')
+        end: '<span class="chip">' + ui.esc(info.count || 0) + '</span>' +
+          (info.timeout ? '<span class="chip is-warn">' + ui.esc(info.timeout) + ' 超时</span>' : '')
       }) +
       '<div class="group-list" data-role="group-list">' + (info.groups || []).slice(0, 6).map(function (group) {
         return '<div class="group-row">' + ui.letterTile(group.name) +
@@ -762,7 +762,7 @@
       const warnChip = ui.$('.card-end .chip.is-warn', groupsCardNode);
       if (info.timeout && !warnChip) {
         ui.$('.card-end', groupsCardNode).insertAdjacentHTML('afterbegin',
-          '<span class="chip is-warn">' + info.timeout + ' 超时</span>');
+          '<span class="chip is-warn">' + ui.esc(info.timeout) + ' 超时</span>');
       }
       const gl = ui.$('[data-role="group-list"]', groupsCardNode);
       if (gl) {
@@ -827,6 +827,11 @@
   async function renderView(name, force) {
     viewTeardown.forEach(function (fn) { try { fn(); } catch (error) { console.error(error); } });
     viewTeardown = [];
+    /* Dashboard subscriptions live outside viewTeardown: leaving the
+     * dashboard must drop them too, or the connections watch keeps polling
+     * (and re-pushing) for the rest of the session. */
+    dashboardUnsubs.forEach(function (off) { try { off(); } catch (error) { console.error(error); } });
+    dashboardUnsubs = [];
     if (name === 'dashboard') { await renderDashboard(); return; }
     ui.stopAll();
     if (!force) skeleton();
