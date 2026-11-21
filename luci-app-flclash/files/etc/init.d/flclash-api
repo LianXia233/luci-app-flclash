@@ -1,5 +1,5 @@
 #!/bin/sh /etc/rc.common
-# FlClash WebUI API bridge (static Go, stdlib only).
+# FlClash WebUI API bridge (static Rust/Tokio, musl).
 
 START=96
 STOP=04
