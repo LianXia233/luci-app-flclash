@@ -54,22 +54,38 @@ scalar() {
 }
 
 MIXED_PORT=$(scalar mixed-port 7892)
+REDIR_PORT=$(scalar redir-port 7893)
+TPROXY_PORT=$(scalar tproxy-port 7894)
 CONTROLLER=$(scalar external-controller 127.0.0.1:9097)
 MODE=$(scalar mode rule)
 
-# Sanitize: numeric port, controller host:port, valid mode.
+# Sanitize: numeric ports, controller host:port, valid mode. The controller
+# reaches a sed replacement below, so anything outside the host:port
+# alphabet falls back to the default rather than corrupting the output.
 case "$MIXED_PORT" in ''|*[!0-9]*) MIXED_PORT=7892 ;; esac
+case "$REDIR_PORT" in ''|*[!0-9]*) REDIR_PORT=7893 ;; esac
+case "$TPROXY_PORT" in ''|*[!0-9]*) TPROXY_PORT=7894 ;; esac
 [ -n "$CONTROLLER" ] || CONTROLLER=127.0.0.1:9097
+case "$CONTROLLER" in *[!0-9A-Za-z.:\[\]]*) CONTROLLER=127.0.0.1:9097 ;; esac
 case "$MODE" in rule|global|direct|script) ;; *) MODE=rule ;; esac
 
 # Optional native base config supplied by the user (full node translation).
 BASE="${IN}.singbox.json"
 if [ -f "$BASE" ]; then
-	# Patch managed scalars with sed (keys are unique in sing-box schema).
-	sed -e "s/\"listen_port\"[[:space:]]*:[[:space:]]*[0-9]*/\"listen_port\": $MIXED_PORT/" \
-		-e "s/\"external_controller\"[[:space:]]*:[[:space:]]*\"[^\"]*\"/\"external_controller\": \"$CONTROLLER\"/" \
-		-e "s/\"default_mode\"[[:space:]]*:[[:space:]]*\"[^\"]*\"/\"default_mode\": \"$MODE\"/" \
-		"$BASE" > "$OUT"
+	# Patch managed scalars with sed (keys are unique in sing-box schema),
+	# except listen_port: a multi-inbound base owns several of them and a
+	# global rewrite used to point every inbound at the mixed port. Only
+	# patch when the base has exactly one (the mixed inbound).
+	if [ "$(grep -o '"listen_port"' "$BASE" | wc -l)" = "1" ]; then
+		sed -e "s/\"listen_port\"[[:space:]]*:[[:space:]]*[0-9]*/\"listen_port\": $MIXED_PORT/" \
+			-e "s/\"external_controller\"[[:space:]]*:[[:space:]]*\"[^\"]*\"/\"external_controller\": \"$CONTROLLER\"/" \
+			-e "s/\"default_mode\"[[:space:]]*:[[:space:]]*\"[^\"]*\"/\"default_mode\": \"$MODE\"/" \
+			"$BASE" > "$OUT"
+	else
+		sed -e "s/\"external_controller\"[[:space:]]*:[[:space:]]*\"[^\"]*\"/\"external_controller\": \"$CONTROLLER\"/" \
+			-e "s/\"default_mode\"[[:space:]]*:[[:space:]]*\"[^\"]*\"/\"default_mode\": \"$MODE\"/" \
+			"$BASE" > "$OUT"
+	fi
 	exit 0
 fi
 
@@ -92,18 +108,26 @@ RULES=$(awk -F, '
 	}
 ' "$IN" | sed 's/,$//')
 
-# Emit the sing-box config. TUN is enabled only when config.yaml asks for it.
-TUN_ENABLE=$(scalar tun-enable 0)
+# TUN is enabled only when config.yaml asks for it. Clash spells that as a
+# `tun:` mapping with an `enable:` child — the previous top-level
+# `tun-enable:` probe never existed in a real config, so TUN silently never
+# came up on the fallback converter.
+TUN_ENABLE=$(awk '
+	/^tun:/ { t=1; next }
+	t && /^[^ \t#]/ { t=0 }
+	t && /^[ \t]*enable:/ { print $2; found=1; exit }
+	END { if (!found) print "0" }
+' "$IN")
 TUN_BLOCK=""
-if [ "$TUN_ENABLE" = "true" ] || [ "$TUN_ENABLE" = "1" ]; then
-	TUN_BLOCK=',{"type":"tun","tag":"tun-in","address":"172.19.0.1/30","auto_route":true,"stack":"gvisor","route_address_set":[],"strict_route":false}'
-fi
+case "$TUN_ENABLE" in true|1|True|TRUE) TUN_BLOCK=',{"type":"tun","tag":"tun-in","address":["172.19.0.1/30"],"auto_route":true,"stack":"gvisor","strict_route":false}' ;; esac
 
 cat > "$OUT" <<EOF
 {
   "log": {"level": "info"},
   "inbounds": [
-    {"type": "mixed", "tag": "mixed-in", "listen": "0.0.0.0", "listen_port": $MIXED_PORT}$TUN_BLOCK
+    {"type": "mixed", "tag": "mixed-in", "listen": "0.0.0.0", "listen_port": $MIXED_PORT},
+    {"type": "redirect", "tag": "redir-in", "listen": "0.0.0.0", "listen_port": $REDIR_PORT},
+    {"type": "tproxy", "tag": "tproxy-in", "listen": "0.0.0.0", "listen_port": $TPROXY_PORT}$TUN_BLOCK
   ],
   "outbounds": [
     {"type": "direct", "tag": "direct-out"}
