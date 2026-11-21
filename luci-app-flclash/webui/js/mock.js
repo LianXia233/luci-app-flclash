@@ -152,16 +152,20 @@ window.FlClashMock = (function () {
   }
 
   function seedDns() {
-    const now = Date.now();
-    const names = ['www.bilibili.com', 'api.github.com', 'example.com', 'api.openai.com', 'cdn.jsdelivr.net', 'music.163.com'];
-    dnsQueries = names.map(function (name, index) {
+    // Schema must match the DNS query log page (domain/qtype/origin/...),
+    // times in seconds.
+    const now = Math.floor(Date.now() / 1000);
+    const seeds = [
+      ['node-02.example.net', 'A', '代理', '203.0.113.20, 203.0.113.21', 'https://203.0.113.10:8443/dns-query/abcd', 34, false],
+      ['edge.example.net', 'A', '直连', '198.51.100.50', 'udp://8.8.4.4:53', 21, false],
+      ['www.gstatic.com', 'A', '缓存', '198.18.0.4', '', 0, true],
+      ['www.cloudflare.com', 'AAAA', '其他', '2606:4700::6810:7b60', 'udp://223.5.5.5:53', 35, false]
+    ];
+    dnsQueries = seeds.map(function (item, index) {
       return {
-        time: now - index * 9000,
-        name: name,
-        type: index % 3 === 0 ? 'AAAA' : 'A',
-        answer: index % 2 === 0 ? '198.18.0.' + (index + 2) : 'DIRECT',
-        resolver: index % 2 === 0 ? 'dns.google' : 'system',
-        elapsed: 8 + Math.floor(Math.random() * 60)
+        time: now - (index + 1) * 3,
+        domain: item[0], qtype: item[1], origin: item[2],
+        result: item[3], source: item[4], elapsed: item[5], cached: item[6]
       };
     });
   }
@@ -198,9 +202,9 @@ window.FlClashMock = (function () {
     if (dnsQueries.length && Math.random() > 0.7) {
       const host = pick(hosts);
       dnsQueries.unshift({
-        time: Date.now(), name: host[0], type: 'A',
-        answer: '198.18.0.' + (2 + Math.floor(Math.random() * 200)),
-        resolver: 'dns.google', elapsed: 8 + Math.floor(Math.random() * 60)
+        time: Math.floor(Date.now() / 1000), domain: host[0], qtype: 'A',
+        origin: '代理', result: '203.0.113.' + (2 + Math.floor(Math.random() * 200)),
+        source: 'https://223.5.5.5/dns-query', elapsed: 8 + Math.floor(Math.random() * 60), cached: false
       });
       if (dnsQueries.length > 60) dnsQueries.pop();
     }
@@ -216,7 +220,11 @@ window.FlClashMock = (function () {
     });
   }
 
-  window.setInterval(tick, 1000);
+  // Only advance the mock world when mock mode is actually on (?mock=1):
+  // the unconditional timer used to idle-spin on every production load.
+  if (window.FlClashConfig && window.FlClashConfig.mock) {
+    window.setInterval(tick, 1000);
+  }
 
   function clone(value) { return JSON.parse(JSON.stringify(value)); }
 
@@ -368,7 +376,6 @@ window.FlClashMock = (function () {
         return Object.assign({}, item, { duration: (Date.now() - item.startTime) / 1000 });
       })));
     },
-    dnsQueries: function () { return Promise.resolve(clone(dnsQueries)); },
     logs: function () { return Promise.resolve(clone(logs)); },
     config: function () {
       return Promise.resolve(clone({
@@ -388,15 +395,7 @@ window.FlClashMock = (function () {
       }));
     },
     version: function () { return Promise.resolve({ version: '0.9.3', core: 'v1.19.33' }); },
-    dnsQueries: function () {
-      const now = Math.floor(Date.now() / 1000);
-      return [
-        { time: now - 2, domain: 'node-02.example.net', qtype: 'A', origin: '代理', result: '203.0.113.20, 203.0.113.21', source: 'https://203.0.113.10:8443/dns-query/abcd', elapsed: 34, cached: false },
-        { time: now - 4, domain: 'edge.example.net', qtype: 'A', origin: '直连', result: '198.51.100.50', source: 'udp://8.8.4.4:53', elapsed: 21, cached: false },
-        { time: now - 6, domain: 'www.gstatic.com', qtype: 'A', origin: '缓存', result: '198.18.0.4', source: '', elapsed: 0, cached: true },
-        { time: now - 9, domain: 'www.cloudflare.com', qtype: 'AAAA', origin: '其他', result: '2606:4700::6810:7b60', source: 'udp://223.5.5.5:53', elapsed: 35, cached: false }
-      ];
-    },
+    dnsQueries: function () { return Promise.resolve(clone(dnsQueries)); },
     systemProxy: function () {
       return Promise.resolve({
         backend: 'flclash',
