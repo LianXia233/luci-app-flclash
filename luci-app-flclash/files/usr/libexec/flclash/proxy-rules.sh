@@ -21,6 +21,8 @@ LAN_IF=${LAN_IF:-}
 DNS_PORT=1053
 REDIR_PORT=7893
 TPROXY_PORT=7894
+MIXED_PORT=$(uci -q get flclash.main.mixed_port 2>/dev/null)
+[ -n "$MIXED_PORT" ] || MIXED_PORT=7892
 FWMARK=0x162
 CORE_MARK=0x14d
 STATE_FILE=/tmp/flclash-proxy.state
@@ -460,11 +462,17 @@ purge_core_artifacts() {
 
 fw4_input_on() {
 	nft list chain inet fw4 input >/dev/null 2>&1 || return 0
-	# allow-lan binds the proxy listeners to "*" — keep them LAN-only so an
-	# open WAN zone cannot turn the router into an open proxy. Inserted first,
-	# ahead of the accept rules below.
-	nft list chain inet fw4 input 2>/dev/null | grep -q 'FlClash WAN Proxy Guard' || \
-		nft insert rule inet fw4 input position 0 "iifname != \"$LAN_IF\" meta l4proto { tcp, udp } th dport { $REDIR_PORT, $TPROXY_PORT } reject comment \"FlClash WAN Proxy Guard\"" 2>/dev/null
+	# allow-lan binds every proxy listener (mixed, redir, tproxy, core DNS) to
+	# "*" — keep them LAN-only so an open WAN zone cannot turn the router into
+	# an open proxy or an open resolver. Loopback stays exempt: local takeover
+	# redirects router-originated TCP to 127.0.0.1:$REDIR_PORT and dnsmasq
+	# forwards to 127.0.0.1:$DNS_PORT, both arriving on iifname lo. The guard
+	# rule is replaced in place so a changed LAN_IF or port set takes effect.
+	local h
+	for h in $(nft -a list chain inet fw4 input 2>/dev/null | awk '/FlClash WAN Proxy Guard/ {print $NF}'); do
+		nft delete rule inet fw4 input handle "$h" 2>/dev/null
+	done
+	nft insert rule inet fw4 input position 0 "iifname != \"$LAN_IF\" iifname != \"lo\" meta l4proto { tcp, udp } th dport { $MIXED_PORT, $REDIR_PORT, $TPROXY_PORT, $DNS_PORT } reject comment \"FlClash WAN Proxy Guard\"" 2>/dev/null
 	nft list chain inet fw4 input 2>/dev/null | grep -q 'FlClash Redirect Accept' || \
 		nft insert rule inet fw4 input position 0 ct status dnat accept comment '"FlClash Redirect Accept"' 2>/dev/null
 	nft list chain inet fw4 input 2>/dev/null | grep -q 'FlClash TPROXY Accept' || \
@@ -850,6 +858,9 @@ sync() {
 		# domain rules; TUN's any:53 hijack and this loopback hand-off do not loop.
 		dns_on || { set_state off; return 1; }
 		output_local_on
+		# rules_off removed the WAN guard with the nft table; TUN still listens
+		# on the LAN-facing proxy ports, so re-arm it.
+		fw4_input_on
 		set_state tun
 		return 0
 	fi
