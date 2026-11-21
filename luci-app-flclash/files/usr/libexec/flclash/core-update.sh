@@ -105,15 +105,12 @@ else
 fi
 chmod 755 "$TMP"
 
-NEWVER=$("$TMP" -v 2>/dev/null | head -n1)
-[ -n "$NEWVER" ] || NEWVER=$("$TMP" version 2>/dev/null | head -n1)
-[ -n "$NEWVER" ] || fail "new binary does not execute"
-echo "[update] new core: $NEWVER"
-
-# --- integrity -------------------------------------------------------------
+# --- integrity (BEFORE any execution) --------------------------------------
 # GitHub releases usually publish "<asset>.sha256". Verify when present; when
 # absent, say so explicitly instead of silently trusting the transport. The
-# previous code executed whatever arrived and replaced /usr/bin with it.
+# previous code executed whatever arrived and replaced /usr/bin with it; the
+# version probe below now only runs on a verified (or explicitly unverified)
+# artifact, never before the check.
 if command -v sha256sum >/dev/null 2>&1; then
 	if curl -fsSL -m 30 -o /tmp/flclash-core.sha256 "${ASSET_URL}.sha256" 2>/dev/null \
 		&& [ -s /tmp/flclash-core.sha256 ]; then
@@ -127,6 +124,11 @@ if command -v sha256sum >/dev/null 2>&1; then
 else
 	echo "[update] WARNING: sha256sum unavailable; integrity relies on HTTPS"
 fi
+
+NEWVER=$("$TMP" -v 2>/dev/null | head -n1)
+[ -n "$NEWVER" ] || NEWVER=$("$TMP" version 2>/dev/null | head -n1)
+[ -n "$NEWVER" ] || fail "new binary does not execute"
+echo "[update] new core: $NEWVER"
 
 # --- install with rollback -------------------------------------------------
 # core_type must be persisted BEFORE the restart, otherwise `init.d start`

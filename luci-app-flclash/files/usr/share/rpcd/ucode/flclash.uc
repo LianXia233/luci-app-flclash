@@ -16,7 +16,7 @@
  */
 'use strict';
 
-import { readfile, popen } from 'fs';
+import { readfile, writefile, popen } from 'fs';
 import { cursor } from 'uci';
 
 let uci_ctx = null;
@@ -96,7 +96,10 @@ function core_version(type) {
 		}
 	}
 	if (length(v) > 0) {
-		system('echo "' + v + '" > /tmp/flclash-core-version.' + type);
+		/* Direct file write: the version string comes from a remote JSON
+		 * document, and interpolating it into a shell command would hand
+		 * `$(...)`/backtick sequences to the shell as root. */
+		writefile('/tmp/flclash-core-version.' + type, v + '\n');
 		return v;
 	}
 	const cached = readfile('/tmp/flclash-core-version.' + type);
