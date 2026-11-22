@@ -95,23 +95,40 @@ start_service() {
 	procd_set_param env GOMEMLIMIT="${mem_limit}MiB" GOGC=50 HTTPS_PROXY=http://127.0.0.1:7892 HTTP_PROXY=http://127.0.0.1:7892 NO_PROXY=127.0.0.1,localhost,::1 GODEBUG=http2client=0
 	if [ "$core_type" = "sing-box" ]; then
 		# sing-box uses its own JSON config. Translate the Clash-format
-		# config.yaml on the fly; if the converter is missing or fails, fall
-		# back to treating config_file as a sing-box native config.
+		# config.yaml, then validate the exact document with `sing-box check`
+		# before it is allowed to replace the last working JSON. A converter
+		# bug or an unsupported subscription node must not turn into a
+		# crash-loop where every start feeds sing-box an invalid file.
 		local sb_config=/tmp/flclash-singbox.json
+		local sb_candidate=/tmp/flclash-singbox.json.new
+		local sb_check=/tmp/flclash-singbox-check.log
+		rm -f "$sb_candidate"
 		if [ -x /usr/libexec/flclash/singbox-convert.sh ] \
-			&& /usr/libexec/flclash/singbox-convert.sh "$config_file" "$sb_config" >/dev/null 2>&1 \
-			&& [ -s "$sb_config" ]; then
-			config_file=$sb_config
-			chmod 0600 "$config_file" 2>/dev/null
+			&& /usr/libexec/flclash/singbox-convert.sh "$config_file" "$sb_candidate" >/dev/null 2>&1 \
+			&& [ -s "$sb_candidate" ]; then
+			if ENABLE_DEPRECATED_LEGACY_RULE_SET_DOWNLOAD_DETOUR=true \
+				"$core_bin" check -c "$sb_candidate" >"$sb_check" 2>&1; then
+				mv -f "$sb_candidate" "$sb_config"
+			else
+				logger -t flclash-core "sing-box rejected converted config: $(tail -n 3 "$sb_check" 2>/dev/null | tr '\n' ' ')"
+				rm -f "$sb_candidate"
+			fi
+		else
+			logger -t flclash-core "sing-box conversion failed; reusing the last converted config"
 		fi
+		if [ ! -s "$sb_config" ]; then
+			logger -t flclash-core "no usable sing-box config; refusing to start"
+			return 1
+		fi
+		chmod 0600 "$sb_config" 2>/dev/null
+		config_file=$sb_config
 		# Legacy rule-set download_detour is emitted by default; allow it on
 		# sing-box 1.14+ until the converter moves to the new syntax.
 		procd_set_param env ENABLE_DEPRECATED_LEGACY_RULE_SET_DOWNLOAD_DETOUR=true
 		# Keep sing-box as root here. On some procd builds dropping to the
 		# sing-box user leaves the instance in a crash loop (verified on
-		# ImmortalWrt snapshot). proxy-rules.sh skips the local OUTPUT redirect
-		# when this core is active, since sing-box has no routing-mark to
-		# exempt its own outbound from the redirect (would form a loop).
+		# ImmortalWrt snapshot). proxy-rules.sh uses route.default_mark (333)
+		# to exempt the core's own outbound from the OUTPUT redirect.
 		procd_set_param command "$core_bin" run -c "$config_file"
 	elif [ "$core_mode" = "cli" ] || [ ! -x /usr/bin/flclash-core-bridge ]; then
 		# Standalone mihomo CLI (including the auto-update path).

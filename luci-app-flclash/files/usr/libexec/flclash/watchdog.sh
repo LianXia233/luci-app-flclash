@@ -18,7 +18,15 @@ while :; do
 			''|*[!0-9]*) port=9097 ;;
 		esac
 		netstat -lnt 2>/dev/null | grep -q ":$port " || bad=1
-		if [ "$(uci -q get flclash.main.core_type 2>/dev/null)" != "sing-box" ]; then
+		# The core serves LAN DNS on :1053 only when its config has a DNS
+		# module. sing-box signals that with the `dns-in` inbound; when DNS is
+		# deliberately disabled the listener is absent and must not be treated
+		# as a failure (otherwise the watchdog restarts a healthy core).
+		if [ "$(uci -q get flclash.main.core_type 2>/dev/null)" = "sing-box" ]; then
+			if grep -q '"tag"[[:space:]]*:[[:space:]]*"dns-in"' /tmp/flclash-singbox.json 2>/dev/null; then
+				netstat -lnu 2>/dev/null | grep -q ":1053 " || bad=1
+			fi
+		else
 			netstat -lnu 2>/dev/null | grep -q ":1053 " || bad=1
 		fi
 		if [ "$bad" = "1" ]; then

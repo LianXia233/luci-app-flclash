@@ -346,6 +346,22 @@ pub async fn save_config(
     }
     let result = persist_config(&config_path, patch);
     if result.is_ok() {
+        // enforce_invariants() re-inserts mixed-port from UCI on every save.
+        // Without mirroring the WebUI value back to UCI the user's new port
+        // was silently reverted (and proxy-rules.sh's fw4 guard kept using the
+        // old port). Do it before the invariant pass.
+        if let Some(port) = parse_i64(patch, "mixedPort") {
+            if port > 0 {
+                if let Err(err) = uci_set_key("flclash.main.mixed_port", &port.to_string())
+                    .and_then(|_| uci_commit_pkg("flclash"))
+                {
+                    if let Some(previous) = &previous {
+                        let _ = write_atomic(&config_path, previous);
+                    }
+                    return Err(err);
+                }
+            }
+        }
         if let Err(err) = persist_dns_uci(patch) {
             if let Some(previous) = &previous {
                 let _ = write_atomic(&config_path, previous);
@@ -368,9 +384,14 @@ pub async fn save_config(
             return Err(format!("配置预检失败: {err}"));
         }
     }
-    if result.is_ok() && !runtime.is_empty() && !tun_runtime {
+    if result.is_ok() && !runtime.is_empty() && !tun_runtime
+        && crate::core::configured_core() != "sing-box"
+    {
         // Failure is deliberately non-fatal: a stopped core must not turn
         // "save settings" into an error (connection refused must not leak).
+        // sing-box's clash_api only accepts mode/log-level PATCHes; listener
+        // and route changes are baked into the JSON and need a restart, which
+        // reload_core() below performs.
         let body = serde_json::to_string(&Value::Object(runtime)).unwrap_or_default();
         let _ = crate::ctrl::ctrl_req(
             &st.controller,
@@ -387,12 +408,24 @@ pub async fn save_config(
     // mode is included because sing-box has no runtime mode switch: its
     // global/direct/rule behaviour is baked into the generated route at
     // startup, so a mode change must reload the core to take effect.
+    // sing-box additionally bakes the mixed/socks/http ports, allow-lan,
+    // IPv6 and log level into the JSON, so those saves restart it as well.
+    let singbox_startup_change = crate::core::configured_core() == "sing-box"
+        && patch
+            .as_object()
+            .map(|map| {
+                ["mixedPort", "socksPort", "httpPort", "allowLan", "ipv6", "logLevel"]
+                    .iter()
+                    .any(|key| map.contains_key(*key))
+            })
+            .unwrap_or(false);
     if result.is_ok()
         && (patch.get("dns").is_some()
             || patch.get("tun").is_some()
             || patch.get("tunStack").is_some()
             || patch.get("mode").is_some()
-            || patch.get("externalUi").is_some())
+            || patch.get("externalUi").is_some()
+            || singbox_startup_change)
     {
         if tun_runtime || patch.get("tun").is_some() || patch.get("tunStack").is_some() {
             // FlClash's native IPC hub deliberately skips updateTun during a
@@ -448,6 +481,16 @@ pub async fn save_config(
                 .arg("sync")
                 .output()
                 .await;
+        }
+        // The IPv6 policy is written into config.yaml by prepare_config (top
+        // level + dns.ipv6). sing-box bakes both into DNS strategy and the TUN
+        // addresses at startup, so a live core needs one restart; a stopped
+        // core must stay stopped and picks the change up on its next start.
+        if crate::core::configured_core() == "sing-box"
+            && patch.get("ipv6Mode").is_some()
+            && crate::ctrl::core_reachable(st).await
+        {
+            crate::profiles::reload_core(st).await;
         }
     }
     result

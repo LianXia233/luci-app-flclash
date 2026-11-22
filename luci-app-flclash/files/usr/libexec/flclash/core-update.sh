@@ -216,5 +216,12 @@ done
 FINAL=$("$DEST" -v 2>/dev/null | head -n1)
 [ -n "$FINAL" ] || FINAL=$("$DEST" version 2>/dev/null | head -n1)
 echo "[update] installed: $FINAL"
+# sing-box reads its own .srs rule-sets; refresh the CN pair in the background
+# so a slow CDN does not hold the "done" state hostage. The core starts fine
+# without them (GEOSITE/GEOIP rules are skipped until they exist).
+if [ "$CORE" = "sing-box" ] && [ -x /usr/libexec/flclash/geo-update.sh ]; then
+	echo "[update] refreshing sing-box geo rule-sets in background"
+	( /usr/libexec/flclash/geo-update.sh sing-box >/dev/null 2>&1 ) &
+fi
 echo "[update] done"
 set_state done

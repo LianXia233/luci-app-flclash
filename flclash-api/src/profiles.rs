@@ -590,59 +590,70 @@ async fn wait_core(st: &AppState, seconds: u64) -> bool {
 /// Applies config.yaml to a running core, or starts the core. This is why
 /// "启用配置" works while the proxy is stopped.
 pub async fn reload_core(st: &AppState) {
-    // Keep the sing-box config in sync with the freshly applied subscription.
-    // Conversion is lossless (proxies/groups/rules/DNS/TUN) and cheap; the init
-    // script re-runs it on core switch, this just removes the staleness window
-    // after an import/update/apply so switching is instant.
     let cfg_path = st.config_path();
-    if let Ok(yaml) = std::fs::read_to_string(&cfg_path) {
-        if let Ok(json) = crate::singbox::convert(&yaml) {
-            // Contains node credentials: 0600, atomic (write_atomic default).
-            let _ = crate::config::write_atomic(
-                std::path::Path::new("/tmp/flclash-singbox.json"),
-                json.as_bytes(),
-            );
+    if crate::core::configured_core() == "sing-box" {
+        // Keep the converted JSON in sync with the freshly applied
+        // subscription. Validation uses the same `sing-box check` path as the
+        // core switch; when it fails the previous (working) JSON is kept and
+        // the restart below simply reuses it.
+        match std::fs::read_to_string(&cfg_path) {
+            Ok(yaml) => match crate::singbox::convert(&yaml) {
+                Ok(json) => match crate::preflight::check_singbox_json(&json) {
+                    Ok(()) => {
+                        let _ = crate::config::write_atomic(
+                            std::path::Path::new("/tmp/flclash-singbox.json"),
+                            json.as_bytes(),
+                        );
+                    }
+                    Err(err) => {
+                        eprintln!("flclash: sing-box preflight failed, keeping previous JSON: {err}");
+                    }
+                },
+                Err(err) => eprintln!("flclash: sing-box convert failed: {err}"),
+            },
+            Err(err) => eprintln!("flclash: read config.yaml failed: {err}"),
         }
-    }
-
-    if crate::config::file_config(&cfg_path).tun {
+        // sing-box's clash_api has no reload endpoint: listeners, route rules,
+        // DNS and TUN only change with a process restart.
+        let _ = service(st, "restart").await;
+        ensure_core(st).await;
+    } else if crate::config::file_config(&cfg_path).tun {
         // The native IPC core can drop TUN on controller PATCH/PUT updates.
         // Re-run listener.start with the complete config instead.
         let _ = service(st, "restart").await;
         ensure_core(st).await;
-        return;
-    }
-
-    let reachable = crate::ctrl::ctrl_req(
-        &st.controller,
-        st.secret.as_deref(),
-        "GET",
-        "/version",
-        None,
-        std::time::Duration::from_secs(2),
-    )
-    .await;
-    match reachable {
-        Ok(reply) if reply.status < 500 => {
-            let body = serde_json::json!({"path": st.config_path().display().to_string()});
-            let put = crate::ctrl::ctrl_req(
-                &st.controller,
-                st.secret.as_deref(),
-                "PUT",
-                "/configs",
-                Some(&body.to_string()),
-                std::time::Duration::from_secs(15),
-            )
-            .await;
-            if !matches!(&put, Ok(r) if r.status < 400) {
-                let _ = service(st, "restart").await;
+    } else {
+        let reachable = crate::ctrl::ctrl_req(
+            &st.controller,
+            st.secret.as_deref(),
+            "GET",
+            "/version",
+            None,
+            std::time::Duration::from_secs(2),
+        )
+        .await;
+        match reachable {
+            Ok(reply) if reply.status < 500 => {
+                let body = serde_json::json!({"path": st.config_path().display().to_string()});
+                let put = crate::ctrl::ctrl_req(
+                    &st.controller,
+                    st.secret.as_deref(),
+                    "PUT",
+                    "/configs",
+                    Some(&body.to_string()),
+                    std::time::Duration::from_secs(15),
+                )
+                .await;
+                if !matches!(&put, Ok(r) if r.status < 400) {
+                    let _ = service(st, "restart").await;
+                }
+            }
+            _ => {
+                let _ = service(st, "start").await;
             }
         }
-        _ => {
-            let _ = service(st, "start").await;
-        }
+        ensure_core(st).await;
     }
-    ensure_core(st).await;
 
     // A reload/restart swaps mihomo's fake-ip pool, but dnsmasq keeps serving
     // the old 198.18.x answers from its cache — LAN clients get RSTs for the

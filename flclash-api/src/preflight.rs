@@ -81,6 +81,51 @@ fn check_output(label: &str, out: Output) -> Result<(), String> {
     }
 }
 
+/// Validates a Clash YAML by converting it to the sing-box config that the
+/// init script will actually run, then `sing-box check` that JSON. Running
+/// `sing-box check -c config.yaml` directly (the previous behaviour) always
+/// failed, which made every settings save / profile apply impossible while
+/// the sing-box core was selected.
+pub fn check_singbox_yaml(yaml: &str) -> Result<(), String> {
+    if std::env::var("FLCLASH_SKIP_PREFLIGHT").map(|v| v == "1").unwrap_or(false) {
+        return Ok(());
+    }
+    let json = crate::singbox::convert(yaml)?;
+    check_singbox_json(&json)
+}
+
+/// Validates an already-converted sing-box JSON document.
+pub fn check_singbox_json(json: &str) -> Result<(), String> {
+    if std::env::var("FLCLASH_SKIP_PREFLIGHT").map(|v| v == "1").unwrap_or(false) {
+        return Ok(());
+    }
+    let bin = crate::coremgmt::bin_path("sing-box");
+    if !bin.is_file() {
+        return Err("sing-box 未安装，无法预检".into());
+    }
+    // Keep the probe on the same filesystem as its temporary name so the
+    // removal is atomic and never leaves a half-written file behind.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!(
+        "flclash-singbox-check-{}-{}.json",
+        std::process::id(),
+        seq
+    ));
+    crate::config::write_atomic(&path, json.as_bytes())?;
+    let mut cmd = Command::new(bin);
+    cmd.args(["check", "-c"]).arg(&path);
+    // Configs produced by older converters may still carry the legacy
+    // rule-set download_detour field; allow it for the duration of the probe.
+    cmd.env("ENABLE_DEPRECATED_LEGACY_RULE_SET_DOWNLOAD_DETOUR", "true");
+    let result = run_with_timeout(cmd, Duration::from_secs(20))
+        .and_then(|out| check_output("sing-box check", out));
+    let _ = std::fs::remove_file(&path);
+    result
+}
+
 /// Validates `path` with the configured core. Returns a user-readable error
 /// (already trimmed) on failure. Never touches the live config.
 pub fn validate_config_blocking(path: &Path) -> Result<(), String> {
@@ -93,13 +138,9 @@ pub fn validate_config_blocking(path: &Path) -> Result<(), String> {
     let home = path.parent().unwrap_or_else(|| Path::new("/etc/flclash"));
     let core = crate::core::configured_core();
     if core == "sing-box" {
-        let bin = crate::coremgmt::bin_path("sing-box");
-        if !bin.is_file() {
-            return Err("sing-box 未安装，无法预检".into());
-        }
-        let mut cmd = Command::new(bin);
-        cmd.args(["check", "-c"]).arg(path);
-        return check_output("sing-box check", run_with_timeout(cmd, Duration::from_secs(20))?);
+        let yaml = std::fs::read_to_string(path)
+            .map_err(|e| format!("读取配置失败: {e}"))?;
+        return check_singbox_yaml(&yaml);
     }
 
     let bin = crate::coremgmt::bin_path("mihomo");

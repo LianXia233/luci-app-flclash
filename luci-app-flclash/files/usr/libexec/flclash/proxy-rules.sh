@@ -212,6 +212,42 @@ core_type() {
 	[ "$(uci -q get flclash.main.core_type 2>/dev/null)" = "sing-box" ] && echo sing-box || echo mihomo
 }
 
+# sing-box exposes LAN DNS through a `direct` inbound tagged dns-in (the
+# converter emits it next to a `hijack-dns` route action). The port is read
+# back from the generated JSON so a user-supplied native base config is not
+# hijacked to a listener it never opened. Only look forward from the tag:
+# searching backwards used to pick the neighbouring tproxy port.
+singbox_dns_port() {
+	[ -f /tmp/flclash-singbox.json ] || return 1
+	local port
+	port=$(grep -A4 -E '"tag"[[:space:]]*:[[:space:]]*"dns-in"' /tmp/flclash-singbox.json 2>/dev/null \
+		| sed -n 's/.*"listen_port"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+		| head -n1)
+	[ -n "$port" ] || return 1
+	echo "$port"
+}
+
+# Port the running core listens on for LAN DNS, empty when the config
+# deliberately has no DNS module.
+core_dns_port() {
+	if [ "$(core_type)" = "sing-box" ]; then
+		singbox_dns_port
+	else
+		echo "$DNS_PORT"
+	fi
+}
+
+# Local (router-originated) traffic can only be sent through the OUTPUT
+# redirect when the core can mark its own sockets, otherwise its outbound
+# connections loop back into the redirect. mihomo uses `routing-mark: 333`;
+# sing-box emits `route.default_mark: 333` (checked against the live JSON so
+# an old converted config without it is not treated as safe).
+local_takeover_ready() {
+	[ "$LOCAL_TAKEOVER" = "1" ] || return 1
+	[ "$(core_type)" = "mihomo" ] && return 0
+	grep -q '"default_mark"[[:space:]]*:[[:space:]]*333' /tmp/flclash-singbox.json 2>/dev/null
+}
+
 core_alive() {
 	local addr port
 	addr=$(uci -q get flclash.main.external_controller 2>/dev/null)
@@ -591,11 +627,26 @@ dns_save() {
 }
 
 dns_on() {
-	[ "$(core_type)" = "sing-box" ] && { dns_off; return $?; }
+	# Both cores must obey the single UCI mode: prepare_config forces
+	# tun.enable=false outside TUN mode and restores the v6 policy before the
+	# converter runs (sing-box only reads these keys at startup).
+	prepare_config
+	if [ "$PREPARE_CHANGED" = "1" ]; then
+		/etc/init.d/flclash-core restart >/dev/null 2>&1
+		wait_core || return 1
+	fi
+	local dns_port
+	dns_port=$(core_dns_port)
+	if [ -z "$dns_port" ]; then
+		# DNS module disabled in the core config: leave dnsmasq untouched and
+		# let traffic rules proceed without a DNS hand-off.
+		dns_off
+		return 0
+	fi
 	# In allow/block mode only a subset of clients is hijacked by nft. A global
-	# dnsmasq upstream of 127.0.0.1:1053 would still route the *other* clients'
-	# DNS through the proxy resolver, defeating the ACL. Restore the original
-	# upstream and let nft redirect only the selected clients.
+	# dnsmasq upstream of 127.0.0.1:<port> would still route the *other*
+	# clients' DNS through the proxy resolver, defeating the ACL. Restore the
+	# original upstream and let nft redirect only the selected clients.
 	if [ "$(acl_mode)" != "all" ]; then
 		dns_off
 		local change=0
@@ -613,15 +664,10 @@ dns_on() {
 		fi
 		return 0
 	fi
-	prepare_config
-	if [ "$PREPARE_CHANGED" = "1" ]; then
-		/etc/init.d/flclash-core restart >/dev/null 2>&1
-		wait_core || return 1
-	fi
 	dns_save
 	mkdir -p /tmp/dnsmasq.d
 	local change=0 cur filter
-	printf 'no-poll\nno-resolv\nserver=127.0.0.1#%s\n' "$DNS_PORT" > "$DNSCONF.new"
+	printf 'no-poll\nno-resolv\nserver=127.0.0.1#%s\n' "$dns_port" > "$DNSCONF.new"
 	if ! cmp -s "$DNSCONF.new" "$DNSCONF"; then
 		mv "$DNSCONF.new" "$DNSCONF"
 		change=1
@@ -629,9 +675,9 @@ dns_on() {
 		rm -f "$DNSCONF.new"
 	fi
 	cur=$(uci -q get dhcp.@dnsmasq[0].server 2>/dev/null)
-	if [ "$cur" != "127.0.0.1#$DNS_PORT" ]; then
+	if [ "$cur" != "127.0.0.1#$dns_port" ]; then
 		uci -q delete dhcp.@dnsmasq[0].server 2>/dev/null
-		uci -q add_list "dhcp.@dnsmasq[0].server=127.0.0.1#$DNS_PORT"
+		uci -q add_list "dhcp.@dnsmasq[0].server=127.0.0.1#$dns_port"
 		change=1
 	fi
 	if [ "$(uci -q get dhcp.@dnsmasq[0].noresolv)" != "1" ]; then
@@ -655,7 +701,11 @@ dns_on() {
 }
 
 dns_off() {
-	local change=0 cur saved saved_servers noresolv filter managed
+	local change=0 cur saved saved_servers noresolv filter managed dns_port
+	# Restore the exact upstream that was saved, including a native base
+	# config that used a non-default DNS listener port.
+	dns_port=$(core_dns_port)
+	[ -n "$dns_port" ] || dns_port=$DNS_PORT
 	# Also drop a leftover .new: dnsmasq's conf-dir reads every non-hidden
 	# file, so an interrupted dns_on otherwise keeps pointing dnsmasq at a
 	# possibly dead core listener long after dns_off ran.
@@ -680,8 +730,8 @@ dns_off() {
 		uci -q commit flclash
 	else
 		case " $cur " in
-			*"127.0.0.1#$DNS_PORT"*)
-				uci -q del_list "dhcp.@dnsmasq[0].server=127.0.0.1#$DNS_PORT" 2>/dev/null && change=1
+			*"127.0.0.1#$dns_port"*)
+				uci -q del_list "dhcp.@dnsmasq[0].server=127.0.0.1#$dns_port" 2>/dev/null && change=1
 				[ -n "$(uci -q get dhcp.@dnsmasq[0].server 2>/dev/null)" ] || uci -q delete dhcp.@dnsmasq[0].server 2>/dev/null
 				[ "$(uci -q get dhcp.@dnsmasq[0].noresolv)" != "0" ] && {
 					uci -q set dhcp.@dnsmasq[0].noresolv=0 && change=1
@@ -880,8 +930,10 @@ nft_lan_ready() {
 	if [ "$IPV6_MODE" = "off" ]; then
 		nft list chain inet "$TABLE" v6_block 2>/dev/null | grep -q 'drop' || return 1
 	fi
-	[ "$(core_type)" = "sing-box" ] && return 0
-	nft list chain inet "$TABLE" prerouting_dns 2>/dev/null | grep -q 'redirect to :'"$DNS_PORT"
+	local dns_port
+	dns_port=$(core_dns_port)
+	[ -n "$dns_port" ] || return 0
+	nft list chain inet "$TABLE" prerouting_dns 2>/dev/null | grep -q 'redirect to :'"$dns_port"
 }
 
 nft_output_local() {
@@ -979,16 +1031,17 @@ nft_acl_dns_rules() {
 # redirect is emitted per allowed client (MAC-only for IPv6 until v6 ACLs are
 # modelled).
 nft_dns_hijack_rules() {
-	local mode ip ip6 mac listed=0
-	[ "$(core_type)" = "sing-box" ] && return 0
+	local mode ip ip6 mac listed=0 dns_port
+	dns_port=$(core_dns_port)
+	[ -n "$dns_port" ] || return 0
 	mode=$(acl_mode)
 	emit() {
 		local prefix="$1"
-		echo "iifname { $LAN_IFS_NFT } $prefix udp dport 53 redirect to :$DNS_PORT"
-		echo "iifname { $LAN_IFS_NFT } $prefix tcp dport 53 redirect to :$DNS_PORT"
+		echo "iifname { $LAN_IFS_NFT } $prefix udp dport 53 redirect to :$dns_port"
+		echo "iifname { $LAN_IFS_NFT } $prefix tcp dport 53 redirect to :$dns_port"
 		if [ "$IPV6_MODE" = "proxy" ]; then
-			echo "iifname { $LAN_IFS_NFT } $prefix meta nfproto ipv6 udp dport 53 redirect to :$DNS_PORT"
-			echo "iifname { $LAN_IFS_NFT } $prefix meta nfproto ipv6 tcp dport 53 redirect to :$DNS_PORT"
+			echo "iifname { $LAN_IFS_NFT } $prefix meta nfproto ipv6 udp dport 53 redirect to :$dns_port"
+			echo "iifname { $LAN_IFS_NFT } $prefix meta nfproto ipv6 tcp dport 53 redirect to :$dns_port"
 		fi
 	}
 	if [ "$mode" != "allow" ]; then
@@ -1139,7 +1192,10 @@ EOF
 		[ $? -eq 0 ] || return 1
 	fi
 	fw4_input_on
-	[ "$LOCAL_TAKEOVER" = "1" ] && [ "$(core_type)" != "sing-box" ] && nft_output_local
+	# sing-box can now take over router-local traffic too: its converted
+	# config carries route.default_mark=333, the same value mihomo puts in
+	# routing-mark, so the OUTPUT chain's mark exemption breaks the loop.
+	local_takeover_ready && nft_output_local
 	echo "$LAN_SIG_VALUE" > "$LAN_SIG" 2>/dev/null
 	nft_lan_ready
 }
@@ -1161,7 +1217,7 @@ rules_on() { nft_on; }
 rules_off() { nft_off; }
 rules_active() { nft_active; }
 output_local_on() {
-	[ "$LOCAL_TAKEOVER" = "1" ] && [ "$(core_type)" != "sing-box" ] || return 0
+	local_takeover_ready || return 0
 	nft_output_local
 }
 

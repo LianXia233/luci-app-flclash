@@ -4,7 +4,7 @@
 
 **单包 APK · mihomo + sing-box 双内核 · Rust/Tokio API 桥 · HTML5 WebUI**
 
-<a href="https://github.com/LianXia233/luci-app-flclash/releases"><img alt="version" height="20" src="https://img.shields.io/badge/version-1.5.5-0f766e?style=flat-square"></a>
+<a href="https://github.com/LianXia233/luci-app-flclash/releases"><img alt="version" height="20" src="https://img.shields.io/badge/version-1.5.6-0f766e?style=flat-square"></a>
 <a href="LICENSE"><img alt="license" height="20" src="https://img.shields.io/badge/license-GPL--3.0--only-0f766e?style=flat-square"></a>
 <a href="#兼容性与限制"><img alt="arch" height="20" src="https://img.shields.io/badge/arch-aarch64__cortex--a53%20%7C%20x86__64-0891b2?style=flat-square"></a>
 <a href="https://github.com/LianXia233/luci-app-flclash/actions/workflows/build-apk.yml"><img alt="CI" height="20" src="https://img.shields.io/github/actions/workflow/status/LianXia233/luci-app-flclash/build-apk.yml?style=flat-square&label=CI"></a>
@@ -17,21 +17,21 @@
 
 FlClash 的 OpenWrt 移植：把 **mihomo 内核**、**Rust IPC host**、**Rust/Tokio API 桥**、**LuCI 入口**与 **HTML5 WebUI** 装进**一个 apk**。
 
-订阅只需导入一次。桥接将订阅归一为 mihomo `config.yaml`，切换到 sing-box 时再结构化转换为原生 JSON（节点、代理组、规则、DNS、TUN），混合端口与控制器端口保持不变。
+订阅只需导入一次。桥接将订阅归一为 mihomo `config.yaml`，切换到 sing-box 时再结构化转换为原生 JSON（节点、代理组、规则、DNS、TUN、LAN DNS 入站），混合端口与控制器端口保持不变。转换结果在切换与启动前都会经过 `sing-box check`，被拒绝的配置不会覆盖正在工作的内核。
 
 ## 功能
 
 - **订阅导入**：Clash YAML、base64 节点列表，以及分享链接 `ss / ssr / vmess / vless / trojan / hysteria (v1) / hysteria2 / hy2 / tuic / anytls`。
 - **配置管理**：订阅更新、编辑（名称 / URL / 自动更新间隔）、流量与到期展示、一键应用。
 - **代理与连接**：代理组 / 节点测速与切换、连接列表与关闭、规则查看、日志采样。
-- **DNS 进阶**：fake-ip / redir-host / mixed、DoH / DoT / bootstrap、fallback 链、代理节点/直连专用 nameserver、fallback-filter（geoip / ipcidr / domain）、分域名 `nameserver-policy`、DNS 查询与缓存刷新。基础设置页改动不会清空进阶字段。节点域名解析自动适配：订阅下发了 DNS 时优先用机场自己的 DoH/DoT（原样透传，含私有端点与 skip-cert-verify 参数）解析节点域名；未下发时回落国内 DoH/DoT（223.5.5.5 / doh.pub / 120.53.53.53），`mixin.yaml` 仍可覆盖。
+- **DNS 进阶**：fake-ip / redir-host / mixed、DoH / DoT / bootstrap、fallback 链、代理节点/直连专用 nameserver、fallback-filter（geoip / ipcidr / domain）、分域名 `nameserver-policy`、DNS 查询与缓存刷新。基础设置页改动不会清空进阶字段。节点域名解析自动适配：订阅下发了 DNS 时优先用机场自己的 DoH/DoT（原样透传，含私有端点与 skip-cert-verify 参数）解析节点域名；未下发时回落国内 DoH/DoT（223.5.5.5 / doh.pub / 120.53.53.53），`mixin.yaml` 仍可覆盖。切到 sing-box 时这套 DNS 会转换为原生 `dns` 模块：`dns-in` 入站 + `hijack-dns` 路由动作继续服务 dnsmasq 与 LAN DNS 劫持，`nameserver-policy` 域名键、fake-ip-filter、`geosite:cn` 分流与 IPv4/IPv6 策略一并保留。
 - **访问控制**：局域网客户端全部 / 白名单 / 黑名单（IP·CIDR·MAC），目标网段与端口排除，路由器自身出站接管开关；保存即重建 nft / iptables 规则。
 - **配置混入与校验**：`mixin.yaml` 深合并（映射递归、规则前置、`null` 删键），应用前结构校验（端口/枚举/引用完整性），订阅原始 YAML 可直接编辑并按需重应用。
 - **备份与恢复**：内置快照（配置 + 订阅 + 混入），保留最近 12 份，恢复前自动留底、校验后原子替换；支持下载与上传恢复。
-- **规则提供者与 Geo 数据**：查看规则提供者条数与更新时间、单条更新；GeoIP / GeoSite 由内核在线升级。
+- **规则提供者与 Geo 数据**：查看规则提供者条数与更新时间、单条更新；mihomo 的 GeoIP / GeoSite 由内核在线升级；sing-box 使用自己的二进制规则集，`/system/geo` 会下载 `geoip-cn.srs` / `geosite-cn.srs` 到 `/etc/flclash` 并以 `sing-box rule-set match` 校验后原子替换。
 - **透明代理状态机**：REDIRECT / TPROXY / TUN 三种接管路径由 `proxy-rules.sh sync` 统一收敛（见[透明代理状态机](#透明代理状态机)）；硬件流量卸载自动关闭；核心异常退出自动清理残留规则。
 - **双栈 IP 状态卡**：出口 IPv4 / IPv6 同屏显示，多源查询（Cloudflare 优先）+ 中文归属地 + 启停状态感知（见[状态卡与 IP 资料](#状态卡与-ip-资料)）。
-- **双内核**：内置 mihomo（FlClash native-IPC core，由 `flclash-core-bridge` 驱动）；sing-box 通过在线更新安装，以 `clash_api` 模式接入。WebUI 经 `/core` 系列 REST 端点查看已安装版本、在线更新、一键切换（切 sing-box 前用转换器重新生成 `/tmp/flclash-singbox.json`，不再依赖跨源 `/ubus`）。
+- **双内核**：内置 mihomo（FlClash native-IPC core，由 `flclash-core-bridge` 驱动）；sing-box 通过在线更新安装，以 `clash_api` 模式接入。转换器把订阅节点（ss/ssr/vmess/vless/trojan/hysteria/hysteria2/tuic/socks5/http/anytls）、代理组（含前向引用与环检测）、Clash 规则、DNS 与 TUN 映射为 sing-box 1.14 JSON；`GEOSITE,cn` / `GEOIP,CN` 使用本地 `.srs`，`route.default_mark=333` 与 mihomo 的 `routing-mark` 对齐，因此 sing-box 也支持路由器本机流量接管。WebUI 经 `/core` 系列 REST 端点查看已安装版本、在线更新、一键切换（切换前转换并预检，失败自动回滚）。
 - **优雅降级**：内核停止时读接口回退到 `config.yaml`，仍可查看状态与保存配置；依赖内核的写操作返回明确的 `503`，`apply` 会自动拉起内核。
 - **LuCI 集成**：`服务 → FlClash` 单页。**开关只控制 WebUI 后端（flclash-api）**，代理内核由 WebUI 内的开关手动启停；「一键进入 WebUI」会在后端未运行时自动拉起。
 
@@ -100,7 +100,7 @@ apk add --allow-untrusted ./luci-app-flclash_*.apk
 | API 桥 | `/usr/bin/flclash-api` | Rust / Tokio / axum；REST API + 静态 WebUI + 原生 HTTPS 出站 |
 | procd 服务 | `/etc/init.d/flclash-core`、`flclash-api`、`flclash-proxy` | 内核（手动）、桥接、接管收敛 |
 | UCI 配置 | `/etc/config/flclash` | 唯一 conffile |
-| 辅助脚本 | `/usr/libexec/flclash/*.sh` | 内核更新、透明代理状态机、sing-box 转换 |
+| 辅助脚本 | `/usr/libexec/flclash/*.sh` | 内核更新、Geo 规则集下载、透明代理状态机、sing-box 转换 |
 | LuCI | `/usr/share/luci/menu.d`、`/usr/share/rpcd/{acl.d,ucode}` | 菜单、ACL、ubus 对象 |
 | WebUI | `/www/flclash/` | HTML / CSS / JS / 字体 / 图标 |
 
@@ -112,7 +112,7 @@ apk add --allow-untrusted ./luci-app-flclash_*.apk
 | `7892` | `*`（接管时 `allow-lan` 被强制开启） | mixed HTTP/SOCKS 代理入口 |
 | `7893` | `*` | 透明代理 TCP REDIRECT 入口（`redir-port`） |
 | `7894` | `*` | 透明代理 UDP TPROXY 入口（`tproxy-port`） |
-| `1053` | `*` | 内核 DNS 监听器（`dns.listen`），供 dnsmasq 与 LAN DNS 劫持使用 |
+| `1053` | `*` | 内核 DNS 监听器（mihomo `dns.listen` / sing-box `dns-in` 入站），供 dnsmasq 与 LAN DNS 劫持使用 |
 | `9098` | `0.0.0.0` | `/flclash/api` 与 `/flclash/` WebUI |
 
 接管生效时 `allow-lan` 被强制为 `true`（REDIRECT 的目的地址是接口地址而非回环，绑死 `127.0.0.1` 会让 LAN 劫持连接全部被拒——这是「本机能代理、下挂设备不通」的根因）。作为补偿，`fw4 input` 会插入 **FlClash WAN Proxy Guard**：非 LAN 接口访问 `7893/7894` 直接 reject，避免在 WAN 侧变成开放代理。
@@ -134,12 +134,13 @@ sync() ─────┼─ config.tun.enable=true 且 TUN 在线 ──► TUN
 | --- | --- |
 | **管理面豁免** | prerouting 只挂 `br-lan` 且排除 RFC1918 目的地址；本机 OUTPUT 链带 `ct direction reply accept` 与 `ct original ip daddr private accept`——即使客户端是公网地址，SSH / LuCI 的回包也不会被劫持 |
 | **TUN 模式** | WebUI「虚拟网卡」开关写入 `tun:` 块并**完整重启内核**（IPC 内核热重载不会创建 TUN 设备）；接管期间撤下 REDIRECT 表与 DNS 手工接管，由内核 `Meta` 设备 + 策略路由接管 LAN，本机流量仍由 OUTPUT 链送入内核；`route-exclude-address` 固定排除全部管理/内网网段 |
-| **本机接管** | nft `output` 链把本机非私网 TCP REDIRECT 到 `7893`，路由器自身请求同样经内核分流；环路防护依赖 `routing-mark: 333`（内核 socket 携带 `0x14d` mark 首条规则放行） |
+| **本机接管** | nft `output` 链把本机非私网 TCP REDIRECT 到 `7893`，路由器自身请求同样经内核分流；环路防护依赖内核 socket mark：mihomo 用 `routing-mark: 333`，sing-box 用转换器生成的 `route.default_mark: 333`（两者都是 `0x14d`，nft 首条规则放行） |
 | **残留清理** | 内核被 SIGKILL / 异常退出会在 ip rules 9000-9010、table 2022、nft `inet mihomo` 留下指向死端口的残留规则，把 LAN 打进黑洞——`start_service` 与 `sync` 都会清除 |
 | **硬件卸载** | `flow_offloading` / `flow_offloading_hw` 被强制关闭，`bridger` 被停用并禁自启：硬件快路径的流绕过 netfilter，会让 REDIRECT 对 LAN TCP 失效（UDP 走 mangle 链幸存，更具迷惑性）；仅在此刻一次性 `conntrack -F`。停止接管时按接管前记录还原 |
-| **DNS 过滤** | 客户端 53 端口被直接劫持到内核 `1053`，不经过 dnsmasq，所以 dnsmasq 层 `filter_aaaa` 是无效摆设——改为在源头设 `dns.ipv6: false`（`flclash.proxy.filter_aaaa=1` 默认），双栈客户端回退 v4 进入接管路径 |
+| **DNS 过滤** | 客户端 53 端口被直接劫持到内核 DNS 监听器（默认 `1053`），不经过 dnsmasq，所以 dnsmasq 层 `filter_aaaa` 是无效摆设——改为在源头设 `dns.ipv6: false`（`flclash.proxy.filter_aaaa=1` 默认），双栈客户端回退 v4 进入接管路径；sing-box 下对应 `dns.strategy: ipv4_only` |
 | **缩进自适应** | `prepare_config` 对 `config.yaml` 的所有插入（`listen` / `routing-mark` / `dns.ipv6` / TUN `route-exclude-address`）按 dns 块自身的缩进对齐——混合缩进会让 YAML 解析失败、核心无限 respawn |
-| **出站模式** | `mode: rule / global / direct` 经 controller 运行时生效并持久化；sing-box 无运行时切换，由转换器按模式生成静态路由 |
+| **出站模式** | `mode: rule / global / direct` 经 controller 运行时生效并持久化；sing-box 无运行时切换，由转换器按模式生成静态路由（`hijack-dns` / `sniff` 前置规则在两种模式下都保留） |
+| **sing-box 对等** | 转换器同时生成 `dns-in` 入站 + `hijack-dns`、`sniff`、`route.default_mark`、`geosite-cn`/`geoip-cn` 规则集与 TUN (`auto_redirect`)；启动/切换前执行 `sing-box check`，失败时保留上一份可用 JSON，配置保存与订阅应用不再因“用 YAML 校验 JSON”而失败 |
 
 状态落在三处：UCI `flclash.proxy.enabled`（用户期望，重启保留）、`/tmp/flclash-proxy.state`（`on` / `tun` / `off`，收敛结果）、nft 规则本身。`flclash-core` 每次启动前清理残留，启动后 5 秒与 API 每 60 秒各收敛一次。
 
@@ -168,6 +169,8 @@ sync() ─────┼─ config.tun.enable=true 且 TUN 在线 ──► TUN
 | 纯 IP 连接 | — | `GEOIP,CN,DIRECT`、`GEOIP,PRIVATE,DIRECT`（`no-resolve`） |
 
 WebUI「设置」页提供国内 DoH/DoT 预设与自定义文本框，「DNS 进阶」页维护国外 fallback、`direct-nameserver`/`proxy-server-nameserver`、`fallback-filter` 与 `nameserver-policy`；所有字段都会同步回 UCI，重启与订阅更新后保持。`flclash.dns.split=0` 可关闭整套分流，完全采用订阅/自定义 DNS。
+
+sing-box 下同一份 `dns:` 块由转换器落实为原生模块：`nameserver` / `direct-nameserver` 走直连上游并为域名型上游自动补 `domain_resolver`（bootstrap 只用明文 IP），`fallback` 挂到主代理组的 `detour`，`nameserver-policy` 的域名键生成 DNS 规则，`fake-ip-filter` 交给真实解析器；`geosite:cn` 在 `geosite-cn.srs` 存在时优先国内解析，其余 A/AAAA 交给 `dns-fakeip`。`redir-host` 模式且存在 fallback 时，未匹配域名默认走国外上游。规则集文件缺失时相关规则会被安全跳过，核心仍可启动；在「工具 → 更新 Geo 数据」或 sing-box 内核更新后会自动补齐。
 
 ## 配置项
 
@@ -226,9 +229,9 @@ REST 只负责**控制与查询**；实时数据由 `GET /ws` 推送。两者读
 | `GET /version` | 内核与桥接版本 |
 | `GET /memory` | 内存统计（`rss` / `app` / `core`） |
 | `GET /core` | 已安装内核二进制与版本（未安装时为空，WebUI 标注「（未安装）」） |
-| `POST /core/switch` | 持久化 `mihomo` / `sing-box` 选择并重启内核；切换前重新生成 sing-box 原生 JSON，返回 `202 {taskId}` |
+| `POST /core/switch` | 持久化 `mihomo` / `sing-box` 选择并重启内核；切 sing-box 前重新生成并 `sing-box check` 原生 JSON，校验失败直接返回错误且不改 UCI，启动失败则回滚到原内核（同步返回结果） |
 | `POST /core/update`、`GET /core/update/status` | 触发内核在线更新 / 查询更新状态与日志 |
-| `POST /system/geo` | 触发 GeoIP / GeoSite 数据更新，返回 `202 {taskId}` |
+| `POST /system/geo` | 触发 GeoIP / GeoSite 更新，返回 `202 {taskId}`；mihomo 调用内核 `/upgrade/geo`，sing-box 下载并校验 `geoip-cn.srs` / `geosite-cn.srs` 后重新生成配置并重启 |
 | `POST /service/{action}` | `start` / `stop` / `restart` 内核服务，返回 `202 {taskId}`；启停后自动收敛接管 |
 | `GET /system/proxy` | 系统透明代理状态摘要 |
 | `GET /proxy`、`POST /proxy/{action}` | 透明代理开关与状态（`takeover` / `tunActive` / `coreRunning` / `proxyWish`） |
@@ -430,7 +433,7 @@ luci-app-flclash_<ver>-r<rel>_<arch>_immortalwrt-snapshot.apk
 - **静态二进制**：`mihomo`、`flclash-api`、`flclash-core-bridge` 均为静态 ELF，无 glibc / musl 运行时依赖，无 `INTERP`。`flclash-api` 内置 rustls + webpki-roots，HTTPS 出站不依赖系统 CA；实时流量/日志流仍使用 `curl -N`（apk 已声明 `+curl` 依赖）。
 - **内核依赖**：透明代理需要设备内核具备 `TUN` 与 `nftables`（ImmortalWrt 默认镜像已带 `firewall4` / `nftables`）。这些 `kmod-*` 未在 25.12 的 apk 源发布，因此**不写入硬依赖**，避免 `apk add` 解依赖失败。
 - **硬件卸载**：接管期间 `flow_offloading` / `flow_offloading_hw` / `bridger` 会被自动关闭并禁自启（快路径流绕过 netfilter，REDIRECT 对 LAN TCP 失效）。关闭接管时三者都会还原：offloading 恢复为接管前的值（`flclash.proxy.saved_*`），`bridger` 仅在接管前本就启用时才重新启用（`flclash.proxy.bridger_saved`）。
-- **sing-box 不随包内置**：单包只带 mihomo。sing-box 通过 LuCI / WebUI 的「更新内核」在线安装到 `/usr/bin/sing-box`，再由 `core_type=sing-box` 启用。
+- **sing-box 不随包内置**：单包只带 mihomo。sing-box 通过 LuCI / WebUI 的「更新内核」在线安装到 `/usr/bin/sing-box`，再由 `core_type=sing-box` 启用。转换目标为 sing-box 1.12+（已在 1.13 / 1.14 上通过 `sing-box check`）；Geo 规则集位于 `/etc/flclash/{geoip-cn.srs,geosite-cn.srs}`，缺失时相关 GEOSITE/GEOIP 规则会被跳过而不是让内核启动失败。
 - **在线更新依赖网络**：内核更新从 GitHub Releases 下载，设备需能访问 `api.github.com` 与 release 资源；受限网络下可手动放置二进制。更新前会校验 `<asset>.sha256`（上游未发布时在日志中明确告警），替换前备份 `/usr/bin/<core>.old-*`，新内核 10 秒内未监听控制器会自动回滚。
 - **安装签名**：构建 SDK 的 apk 签名不在设备默认信任库，需 `--allow-untrusted`。
 - **升级**：旧版三包与单包写入相同路径，升级前先 `apk del` 旧三包。
@@ -442,7 +445,7 @@ luci-app-flclash_<ver>-r<rel>_<arch>_immortalwrt-snapshot.apk
 
 | 检查 | 方式 | 结果 |
 | --- | --- | --- |
-| Rust 单元测试 | `cd flclash-api && cargo test --locked` | 50 项通过（含 ws 集成、任务、代理解析、能力矩阵、备份、混入、ACL、内核管理） |
+| Rust 单元测试 | `cd flclash-api && cargo test --locked` | 93 项通过（含 ws 集成、任务、代理解析、sing-box 转换、能力矩阵、备份、混入、ACL、内核管理） |
 | WebUI 布局 | headless Chromium 逐视图量宽（390 / 1280） | 12 个视图无横向溢出（滚动容器除外） |
 | 端到端 | 假 controller + 真实二进制 + 浏览器 | WS 连接、选择、事件、任务、重连全部通过 |
 | 二进制架构与静态性 | CI `binaries` / `package` 架构闸门 | ELF、静态、目标架构、无 `INTERP` |

@@ -1596,6 +1596,54 @@ pub async fn rule_provider_update(State(st): State<Arc<AppState>>, Path(name): P
 /// GeoIP/GeoSite database update via the core's own updater
 /// (mihomo POST /upgrade/geo). Long-running: reported as a task.
 pub async fn geo_update(State(st): State<Arc<AppState>>) -> Response {
+    // sing-box uses its own .srs rule-sets; the controller's /upgrade/geo
+    // endpoint only exists in mihomo. Download the CN pair locally, then
+    // regenerate + restart so the new rule-sets take effect immediately.
+    if crate::core::configured_core() == "sing-box" {
+        let handle = st.tasks.begin("system.geo", "更新 Geo 数据", None);
+        let task_id = handle.id().to_string();
+        handle.progress(5.0, "下载 CN 规则集");
+        tokio::spawn(async move {
+            let output = tokio::process::Command::new("/usr/libexec/flclash/geo-update.sh")
+                .arg("sing-box")
+                .output()
+                .await;
+            match output {
+                Ok(out) if out.status.success() => {
+                    handle.progress(70.0, "重新生成 sing-box 配置");
+                    let mut detail = String::new();
+                    match std::fs::read_to_string(st.config_path()) {
+                        Ok(yaml) => match crate::singbox::convert(&yaml) {
+                            Ok(json_text) => match crate::preflight::check_singbox_json(&json_text) {
+                                Ok(()) => {
+                                    let path = std::path::Path::new(crate::coremgmt::SINGBOX_JSON);
+                                    if let Err(err) = crate::config::write_atomic(path, json_text.as_bytes()) {
+                                        detail = format!("规则集已更新，但写入转换配置失败: {err}");
+                                    } else if let Err(err) = crate::profiles::service(&st, "restart").await {
+                                        detail = format!("规则集已更新，但内核重启失败: {err}");
+                                    }
+                                }
+                                Err(err) => detail = format!("规则集已更新，但配置预检失败: {err}"),
+                            },
+                            Err(err) => detail = format!("规则集已更新，但转换失败: {err}"),
+                        },
+                        Err(err) => detail = format!("规则集已更新，但读取配置失败: {err}"),
+                    }
+                    if detail.is_empty() {
+                        handle.succeed(json!({"ok": true, "detail": "GeoIP / GeoSite 规则集已更新"}));
+                    } else {
+                        handle.succeed(json!({"ok": true, "warning": detail}));
+                    }
+                }
+                Ok(out) => {
+                    let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                    handle.fail(if err.is_empty() { "geo-update.sh 执行失败" } else { &err });
+                }
+                Err(err) => handle.fail(&format!("geo-update.sh: {err}")),
+            }
+        });
+        return accepted(task_id);
+    }
     if !core_reachable(&st).await {
         return core_down();
     }

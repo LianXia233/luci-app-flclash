@@ -101,9 +101,10 @@ pub fn info() -> Value {
 }
 
 /// Switch the running core. Mirrors the ubus handler: refuse uninstalled
-/// binaries, persist UCI, regenerate sing-box JSON from the live mihomo
-/// config before restart, then restart through the same service path the
-/// rest of the backend uses.
+/// binaries, regenerate and validate the sing-box JSON *before* persisting
+/// the UCI choice, then restart through the same service path the rest of the
+/// backend uses. A rejected conversion leaves both UCI and the running core
+/// untouched; a failed start rolls the previous choice back.
 pub async fn switch(st: &crate::state::AppState, core: &str) -> Result<Value, String> {
     if !valid_core(core) {
         return Err("未知内核类型".into());
@@ -111,6 +112,23 @@ pub async fn switch(st: &crate::state::AppState, core: &str) -> Result<Value, St
     if !installed(core) {
         return Err("内核未安装,请先在线更新".into());
     }
+    let previous = active();
+    let mut converted = false;
+    if core == "sing-box" {
+        let yaml = std::fs::read_to_string(st.config_path())
+            .map_err(|e| format!("读取 config.yaml 失败: {e}"))?;
+        let json_text = crate::singbox::convert(&yaml)
+            .map_err(|err| format!("sing-box 配置转换失败: {err}"))?;
+        // Validate the exact document the init script will run. Without this
+        // an unsupported node/rule could be persisted as the active core and
+        // leave the router without a working proxy.
+        crate::preflight::check_singbox_json(&json_text)
+            .map_err(|err| format!("sing-box 配置预检失败: {err}"))?;
+        crate::config::write_atomic(std::path::Path::new(SINGBOX_JSON), json_text.as_bytes())
+            .map_err(|e| format!("写入 sing-box 配置失败: {e}"))?;
+        converted = true;
+    }
+
     uci(&["-q", "set", &format!("flclash.main.core_type={core}")])?;
     // Bundled mihomo runs in native IPC mode; the standalone CLI installed by
     // the updater sets core_mode=cli itself. sing-box ignores core_mode.
@@ -119,20 +137,17 @@ pub async fn switch(st: &crate::state::AppState, core: &str) -> Result<Value, St
     }
     uci(&["-q", "commit", "flclash"])?;
 
-    let mut converted = false;
-    if core == "sing-box" {
-        let yaml = std::fs::read_to_string(st.config_path())
-            .map_err(|e| format!("读取 config.yaml 失败: {e}"))?;
-        match crate::singbox::convert(&yaml) {
-            Ok(json_text) => {
-                crate::config::write_atomic(std::path::Path::new(SINGBOX_JSON), json_text.as_bytes())
-                    .map_err(|e| format!("写入 sing-box 配置失败: {e}"))?;
-                converted = true;
-            }
-            Err(err) => return Err(format!("sing-box 配置转换失败: {err}")),
+    if let Err(err) = crate::profiles::service(st, "restart").await {
+        // Roll back the persisted choice so the next boot does not retry a
+        // core that cannot start on this device.
+        let _ = uci(&["-q", "set", &format!("flclash.main.core_type={previous}")]);
+        if previous == "mihomo" {
+            let _ = uci(&["-q", "set", "flclash.main.core_mode=ipc"]);
         }
+        let _ = uci(&["-q", "commit", "flclash"]);
+        let _ = crate::profiles::service(st, "restart").await;
+        return Err(format!("切换到 {core} 失败: {err}"));
     }
-    crate::profiles::service(st, "restart").await?;
     st.bus.publish("system", "system.service", json!({"core": core, "converted": converted}));
     Ok(json!({"ok": true, "core": core, "converted": converted}))
 }
